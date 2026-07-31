@@ -316,12 +316,44 @@ pub struct ServerTime {
 /// Client state update message (wraps role-specific state)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientState {
-    /// Client operational state
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Whether this client is available to take part in playback.
+    ///
+    /// `false` says the output is in use by something else — an HDMI input, a local app —
+    /// so the server should not schedule audio here. It replaces the `state` enum below,
+    /// which said the same thing in a way that could not express anything else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    /// Client operational state.
+    ///
+    /// Superseded by `available` and still sent alongside it: a server that only reads
+    /// this field would otherwise see a client that never reports being busy. Populate
+    /// both or neither; [`ClientState::is_available`] resolves them in the right order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<ClientSyncState>,
     /// Player state (if player role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<PlayerState>,
+}
+
+impl ClientState {
+    /// A state update that says whether the client is available, in both spellings.
+    pub fn availability(state: ClientSyncState) -> Self {
+        Self {
+            available: Some(state == ClientSyncState::Synchronized),
+            state: Some(state),
+            player: None,
+        }
+    }
+
+    /// Whether the sender said it is available, preferring the field that can say more.
+    ///
+    /// `None` when it said neither, which is not the same as "unavailable": a partial
+    /// update that carries only player volume says nothing about availability, and
+    /// reading that as "do not send audio" would silence the room.
+    pub fn is_available(&self) -> Option<bool> {
+        self.available
+            .or_else(|| self.state.map(|state| state == ClientSyncState::Synchronized))
+    }
 }
 
 /// Player state

@@ -82,6 +82,7 @@ fn test_server_hello_deserialization() {
 #[test]
 fn test_client_state_serialization() {
     let state = ClientState {
+        available: Some(true),
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
             volume: Some(100),
@@ -105,6 +106,7 @@ fn test_client_state_serialization() {
 #[test]
 fn test_client_sync_state_external_source() {
     let state = ClientState {
+        available: Some(false),
         state: Some(ClientSyncState::ExternalSource),
         player: None,
     };
@@ -1258,6 +1260,7 @@ fn test_player_state_ignores_legacy_state_field() {
 #[test]
 fn test_player_state_supported_commands_roundtrip() {
     let state = ClientState {
+        available: Some(true),
         state: Some(ClientSyncState::Synchronized),
         player: Some(PlayerState {
             volume: Some(100),
@@ -1339,4 +1342,40 @@ fn test_artwork_format_request_from_wire_json() {
     assert_eq!(parsed.format, Some(ImageFormat::Png));
     assert_eq!(parsed.media_width, Some(400));
     assert_eq!(parsed.media_height, Some(400));
+}
+
+#[test]
+fn availability_is_sent_in_both_spellings() {
+    // `available` is what a current server reads; `state` is what one that predates it
+    // reads. Sending only the new field would make a client look permanently free to a
+    // server that never learned about it -- so it sends both, from one call.
+    let json = serde_json::to_string(&Message::ClientState(ClientState::availability(
+        ClientSyncState::ExternalSource,
+    )))
+    .unwrap();
+    assert!(json.contains("\"available\":false"));
+    assert!(json.contains("\"state\":\"external_source\""));
+
+    let json = serde_json::to_string(&Message::ClientState(ClientState::availability(
+        ClientSyncState::Synchronized,
+    )))
+    .unwrap();
+    assert!(json.contains("\"available\":true"));
+    assert!(json.contains("\"state\":\"synchronized\""));
+}
+
+#[test]
+fn availability_reads_the_new_field_first_and_falls_back_to_the_old_one() {
+    let modern: ClientState = serde_json::from_str(r#"{"available":false}"#).unwrap();
+    assert_eq!(modern.is_available(), Some(false));
+
+    let legacy: ClientState = serde_json::from_str(r#"{"state":"external_source"}"#).unwrap();
+    assert_eq!(legacy.is_available(), Some(false));
+    let legacy: ClientState = serde_json::from_str(r#"{"state":"synchronized"}"#).unwrap();
+    assert_eq!(legacy.is_available(), Some(true));
+
+    // A partial update that only carries volume says nothing about availability, and
+    // reading silence as "unavailable" would stop the music.
+    let partial: ClientState = serde_json::from_str(r#"{"player":{"volume":40}}"#).unwrap();
+    assert_eq!(partial.is_available(), None);
 }

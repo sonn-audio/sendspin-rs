@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Report availability in `client/state` as `available`, alongside the older `state` enum
+  so servers that read either see the same thing. `ClientState::availability` builds both
+  and `ClientState::is_available` resolves them.
+
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.
