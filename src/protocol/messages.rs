@@ -631,6 +631,17 @@ pub enum ControllerCommandType {
 /// Stream start message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamStart {
+    /// When the server put this message on the wire, in *its* clock, in microseconds.
+    ///
+    /// The start of the window a player's `required_lead_time_ms` is measured over: the spec
+    /// counts the lead from the server's transmit time of the trigger to the playback timestamp
+    /// of the first chunk that can be played in full. Without it a client can state a lead
+    /// requirement but never tell whether it was honoured.
+    ///
+    /// Optional here because a server that predates the field simply omits it, and a stream is
+    /// perfectly playable without knowing when its trigger was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_transmitted: Option<i64>,
     /// Player stream configuration (optional - only if player role active)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub player: Option<StreamPlayerConfig>,
@@ -703,6 +714,17 @@ impl StreamVisualizerConfig {
 /// Stream end message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEnd {
+    /// When the server put this message on the wire, in *its* clock, in microseconds.
+    ///
+    /// The start of the window a player's `required_lead_time_ms` is measured over: the spec
+    /// counts the lead from the server's transmit time of the trigger to the playback timestamp
+    /// of the first chunk that can be played in full. Without it a client can state a lead
+    /// requirement but never tell whether it was honoured.
+    ///
+    /// Optional here because a server that predates the field simply omits it, and a stream is
+    /// perfectly playable without knowing when its trigger was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_transmitted: Option<i64>,
     /// Roles for which streaming has ended (optional, all if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
@@ -711,6 +733,17 @@ pub struct StreamEnd {
 /// Stream clear message (clear buffers)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamClear {
+    /// When the server put this message on the wire, in *its* clock, in microseconds.
+    ///
+    /// The start of the window a player's `required_lead_time_ms` is measured over: the spec
+    /// counts the lead from the server's transmit time of the trigger to the playback timestamp
+    /// of the first chunk that can be played in full. Without it a client can state a lead
+    /// requirement but never tell whether it was honoured.
+    ///
+    /// Optional here because a server that predates the field simply omits it, and a stream is
+    /// perfectly playable without knowing when its trigger was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_transmitted: Option<i64>,
     /// Roles for which buffers should be cleared (optional, all if not specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,

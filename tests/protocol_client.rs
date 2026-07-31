@@ -86,6 +86,7 @@ fn player_stream_start() -> WsMessage {
         }),
         artwork: None,
         visualizer: None,
+        server_transmitted: None,
     }))
 }
 
@@ -102,6 +103,7 @@ fn artwork_stream_start() -> WsMessage {
             }],
         }),
         visualizer: None,
+        server_transmitted: None,
     }))
 }
 
@@ -116,12 +118,16 @@ fn visualizer_stream_start() -> WsMessage {
             tracks_downbeats: None,
             spectrum: None,
         }),
+        server_transmitted: None,
     }))
 }
 
 /// A server→client `stream/end` for the given roles (all streams if `None`).
 fn stream_end(roles: Option<Vec<String>>) -> WsMessage {
-    text_message(&Message::StreamEnd(StreamEnd { roles }))
+    text_message(&Message::StreamEnd(StreamEnd {
+        roles,
+        server_transmitted: None,
+    }))
 }
 
 /// Discard the `client/state` the client emits immediately after handshake.
