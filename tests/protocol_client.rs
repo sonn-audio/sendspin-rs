@@ -1386,7 +1386,10 @@ async fn test_disconnect_observes_writer_completion() {
 
     assert!(controller.play().await.is_err());
     assert!(sender_clone
-        .send_message(Message::ClientCommand(ClientCommand { controller: None }))
+        .send_message(Message::ClientCommand(ClientCommand {
+            controller: None,
+            source: None,
+        }))
         .await
         .is_err());
 }
@@ -1443,7 +1446,10 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
     for _ in 0..20 {
         last = conn
             .sender
-            .send_message(Message::ClientCommand(ClientCommand { controller: None }))
+            .send_message(Message::ClientCommand(ClientCommand {
+            controller: None,
+            source: None,
+        }))
             .await;
         if last.is_err() {
             break;

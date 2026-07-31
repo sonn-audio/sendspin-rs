@@ -12,6 +12,7 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 - **Lock-free concurrency** - No contention on audio thread
 - **Async I/O** - Efficient WebSocket handling with Tokio
 - **Type-safe protocol** - Leverage Rust's type system for correctness
+- **Source role** - Stream a local audio input *to* the server (`source@v1`)
 
 ## Performance Targets
 
@@ -79,6 +80,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 See `examples/` directory for more examples.
+
+## Sources (`source@v1`)
+
+A source is a player in reverse: it captures a local input — line-in, a turntable
+preamp, an HDMI capture card — and streams it to the server, which does the
+resampling, mixing and distribution. The device stays simple.
+
+```rust
+let client = ProtocolClientBuilder::builder()
+    .client_id("kitchen-linein".to_string())
+    .name("Kitchen Line-In".to_string())
+    .source_v1_support(SourceV1Support {
+        supported_formats: vec![SourceFormat {
+            codec: "pcm".to_string(), channels: 2, sample_rate: 48_000, bit_depth: 16,
+        }],
+        controls: None,
+        features: Some(SourceFeatures { level: Some(true), line_sense: Some(true) }),
+    })
+    .initial_source_state(SourceState {
+        state: SourceStateType::Idle, level: Some(0.0), signal: Some(SourceSignal::Unknown),
+    })
+    .build()
+    .connect(url)
+    .await?;
+```
+
+The server drives capture with `server/command` (`start`/`stop`, optional signal
+thresholds, and transport controls for the attached device). Each stream is
+announced with `input_stream/start` before its first frame, so a format change is
+a stream boundary rather than something the server has to infer:
+
+```rust
+sender.send_input_stream_start(InputStreamSource { /* codec, rate, depth */ }).await?;
+sender.send_source_state(SourceState { state: SourceStateType::Streaming, .. }).await?;
+
+// Capture timestamps go out in the *server's* clock.
+let server_us = clock_sync.lock().client_to_server_micros(capture_us).unwrap();
+sender.send_source_audio(server_us, &pcm_frame).await?;
+```
+
+Level and signal presence (`line_sense`) let a source whose activation is local —
+nobody can start a turntable remotely — tell the server the user has begun
+playing, via `send_source_event`. See `examples/source.rs` for a complete client.
 
 ## Architecture
 

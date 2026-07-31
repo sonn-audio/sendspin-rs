@@ -5,9 +5,10 @@ use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
-    ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, Message,
-    PlayerFormatRequest, PlayerState, RepeatMode, ServerHello, StreamEnd, StreamRequestFormat,
-    StreamStart, VisualizerDataType, VisualizerFormatRequest,
+    ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, InputStreamEnd,
+    InputStreamSource, InputStreamStart, Message, PlayerFormatRequest, PlayerState, RepeatMode,
+    ServerHello, SourceClientCommand, SourceClientCommandType, SourceState, StreamEnd,
+    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -216,11 +217,85 @@ impl WsSender {
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
+    /// Send a raw binary frame.
+    ///
+    /// Uplink binary traffic is the source role's audio; downlink frames (player
+    /// audio, artwork, visualizer) arrive on the receivers from
+    /// [`ProtocolClient::split`] and never go through here. The frame must already
+    /// carry its type byte and header — use [`Self::send_source_audio`] rather than
+    /// packing one by hand.
+    pub async fn send_binary(&self, frame: Vec<u8>) -> Result<(), Error> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriteCommand::Send {
+                msg: WsMessage::Binary(frame.into()),
+                ack: ack_tx,
+            })
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+        ack_rx
+            .await
+            .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+    }
+
+    /// Send one captured audio frame as a source audio chunk (binary type 12).
+    ///
+    /// `server_timestamp_us` is when the first sample was captured, in the
+    /// *server's* clock — convert with
+    /// [`ClockSync::client_to_server_micros`](crate::sync::ClockSync::client_to_server_micros).
+    /// Sending local time instead is the one mistake that produces audio which
+    /// plays but never lines up.
+    pub async fn send_source_audio(
+        &self,
+        server_timestamp_us: i64,
+        frame: &[u8],
+    ) -> Result<(), Error> {
+        self.send_binary(pack_source_audio(server_timestamp_us, frame))
+            .await
+    }
+
+    /// Announce the format of the input stream that follows.
+    ///
+    /// Sent before the first chunk of every stream, and again after a format
+    /// change: the server treats it as the stream boundary.
+    pub async fn send_input_stream_start(&self, source: InputStreamSource) -> Result<(), Error> {
+        self.send_message(Message::InputStreamStart(InputStreamStart { source }))
+            .await
+    }
+
+    /// End the input stream, so the server tears down its ingest.
+    pub async fn send_input_stream_end(&self) -> Result<(), Error> {
+        self.send_message(Message::InputStreamEnd(InputStreamEnd {}))
+            .await
+    }
+
+    /// Send a source state update (capture state, level, signal presence).
+    pub async fn send_source_state(&self, source: SourceState) -> Result<(), Error> {
+        self.send_message(Message::ClientState(ClientState {
+            state: None,
+            player: None,
+            source: Some(source),
+        }))
+        .await
+    }
+
+    /// Report that audio appeared on, or disappeared from, the input.
+    ///
+    /// This is how a source whose activation is local — a turntable, a tape deck —
+    /// tells the server the user has started something.
+    pub async fn send_source_event(&self, command: SourceClientCommandType) -> Result<(), Error> {
+        self.send_message(Message::ClientCommand(ClientCommand {
+            controller: None,
+            source: Some(SourceClientCommand { command }),
+        }))
+        .await
+    }
+
     /// Send a top-level client synchronization state update.
     pub async fn send_sync_state(&self, state: ClientSyncState) -> Result<(), Error> {
         self.send_message(Message::ClientState(ClientState {
             state: Some(state),
             player: None,
+            source: None,
         }))
         .await
     }
@@ -244,6 +319,7 @@ impl WsSender {
         self.send_message(Message::ClientState(ClientState {
             state: Some(ClientSyncState::Synchronized),
             player,
+            source: None,
         }))
         .await
     }
@@ -368,6 +444,7 @@ impl Controller {
     async fn send_controller_command(&self, cmd: ControllerCommand) -> Result<(), Error> {
         let msg = Message::ClientCommand(ClientCommand {
             controller: Some(cmd),
+            source: None,
         });
         self.sender.send_message(msg).await
     }
@@ -506,6 +583,8 @@ pub mod binary_types {
     pub const ARTWORK_CHANNEL_2: u8 = 0x0A;
     /// Artwork channel 3 (type 11)
     pub const ARTWORK_CHANNEL_3: u8 = 0x0B;
+    /// Source audio chunk, client to server (type 12)
+    pub const SOURCE_AUDIO: u8 = 0x0C;
     /// Visualizer loudness data (type 16).
     pub const VISUALIZER_LOUDNESS: u8 = 0x10;
     /// Visualizer beat data (type 17).
@@ -534,6 +613,18 @@ pub mod binary_types {
     pub fn is_visualizer(type_id: u8) -> bool {
         (VISUALIZER_LOUDNESS..=VISUALIZER_PEAK).contains(&type_id)
     }
+}
+
+/// Pack one source audio frame: type byte, big-endian capture timestamp, payload.
+///
+/// The mirror of [`AudioChunk::from_bytes`], and separate from the sender so the
+/// layout can be tested without a connection.
+pub fn pack_source_audio(server_timestamp_us: i64, frame: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + frame.len());
+    out.push(binary_types::SOURCE_AUDIO);
+    out.extend_from_slice(&server_timestamp_us.to_be_bytes());
+    out.extend_from_slice(frame);
+    out
 }
 
 /// Audio chunk from server (binary type 4)
