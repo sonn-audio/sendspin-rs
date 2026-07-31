@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   leaves the behaviour of the existing two reasons unchanged.
 - Expose `server_transmitted` on `stream/start`, `stream/end` and `stream/clear`, so a
   client can measure the lead it was actually given against the one it asked for.
+- Allow `stream/request-format` to change the visualizer's `buffer_capacity`.
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw

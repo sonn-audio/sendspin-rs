@@ -633,6 +633,7 @@ fn test_visualizer_negotiation_serialization() {
         visualizer: Some(VisualizerFormatRequest {
             types: Some(vec![VisualizerDataType::FPeak]),
             rate_max: Some(24),
+            buffer_capacity: None,
             spectrum: None,
         }),
     };
@@ -643,12 +644,14 @@ fn test_visualizer_negotiation_serialization() {
     let partial = VisualizerFormatRequest {
         types: Some(vec![VisualizerDataType::Spectrum]),
         rate_max: None,
+        buffer_capacity: None,
         spectrum: None,
     };
     assert!(partial.validate().is_ok());
     let empty = VisualizerFormatRequest {
         types: None,
         rate_max: None,
+        buffer_capacity: None,
         spectrum: None,
     };
     assert!(empty.validate().is_err());
@@ -1475,4 +1478,20 @@ fn a_stream_without_a_transmit_stamp_still_parses() {
     };
     assert_eq!(end.server_transmitted, None);
     assert_eq!(end.roles.as_deref(), Some(&["player".to_string()][..]));
+}
+
+#[test]
+fn a_visualizer_request_may_change_only_its_buffer_ceiling() {
+    // Lowering the ceiling is the one visualizer change a client makes for reasons that
+    // have nothing to do with what it wants to see -- so it has to count as a change on
+    // its own, or the request is rejected before it reaches the wire.
+    let request = VisualizerFormatRequest {
+        types: None,
+        rate_max: None,
+        buffer_capacity: Some(32 * 1024),
+        spectrum: None,
+    };
+    assert!(request.validate().is_ok());
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(json, r#"{"buffer_capacity":32768}"#);
 }

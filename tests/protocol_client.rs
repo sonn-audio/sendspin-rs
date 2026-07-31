@@ -513,11 +513,13 @@ async fn test_sender_visualizer_request_requires_active_stream() {
     let request = VisualizerFormatRequest {
         types: Some(vec![VisualizerDataType::Loudness]),
         rate_max: Some(30),
+        buffer_capacity: None,
         spectrum: None,
     };
     let empty = VisualizerFormatRequest {
         types: None,
         rate_max: None,
+        buffer_capacity: None,
         spectrum: None,
     };
     let result = conn.sender.request_visualizer_format(empty).await;

@@ -786,6 +786,13 @@ pub struct VisualizerFormatRequest {
     /// New periodic visualization frames-per-second cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_max: Option<u32>,
+    /// New ceiling on buffered visualizer bytes.
+    ///
+    /// The one visualizer setting a client may need to *lower* while a stream runs: a
+    /// display that has taken on other work has less memory to hold frames in, and the
+    /// alternative to saying so is dropping them on arrival.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buffer_capacity: Option<u32>,
     /// New spectrum configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spectrum: Option<SpectrumConfig>,
@@ -797,7 +804,11 @@ impl VisualizerFormatRequest {
     /// This is a partial update: omitted fields retain their current value, so
     /// a request may omit `spectrum` even when its new `types` includes it.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.types.is_none() && self.rate_max.is_none() && self.spectrum.is_none() {
+        if self.types.is_none()
+            && self.rate_max.is_none()
+            && self.buffer_capacity.is_none()
+            && self.spectrum.is_none()
+        {
             return Err("visualizer format request must specify at least one field");
         }
         if let (Some(types), Some(spectrum)) = (self.types.as_ref(), self.spectrum.as_ref()) {
