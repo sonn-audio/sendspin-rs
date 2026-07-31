@@ -5,8 +5,8 @@ use sendspin::protocol::messages::{
     GoodbyeReason, ImageFormat, Message, PairMethod, PairMethodDescriptor, PlaybackState,
     PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand, PlayerV1Support,
     RepeatMode, ServerTime, SpectrumConfig, SpectrumScale, StreamArtworkChannelConfig,
-    StreamRequestFormat, StreamVisualizerConfig, TrustLevel, UnpairedAccess,
-    VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
+    StreamRequestFormat, StreamVisualizerConfig, TrustLevel, UnpairedAccess, VisualizerDataType,
+    VisualizerFormatRequest, VisualizerV1Support,
 };
 
 // =============================================================================
@@ -20,9 +20,9 @@ fn test_client_hello_serialization() {
         name: "Test Player".to_string(),
         version: 1,
         supported_roles: vec!["player@v1".to_string()],
-            trust_level: TrustLevel::default(),
-            supported_pair_methods: None,
-            unpaired_access: UnpairedAccess::default(),
+        trust_level: TrustLevel::default(),
+        supported_pair_methods: None,
+        unpaired_access: UnpairedAccess::default(),
         device_info: Some(DeviceInfo {
             product_name: Some("Sendspin-RS Player".to_string()),
             manufacturer: Some("Sendspin".to_string()),
@@ -583,9 +583,9 @@ fn test_visualizer_negotiation_serialization() {
         name: "Visualizer".to_string(),
         version: 1,
         supported_roles: vec!["visualizer@v1".to_string()],
-            trust_level: TrustLevel::default(),
-            supported_pair_methods: None,
-            unpaired_access: UnpairedAccess::default(),
+        trust_level: TrustLevel::default(),
+        supported_pair_methods: None,
+        unpaired_access: UnpairedAccess::default(),
         device_info: None,
         player_v1_support: None,
         artwork_v1_support: None,
