@@ -1431,3 +1431,48 @@ fn the_goodbye_reasons_for_trust_and_admission_round_trip() {
         );
     }
 }
+
+#[test]
+fn stream_messages_carry_the_moment_the_server_sent_them() {
+    // The start of the window `required_lead_time_ms` is measured over. A client that
+    // asks for 500 ms of lead can only tell whether it got it by comparing this against
+    // the timestamp of the first chunk.
+    let json = r#"{
+        "type": "stream/start",
+        "payload": {
+            "server_transmitted": 1717171717000000,
+            "player": {"codec": "pcm", "sample_rate": 48000, "channels": 2, "bit_depth": 16}
+        }
+    }"#;
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    let Message::StreamStart(start) = parsed else {
+        panic!("expected stream/start");
+    };
+    assert_eq!(start.server_transmitted, Some(1_717_171_717_000_000));
+
+    for json in [
+        r#"{"type":"stream/end","payload":{"server_transmitted":42}}"#,
+        r#"{"type":"stream/clear","payload":{"server_transmitted":42}}"#,
+    ] {
+        let parsed: Message = serde_json::from_str(json).unwrap();
+        let stamped = match parsed {
+            Message::StreamEnd(end) => end.server_transmitted,
+            Message::StreamClear(clear) => clear.server_transmitted,
+            other => panic!("unexpected {:?}", other),
+        };
+        assert_eq!(stamped, Some(42));
+    }
+}
+
+#[test]
+fn a_stream_without_a_transmit_stamp_still_parses() {
+    // Servers that predate the field omit it, and a stream is playable without knowing
+    // when its trigger was sent.
+    let parsed: Message =
+        serde_json::from_str(r#"{"type":"stream/end","payload":{"roles":["player"]}}"#).unwrap();
+    let Message::StreamEnd(end) = parsed else {
+        panic!("expected stream/end");
+    };
+    assert_eq!(end.server_transmitted, None);
+    assert_eq!(end.roles.as_deref(), Some(&["player".to_string()][..]));
+}
