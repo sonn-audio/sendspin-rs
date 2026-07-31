@@ -142,7 +142,14 @@ impl Clock for DefaultClock {
                 );
             }
         }
-        ts.tv_sec * 1_000_000 + ts.tv_nsec / 1_000
+        // `timespec` holds 32-bit fields on armv7 and armhf -- Raspberry Pi OS 32-bit -- and 64-bit
+        // fields elsewhere, so multiplying the seconds out directly does not compile there, and
+        // widening only the result would overflow after about half an hour of uptime. Going
+        // through `Duration` widens on every target and reuses the conversion the non-Linux
+        // implementation below already does. `clock_gettime` never reports a negative monotonic
+        // time, and a failed call leaves the zeroed value initialized above.
+        let uptime = Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        i64::try_from(uptime.as_micros()).unwrap_or(i64::MAX)
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -226,3 +226,23 @@ fn test_zero_rtt_accepted() {
     assert_eq!(sync.rtt_micros(), Some(0));
     assert!(sync.is_synchronized(), "zero RTT should still allow sync");
 }
+
+#[test]
+fn test_default_clock_reports_microseconds() {
+    use sendspin::sync::Clock;
+
+    let clock = DefaultClock::new();
+    let before = clock.now_micros();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let after = clock.now_micros();
+
+    // The bounds are what pin the unit: sleeping 20ms has to move the clock by roughly 20_000, so
+    // a reading in milliseconds or nanoseconds lands far outside this window. The upper bound is
+    // loose because a loaded CI runner can oversleep by a lot -- it is there to catch a wrong
+    // scale, not to time the scheduler.
+    let elapsed = after - before;
+    assert!(
+        (10_000..2_000_000).contains(&elapsed),
+        "20ms should read as ~20_000 microseconds, got {elapsed}"
+    );
+}
