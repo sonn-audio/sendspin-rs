@@ -772,11 +772,12 @@ fn test_group_update_deserialization() {
     }
 }
 
-// Test all playback state variants (per spec: only 'playing' and 'stopped')
+// Test all playback state variants
 #[test]
 fn test_playback_state_variants() {
     let states = [
         (r#""playing""#, PlaybackState::Playing),
+        (r#""paused""#, PlaybackState::Paused),
         (r#""stopped""#, PlaybackState::Stopped),
     ];
 
@@ -1137,12 +1138,12 @@ fn test_invalid_connection_reason_rejected() {
 }
 
 #[test]
-fn test_invalid_playback_state_rejected() {
-    let result = serde_json::from_str::<PlaybackState>(r#""paused""#);
-    assert!(
-        result.is_err(),
-        "only 'playing' and 'stopped' are valid per spec"
-    );
+fn test_unknown_playback_state_is_not_rejected() {
+    // `paused` was removed from the spec and is back; a client that treats an
+    // unrecognised state as a parse error loses the whole message over a field it
+    // could have ignored, so unknown states land on `Unknown` instead.
+    let parsed: PlaybackState = serde_json::from_str(r#""buffering""#).unwrap();
+    assert_eq!(parsed, PlaybackState::Unknown);
 }
 
 #[test]
@@ -1339,4 +1340,37 @@ fn test_artwork_format_request_from_wire_json() {
     assert_eq!(parsed.format, Some(ImageFormat::Png));
     assert_eq!(parsed.media_width, Some(400));
     assert_eq!(parsed.media_height, Some(400));
+}
+
+#[test]
+fn group_update_accepts_every_playback_state() {
+    // A `paused` group used to fail to deserialize, and because the state sits inside
+    // the message envelope, the failure took the whole group/update with it: a client
+    // learned nothing about the group it had just been put in.
+    for (wire, expected) in [
+        ("playing", PlaybackState::Playing),
+        ("paused", PlaybackState::Paused),
+        ("stopped", PlaybackState::Stopped),
+    ] {
+        let raw = format!(
+            r#"{{"type":"group/update","payload":{{"playback_state":"{}","group_id":"g1"}}}}"#,
+            wire
+        );
+        let parsed: Message = serde_json::from_str(&raw).expect(wire);
+        let Message::GroupUpdate(update) = parsed else {
+            panic!("expected group/update");
+        };
+        assert_eq!(update.playback_state, Some(expected));
+    }
+}
+
+#[test]
+fn an_unknown_playback_state_does_not_lose_the_group_update() {
+    let raw = r#"{"type":"group/update","payload":{"playback_state":"buffering","group_id":"g1","group_name":"Kitchen"}}"#;
+    let parsed: Message = serde_json::from_str(raw).unwrap();
+    let Message::GroupUpdate(update) = parsed else {
+        panic!("expected group/update");
+    };
+    assert_eq!(update.playback_state, Some(PlaybackState::Unknown));
+    assert_eq!(update.group_name.as_deref(), Some("Kitchen"));
 }

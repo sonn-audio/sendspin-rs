@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Accept `paused` as a group playback state, and map any future state to
+  `PlaybackState::Unknown` instead of failing the whole `group/update`.
+
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.

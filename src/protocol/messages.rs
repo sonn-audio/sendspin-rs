@@ -816,13 +816,18 @@ pub struct GroupUpdate {
 }
 
 /// Group playback state
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PlaybackState {
     /// Audio is playing
     Playing,
+    /// Playback is paused, with a position to resume from
+    Paused,
     /// Playback is stopped
     Stopped,
+    /// A state this build does not know (forward compatibility)
+    #[serde(other)]
+    Unknown,
 }
 
 // =============================================================================
