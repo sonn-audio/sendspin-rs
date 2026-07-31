@@ -558,6 +558,7 @@ mod tests {
             version: 1,
             active_roles: vec![],
             connection_reason: reason,
+            selected_pair_method: None,
         }
     }
 

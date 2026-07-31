@@ -39,6 +39,7 @@ async fn connect_peer(url: &str, server_id: &str, reason: ConnectionReason) -> P
         version: 1,
         active_roles: vec![],
         connection_reason: reason,
+        selected_pair_method: None,
     }))
     .unwrap();
     write

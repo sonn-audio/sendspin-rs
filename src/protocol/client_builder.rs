@@ -4,7 +4,8 @@ use crate::error::Error;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
-    PlayerState, PlayerV1Support, VisualizerV1Support,
+    PairMethodDescriptor, PlayerState, PlayerV1Support, TrustLevel, UnpairedAccess,
+    VisualizerV1Support,
 };
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
@@ -24,6 +25,9 @@ pub(crate) struct ProtocolClientBuilderRaw {
     manufacturer: Option<String>,
     software_version: Option<String>,
     mac_address: Option<String>,
+    trust_level: TrustLevel,
+    supported_pair_methods: Option<Vec<PairMethodDescriptor>>,
+    unpaired_access: UnpairedAccess,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
@@ -101,6 +105,9 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             manufacturer: raw.manufacturer,
             software_version: raw.software_version,
             mac_address: raw.mac_address,
+            trust_level: raw.trust_level,
+            supported_pair_methods: raw.supported_pair_methods,
+            unpaired_access: raw.unpaired_access,
             supported_roles,
             player_v1_support,
             clock: Arc::new(DefaultClock::new()),
@@ -126,6 +133,19 @@ pub struct ProtocolClientBuilderFields {
     software_version: Option<String>,
     #[builder(default = None)]
     mac_address: Option<String>,
+    /// Trust this client extends to the server it is about to talk to. Leave at
+    /// [`TrustLevel::None`] unless a pairing exchange has already established otherwise.
+    #[builder(default = TrustLevel::None)]
+    trust_level: TrustLevel,
+    /// Pairing methods to offer. A client with no way to pair offers none, which is the
+    /// default and is what this library does on its own.
+    #[builder(default = None, setter(transform = |x: Vec<PairMethodDescriptor>| Some(x)))]
+    supported_pair_methods: Option<Vec<PairMethodDescriptor>>,
+    /// Whether unpaired servers are admitted. Defaults to `true`, because that is what a
+    /// client without a trust store does; set it to `false` only if something is actually
+    /// enforcing it.
+    #[builder(default = UnpairedAccess::default(), setter(transform = |enabled: bool| UnpairedAccess { enabled }))]
+    unpaired_access: UnpairedAccess,
     #[builder(default = None, setter(transform = |x: PlayerV1Support| Some(x)))]
     player_v1_support: Option<PlayerV1Support>,
     #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
@@ -155,6 +175,9 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             manufacturer: fields.manufacturer,
             software_version: fields.software_version,
             mac_address: fields.mac_address,
+            trust_level: fields.trust_level,
+            supported_pair_methods: fields.supported_pair_methods,
+            unpaired_access: fields.unpaired_access,
             player_v1_support: fields.player_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
@@ -177,6 +200,9 @@ pub struct ProtocolClientBuilder {
     manufacturer: Option<String>,
     software_version: Option<String>,
     mac_address: Option<String>,
+    trust_level: TrustLevel,
+    supported_pair_methods: Option<Vec<PairMethodDescriptor>>,
+    unpaired_access: UnpairedAccess,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
@@ -262,6 +288,9 @@ impl ProtocolClientBuilder {
             name: self.name,
             version: 1,
             supported_roles: self.supported_roles,
+            trust_level: self.trust_level,
+            supported_pair_methods: self.supported_pair_methods,
+            unpaired_access: self.unpaired_access,
             device_info: Some(DeviceInfo {
                 product_name: self.product_name,
                 manufacturer: Some(self.manufacturer.unwrap_or_else(|| "Sendspin".to_string())),

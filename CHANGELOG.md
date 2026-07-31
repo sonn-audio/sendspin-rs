@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Report availability in `client/state` as `available`, alongside the older `state` enum
   so servers that read either see the same thing. `ClientState::availability` builds both
   and `ClientState::is_available` resolves them.
+- Declare `trust_level`, `unpaired_access` and (optionally) `supported_pair_methods` in
+  `client/hello`, and read `selected_pair_method` from `server/hello`. New builder setters
+  for the first three; the defaults describe a client without a trust store.
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw

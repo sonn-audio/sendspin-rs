@@ -45,6 +45,7 @@ where
         version: 1,
         active_roles,
         connection_reason: ConnectionReason::Playback,
+        selected_pair_method: None,
     }))
     .unwrap();
     write

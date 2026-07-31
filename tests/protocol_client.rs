@@ -48,6 +48,7 @@ async fn start_test_server() -> (
                 version: 1,
                 active_roles,
                 connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+                selected_pair_method: None,
             },
         ))
         .unwrap();
@@ -1009,6 +1010,7 @@ async fn start_test_server_with_roles(
                 version: 1,
                 active_roles: granted_roles,
                 connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+                selected_pair_method: None,
             },
         ))
         .unwrap();
@@ -1123,6 +1125,7 @@ async fn start_test_server_with_sender() -> (
                 version: 1,
                 active_roles,
                 connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+                selected_pair_method: None,
             },
         ))
         .unwrap();
@@ -1419,6 +1422,7 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
                 version: 1,
                 active_roles: vec!["player@v1".to_string()],
                 connection_reason: sendspin::protocol::messages::ConnectionReason::Playback,
+                selected_pair_method: None,
             },
         ))
         .unwrap();
