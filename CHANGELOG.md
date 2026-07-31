@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `PlaybackState::Unknown` instead of failing the whole `group/update`.
 - Add the `pitch` visualization type (binary slot 21) to the visualizer role, so a
   perceived-pitch frame is delivered instead of rejected as a reserved slot.
+- Add the `pairing` and `management` connection reasons and the `unauthorized`,
+  `pairing_required`, `concurrent_attempt` and `unpaired` goodbye reasons. Arbitration
+  now ranks a connection by purpose (management > playback > pairing > discovery), which
+  leaves the behaviour of the existing two reasons unchanged.
 
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw

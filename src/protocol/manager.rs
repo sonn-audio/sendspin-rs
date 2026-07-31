@@ -18,6 +18,23 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
+/// How much a connection's purpose entitles it to displace another.
+///
+/// Management outranks playback because a management session is something an operator
+/// just asked for on the server, and it is short. Playback outranks pairing for the
+/// mirror-image reason: audio the user is listening to should not stop for a handshake.
+/// Discovery is the floor, and anything this build does not recognise sits there with
+/// it — an unknown purpose is exactly the case where displacing a playing server would
+/// be the expensive guess.
+fn connection_rank(reason: ConnectionReason) -> u8 {
+    match reason {
+        ConnectionReason::Management => 3,
+        ConnectionReason::Playback => 2,
+        ConnectionReason::Pairing => 1,
+        ConnectionReason::Discovery | ConnectionReason::Unknown => 0,
+    }
+}
+
 /// The spec's multi-server arbitration rule: should the newly established
 /// `candidate` displace the `current` server?
 ///
@@ -29,15 +46,19 @@ pub fn should_switch(
     candidate: &ServerHello,
     last_played: Option<&str>,
 ) -> bool {
-    // Matched as (candidate, current) — reverse of the parameter order —
-    // so the new server reads first in each arm.
-    match (&candidate.connection_reason, &current.connection_reason) {
-        (ConnectionReason::Playback, _) => true,
-        (ConnectionReason::Discovery, ConnectionReason::Playback) => false,
-        (ConnectionReason::Discovery, ConnectionReason::Discovery) => {
-            matches!(last_played, Some(lp) if candidate.server_id == lp)
-        }
+    let candidate_rank = connection_rank(candidate.connection_reason);
+    let current_rank = connection_rank(current.connection_reason);
+    if candidate_rank != current_rank {
+        return candidate_rank > current_rank;
     }
+    // Equal rank: a purposeful session (pairing, playback, management) from a second
+    // server is accepted, because the newer one is the one the user just caused. Two
+    // servers merely announcing themselves are separated by which of them last played
+    // here, so a reconnecting pair does not flip-flop.
+    if candidate_rank > 0 {
+        return true;
+    }
+    matches!(last_played, Some(lp) if candidate.server_id == lp)
 }
 
 /// Default [`ManagerConfig::establish_timeout`]
