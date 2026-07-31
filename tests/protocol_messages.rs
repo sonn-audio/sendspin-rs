@@ -2,9 +2,10 @@ use sendspin::protocol::messages::{
     ArtworkChannel, ArtworkFormatRequest, ArtworkSource, ArtworkV1Support, AudioFormatSpec,
     ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState, ClientTime,
     ColorState, ConnectionReason, ControllerCommand, ControllerCommandType, DeviceInfo,
-    GoodbyeReason, ImageFormat, Message, PlaybackState, PlayerCommandType, PlayerFormatRequest,
-    PlayerState, PlayerStateCommand, PlayerV1Support, RepeatMode, ServerTime, SpectrumConfig,
-    SpectrumScale, StreamArtworkChannelConfig, StreamRequestFormat, StreamVisualizerConfig,
+    GoodbyeReason, ImageFormat, Message, PairMethod, PairMethodDescriptor, PlaybackState,
+    PlayerCommandType, PlayerFormatRequest, PlayerState, PlayerStateCommand, PlayerV1Support,
+    RepeatMode, ServerTime, SpectrumConfig, SpectrumScale, StreamArtworkChannelConfig,
+    StreamRequestFormat, StreamVisualizerConfig, TrustLevel, UnpairedAccess,
     VisualizerDataType, VisualizerFormatRequest, VisualizerV1Support,
 };
 
@@ -19,6 +20,9 @@ fn test_client_hello_serialization() {
         name: "Test Player".to_string(),
         version: 1,
         supported_roles: vec!["player@v1".to_string()],
+            trust_level: TrustLevel::default(),
+            supported_pair_methods: None,
+            unpaired_access: UnpairedAccess::default(),
         device_info: Some(DeviceInfo {
             product_name: Some("Sendspin-RS Player".to_string()),
             manufacturer: Some("Sendspin".to_string()),
@@ -579,6 +583,9 @@ fn test_visualizer_negotiation_serialization() {
         name: "Visualizer".to_string(),
         version: 1,
         supported_roles: vec!["visualizer@v1".to_string()],
+            trust_level: TrustLevel::default(),
+            supported_pair_methods: None,
+            unpaired_access: UnpairedAccess::default(),
         device_info: None,
         player_v1_support: None,
         artwork_v1_support: None,
@@ -1339,4 +1346,103 @@ fn test_artwork_format_request_from_wire_json() {
     assert_eq!(parsed.format, Some(ImageFormat::Png));
     assert_eq!(parsed.media_width, Some(400));
     assert_eq!(parsed.media_height, Some(400));
+}
+
+#[test]
+fn hello_declares_trust_and_unpaired_access_by_default() {
+    // A client with no trust store extends no trust and does admit unpaired servers.
+    // Both statements are true of this library, and a server that reads neither field
+    // sees the same hello it always did.
+    let hello = ClientHello {
+        client_id: "c1".to_string(),
+        name: "Test".to_string(),
+        version: 1,
+        supported_roles: vec!["player@v1".to_string()],
+        trust_level: TrustLevel::default(),
+        supported_pair_methods: None,
+        unpaired_access: UnpairedAccess::default(),
+        device_info: None,
+        player_v1_support: None,
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+    let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
+    assert!(json.contains(r#""trust_level":"none""#));
+    assert!(json.contains(r#""unpaired_access":{"enabled":true}"#));
+    assert!(!json.contains("supported_pair_methods"));
+}
+
+#[test]
+fn a_pin_offer_carries_only_the_fields_that_method_uses() {
+    let descriptor = PairMethodDescriptor {
+        method: PairMethod::DynamicPin,
+        out_channels: Some(vec!["display".to_string()]),
+        locked_out: Some(false),
+        min_pin_length: Some(6),
+    };
+    let json = serde_json::to_string(&descriptor).unwrap();
+    assert_eq!(
+        json,
+        r#"{"method":"dynamic_pin","out_channels":["display"],"locked_out":false,"min_pin_length":6}"#
+    );
+
+    let psk = PairMethodDescriptor {
+        method: PairMethod::PairingPsk,
+        out_channels: None,
+        locked_out: None,
+        min_pin_length: None,
+    };
+    assert_eq!(
+        serde_json::to_string(&psk).unwrap(),
+        r#"{"method":"pairing_psk"}"#
+    );
+}
+
+#[test]
+fn a_hello_without_the_pairing_fields_still_parses() {
+    // Every server sending the older hello, and every recorded fixture, omits them.
+    let hello: ClientHello = serde_json::from_str(
+        r#"{"client_id":"c1","name":"Test","version":1,"supported_roles":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(hello.trust_level, TrustLevel::None);
+    assert!(hello.unpaired_access.enabled);
+    assert!(hello.supported_pair_methods.is_none());
+}
+
+#[test]
+fn a_pairing_server_hello_carries_the_method_it_picked() {
+    let json = r#"{
+        "type": "server/hello",
+        "payload": {
+            "server_id": "s1",
+            "name": "Test",
+            "version": 1,
+            "active_roles": ["player@v1"],
+            "connection_reason": "playback",
+            "selected_pair_method": "static_pin"
+        }
+    }"#;
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    let Message::ServerHello(hello) = parsed else {
+        panic!("expected server/hello");
+    };
+    assert_eq!(hello.selected_pair_method, Some(PairMethod::StaticPin));
+
+    // And is absent on every other kind of connection.
+    let json = r#"{
+        "type": "server/hello",
+        "payload": {
+            "server_id": "s1",
+            "name": "Test",
+            "version": 1,
+            "active_roles": [],
+            "connection_reason": "discovery"
+        }
+    }"#;
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    let Message::ServerHello(hello) = parsed else {
+        panic!("expected server/hello");
+    };
+    assert_eq!(hello.selected_pair_method, None);
 }

@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Declare `trust_level`, `unpaired_access` and (optionally) `supported_pair_methods` in
+  `client/hello`, and read `selected_pair_method` from `server/hello`. New builder setters
+  for the first three; the defaults describe a client without a trust store.
+
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.

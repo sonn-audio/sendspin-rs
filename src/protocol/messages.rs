@@ -86,6 +86,15 @@ pub struct ClientHello {
     pub version: u32,
     /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
+    /// Trust this client extends to this server. `none` on an unpaired connection.
+    #[serde(default)]
+    pub trust_level: TrustLevel,
+    /// Pairing methods this client offers. Omitted by a client that cannot pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supported_pair_methods: Option<Vec<PairMethodDescriptor>>,
+    /// Whether this client currently admits unpaired access.
+    #[serde(default)]
+    pub unpaired_access: UnpairedAccess,
     /// Device information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_info: Option<DeviceInfo>,
@@ -101,6 +110,71 @@ pub struct ClientHello {
         skip_serializing_if = "Option::is_none"
     )]
     pub visualizer_v1_support: Option<VisualizerV1Support>,
+}
+
+/// How much a client trusts the server on the other end of a connection.
+///
+/// The client's own judgement, sent in `client/hello`: it governs which management
+/// operations the server may perform on this client, not what the server thinks of the
+/// client. `None` is the honest answer for an unpaired connection, which is every
+/// connection until a pairing exchange has happened.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TrustLevel {
+    /// No trust: unpaired, or mid-pairing. Management operations are refused.
+    #[default]
+    None,
+    /// Paired by a user, which is what admits management.
+    User,
+}
+
+/// A pairing method a client offers, or a server selects.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PairMethod {
+    /// A PIN the client generates and conveys to the operator.
+    DynamicPin,
+    /// A pre-shared key both sides already hold.
+    PairingPsk,
+    /// A fixed PIN, printed on the device or in its manual.
+    StaticPin,
+    /// A method this build does not know (forward compatibility).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One pairing method a client offers, with the details that method needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairMethodDescriptor {
+    /// Which method.
+    pub method: PairMethod,
+    /// `dynamic_pin` only: how the PIN reaches the operator (e.g. `display`, `voice`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_channels: Option<Vec<String>>,
+    /// PIN methods only: whether the method is in terminal lockout after failed attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_out: Option<bool>,
+    /// `dynamic_pin` only: shortest PIN the client will accept, in digits (4-12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_pin_length: Option<u8>,
+}
+
+/// Whether a client admits servers it has never paired with.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnpairedAccess {
+    /// True when an unpaired server may use this client.
+    pub enabled: bool,
+}
+
+impl Default for UnpairedAccess {
+    /// `true`, which is what a client with no trust store actually does.
+    ///
+    /// Claiming otherwise would be a promise this library cannot keep: nothing here can
+    /// turn an unpaired server away. Applications that add a trust store should say so
+    /// explicitly rather than inherit this.
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Device information (all fields optional per spec)
@@ -275,6 +349,13 @@ pub struct ServerHello {
     pub active_roles: Vec<String>,
     /// Reason for connection: 'discovery' or 'playback'
     pub connection_reason: ConnectionReason,
+    /// The pairing method the server picked from the client's offer.
+    ///
+    /// Present when `connection_reason` is `pairing`. A client that offered no methods
+    /// and receives one anyway is being asked for something it cannot do, which is worth
+    /// a `goodbye(unauthorized)` rather than a silent failure to pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pair_method: Option<PairMethod>,
 }
 
 /// Connection reason enum
