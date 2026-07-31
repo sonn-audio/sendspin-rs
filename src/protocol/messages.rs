@@ -277,14 +277,26 @@ pub struct ServerHello {
     pub connection_reason: ConnectionReason,
 }
 
-/// Connection reason enum
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Why a server opened this connection.
+///
+/// Ordered by how much it displaces: see [`should_switch`](crate::protocol::should_switch).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectionReason {
-    /// Server connected for discovery/announcement
+    /// General availability: initial discovery, or a reconnection.
     Discovery,
-    /// Server connected for active playback
+    /// A pairing handshake.
+    Pairing,
+    /// Active or upcoming playback.
     Playback,
+    /// A dedicated management session.
+    Management,
+    /// A reason this build does not know (forward compatibility).
+    ///
+    /// Treated as the lowest rank, which is the safe end: an unrecognised purpose does
+    /// not get to displace a server that is playing.
+    #[serde(other)]
+    Unknown,
 }
 
 // =============================================================================
@@ -848,6 +860,14 @@ pub enum GoodbyeReason {
     Restart,
     /// User requested disconnect
     UserRequest,
+    /// The server asked for something this client's trust level does not permit
+    Unauthorized,
+    /// The server asked for playback, but this client requires pairing first
+    PairingRequired,
+    /// Rejected because another connection is already admitted
+    ConcurrentAttempt,
+    /// This client processed `server/unpair` from the server
+    Unpaired,
 }
 
 // =============================================================================

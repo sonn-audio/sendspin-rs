@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the `pairing` and `management` connection reasons and the `unauthorized`,
+  `pairing_required`, `concurrent_attempt` and `unpaired` goodbye reasons. Arbitration
+  now ranks a connection by purpose (management > playback > pairing > discovery), which
+  leaves the behaviour of the existing two reasons unchanged.
+
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.

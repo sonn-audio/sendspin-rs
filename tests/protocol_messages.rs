@@ -1121,7 +1121,9 @@ fn test_server_hello_missing_required_fields() {
 }
 
 #[test]
-fn test_invalid_connection_reason_rejected() {
+fn test_unknown_connection_reason_is_accepted_as_unknown() {
+    // See `an_unknown_connection_reason_does_not_fail_the_handshake`: the reason lives
+    // inside server/hello, so refusing the value refuses the server.
     let json = r#"{
         "type": "server/hello",
         "payload": {
@@ -1132,8 +1134,11 @@ fn test_invalid_connection_reason_rejected() {
             "connection_reason": "invalid_reason"
         }
     }"#;
-    let result = serde_json::from_str::<Message>(json);
-    assert!(result.is_err());
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    let Message::ServerHello(hello) = parsed else {
+        panic!("expected server/hello");
+    };
+    assert_eq!(hello.connection_reason, ConnectionReason::Unknown);
 }
 
 #[test]
@@ -1339,4 +1344,56 @@ fn test_artwork_format_request_from_wire_json() {
     assert_eq!(parsed.format, Some(ImageFormat::Png));
     assert_eq!(parsed.media_width, Some(400));
     assert_eq!(parsed.media_height, Some(400));
+}
+
+#[test]
+fn every_connection_reason_the_spec_defines_parses() {
+    for (wire, expected) in [
+        ("discovery", ConnectionReason::Discovery),
+        ("pairing", ConnectionReason::Pairing),
+        ("playback", ConnectionReason::Playback),
+        ("management", ConnectionReason::Management),
+    ] {
+        let parsed: ConnectionReason = serde_json::from_str(&format!("\"{}\"", wire)).expect(wire);
+        assert_eq!(parsed, expected);
+    }
+}
+
+#[test]
+fn an_unknown_connection_reason_does_not_fail_the_handshake() {
+    // The reason arrives inside server/hello, so rejecting the value rejects the
+    // handshake: the client would refuse to talk to a server whose purpose it simply
+    // did not recognise.
+    let json = r#"{
+        "type": "server/hello",
+        "payload": {
+            "server_id": "s1",
+            "name": "Test",
+            "version": 1,
+            "active_roles": [],
+            "connection_reason": "teleconference"
+        }
+    }"#;
+    let parsed: Message = serde_json::from_str(json).unwrap();
+    let Message::ServerHello(hello) = parsed else {
+        panic!("expected server/hello");
+    };
+    assert_eq!(hello.connection_reason, ConnectionReason::Unknown);
+}
+
+#[test]
+fn the_goodbye_reasons_for_trust_and_admission_round_trip() {
+    for (reason, wire) in [
+        (GoodbyeReason::Unauthorized, "unauthorized"),
+        (GoodbyeReason::PairingRequired, "pairing_required"),
+        (GoodbyeReason::ConcurrentAttempt, "concurrent_attempt"),
+        (GoodbyeReason::Unpaired, "unpaired"),
+    ] {
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, format!("\"{}\"", wire));
+        assert_eq!(
+            serde_json::from_str::<GoodbyeReason>(&json).unwrap(),
+            reason
+        );
+    }
 }
