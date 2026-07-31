@@ -223,6 +223,8 @@ pub enum VisualizerDataType {
     Spectrum,
     /// Energy onset event.
     Peak,
+    /// Perceived pitch, as MIDI note in 8.8 fixed point plus a confidence.
+    Pitch,
 }
 
 /// Spectrum display-bin configuration.
