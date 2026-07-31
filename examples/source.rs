@@ -15,9 +15,9 @@ use sendspin::protocol::messages::{
     Message, SourceClientCommandType, SourceCommandType, SourceFeatures, SourceFormat,
     SourceSignal, SourceState, SourceStateType, SourceV1Support,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{Clock, ProtocolClientBuilder};
 use std::f64::consts::TAU;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Sendspin source client
 #[derive(Parser, Debug)]
@@ -96,6 +96,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sender = connection.sender;
     let _guard = connection.guard;
 
+    // Capture timestamps must be in the same timebase the filter runs on, which is the
+    // library's raw monotonic clock -- not SystemTime. Clock sync itself is handled
+    // inside the client; `server/time` never reaches this loop.
+    let clock = clock_sync.lock().clock();
+
     let mut streaming = args.start_streaming;
     if streaming {
         start_stream(&sender, &format).await?;
@@ -111,15 +116,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             message = messages.recv() => {
                 let Some(message) = message else { break };
                 match message {
-                    Message::ServerTime(server_time) => {
-                        let t4 = now_micros();
-                        clock_sync.lock().update(
-                            server_time.client_transmitted,
-                            server_time.server_received,
-                            server_time.server_transmitted,
-                            t4,
-                        );
-                    }
                     Message::ServerCommand(command) => {
                         let Some(source) = command.source else { continue };
                         if let Some(vad) = source.vad {
@@ -166,7 +162,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Capture time in the *server's* clock. While the filter is still
                 // settling there is no conversion yet, so there is nothing worth
                 // sending: a frame stamped with local time would never line up.
-                let Some(server_us) = clock_sync.lock().client_to_server_micros(now_micros()) else {
+                let capture_us = clock.now_micros();
+                let Some(server_us) = clock_sync.lock().client_to_server_micros(capture_us) else {
                     continue;
                 };
                 let frame = tone_frame(&mut phase, phase_step, frame_samples);
@@ -221,9 +218,3 @@ fn tone_frame(phase: &mut f64, phase_step: f64, samples: usize) -> Vec<u8> {
     out
 }
 
-fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_micros() as i64)
-        .unwrap_or_default()
-}
