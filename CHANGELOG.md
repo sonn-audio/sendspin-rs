@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add the `pitch` visualization type (binary slot 21) to the visualizer role, so a
+  perceived-pitch frame is delivered instead of rejected as a reserved slot.
+
 - Add spec-aligned `visualizer@v1` negotiation and forwarding for loudness, beat,
   dominant-frequency, spectrum, and peak data. Visualizer payloads remain raw
   bytes for applications to decode and render.

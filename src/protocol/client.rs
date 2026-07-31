@@ -516,6 +516,8 @@ pub mod binary_types {
     pub const VISUALIZER_SPECTRUM: u8 = 0x13;
     /// Visualizer energy-onset data (type 20).
     pub const VISUALIZER_PEAK: u8 = 0x14;
+    /// Visualizer perceived-pitch data (type 21).
+    pub const VISUALIZER_PITCH: u8 = 0x15;
     /// Check if a binary type ID is for artwork (8-11)
     pub fn is_artwork(type_id: u8) -> bool {
         (ARTWORK_CHANNEL_0..=ARTWORK_CHANNEL_3).contains(&type_id)
@@ -532,7 +534,7 @@ pub mod binary_types {
 
     /// Check if a binary type ID is for visualizer data (16-20).
     pub fn is_visualizer(type_id: u8) -> bool {
-        (VISUALIZER_LOUDNESS..=VISUALIZER_PEAK).contains(&type_id)
+        (VISUALIZER_LOUDNESS..=VISUALIZER_PITCH).contains(&type_id)
     }
 }
 
@@ -642,6 +644,7 @@ impl VisualizerChunk {
             binary_types::VISUALIZER_F_PEAK => Some(VisualizerDataType::FPeak),
             binary_types::VISUALIZER_SPECTRUM => Some(VisualizerDataType::Spectrum),
             binary_types::VISUALIZER_PEAK => Some(VisualizerDataType::Peak),
+            binary_types::VISUALIZER_PITCH => Some(VisualizerDataType::Pitch),
             _ => None,
         }
     }
@@ -657,7 +660,7 @@ impl VisualizerChunk {
 
         if !binary_types::is_visualizer(frame[0]) {
             return Err(Error::Protocol(format!(
-                "Invalid visualizer chunk type: expected 16-20, got {}",
+                "Invalid visualizer chunk type: expected 16-21, got {}",
                 frame[0]
             )));
         }

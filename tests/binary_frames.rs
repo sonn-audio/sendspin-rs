@@ -37,11 +37,11 @@ fn test_is_artwork() {
 
 #[test]
 fn test_is_visualizer() {
-    for type_id in 0x10..=0x14 {
+    for type_id in 0x10..=0x15 {
         assert!(binary_types::is_visualizer(type_id));
     }
     assert!(!binary_types::is_visualizer(0x0F));
-    assert!(!binary_types::is_visualizer(0x15));
+    assert!(!binary_types::is_visualizer(0x16));
 }
 
 #[test]
@@ -212,8 +212,9 @@ fn test_all_visualizer_types_are_accepted() {
         sendspin::protocol::messages::VisualizerDataType::FPeak,
         sendspin::protocol::messages::VisualizerDataType::Spectrum,
         sendspin::protocol::messages::VisualizerDataType::Peak,
+        sendspin::protocol::messages::VisualizerDataType::Pitch,
     ];
-    for (type_id, expected_type) in (0x10..=0x14).zip(expected) {
+    for (type_id, expected_type) in (0x10..=0x15).zip(expected) {
         let frame = [type_id, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
         let chunk = VisualizerChunk::from_bytes(&frame).unwrap();
         assert_eq!(chunk.type_id, type_id);
@@ -224,7 +225,8 @@ fn test_all_visualizer_types_are_accepted() {
 
 #[test]
 fn test_reserved_visualizer_type_is_rejected() {
-    let frame = [0x15, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
+    // 22 is the first slot the visualizer role does not define.
+    let frame = [0x16, 0, 0, 0, 0, 0, 0, 0, 1, 0xAA];
     assert!(VisualizerChunk::from_bytes(&frame).is_err());
 }
 
