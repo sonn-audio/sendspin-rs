@@ -35,6 +35,7 @@ fn test_client_hello_serialization() {
             buffer_capacity: 50 * 1024 * 1024, // 50 MB
             supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
+        source_v1_support: None,
         artwork_v1_support: None,
         visualizer_v1_support: None,
     };
@@ -587,6 +588,7 @@ fn test_visualizer_negotiation_serialization() {
         supported_roles: vec!["visualizer@v1".to_string()],
         device_info: None,
         player_v1_support: None,
+        source_v1_support: None,
         artwork_v1_support: None,
         visualizer_v1_support: Some(VisualizerV1Support {
             types: vec![VisualizerDataType::Loudness, VisualizerDataType::Spectrum],

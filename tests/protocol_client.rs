@@ -1447,9 +1447,9 @@ async fn test_peer_close_midstream_ends_stream_and_fails_sends() {
         last = conn
             .sender
             .send_message(Message::ClientCommand(ClientCommand {
-            controller: None,
-            source: None,
-        }))
+                controller: None,
+                source: None,
+            }))
             .await;
         if last.is_err() {
             break;

@@ -15,7 +15,7 @@ use sendspin::protocol::messages::{
     Message, SourceClientCommandType, SourceCommandType, SourceFeatures, SourceFormat,
     SourceSignal, SourceState, SourceStateType, SourceV1Support,
 };
-use sendspin::{Clock, ProtocolClientBuilder};
+use sendspin::ProtocolClientBuilder;
 use std::f64::consts::TAU;
 use std::time::Duration;
 
@@ -217,4 +217,3 @@ fn tone_frame(phase: &mut f64, phase_step: f64, samples: usize) -> Vec<u8> {
     }
     out
 }
-
