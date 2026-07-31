@@ -4,8 +4,8 @@ use crate::error::Error;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
-    PairMethodDescriptor, PlayerState, PlayerV1Support, TrustLevel, UnpairedAccess,
-    VisualizerV1Support,
+    PairMethodDescriptor, PlayerState, PlayerV1Support, SourceState, SourceV1Support, TrustLevel,
+    UnpairedAccess, VisualizerV1Support,
 };
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
@@ -29,10 +29,12 @@ pub(crate) struct ProtocolClientBuilderRaw {
     supported_pair_methods: Option<Vec<PairMethodDescriptor>>,
     unpaired_access: UnpairedAccess,
     player_v1_support: Option<PlayerV1Support>,
+    source_v1_support: Option<SourceV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    initial_source_state: Option<SourceState>,
     metadata: bool,
     controller: bool,
     color: bool,
@@ -43,6 +45,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         // Build supported_roles based on which supports are configured
         let mut supported_roles = Vec::new();
         let has_explicit_role = raw.player_v1_support.is_some()
+            || raw.source_v1_support.is_some()
             || raw.artwork_v1_support.is_some()
             || raw.visualizer_v1_support.is_some()
             || raw.metadata
@@ -82,6 +85,9 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         if player_v1_support.is_some() {
             supported_roles.push("player@v1".to_string());
         }
+        if raw.source_v1_support.is_some() {
+            supported_roles.push("source@v1".to_string());
+        }
         if raw.artwork_v1_support.is_some() {
             supported_roles.push("artwork@v1".to_string());
         }
@@ -111,10 +117,12 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
             supported_roles,
             player_v1_support,
             clock: Arc::new(DefaultClock::new()),
+            source_v1_support: raw.source_v1_support,
             artwork_v1_support: raw.artwork_v1_support,
             visualizer_v1_support: raw.visualizer_v1_support,
             initial_sync_state: raw.initial_sync_state,
             initial_player_state: raw.initial_player_state,
+            initial_source_state: raw.initial_source_state,
         }
     }
 }
@@ -148,6 +156,8 @@ pub struct ProtocolClientBuilderFields {
     unpaired_access: UnpairedAccess,
     #[builder(default = None, setter(transform = |x: PlayerV1Support| Some(x)))]
     player_v1_support: Option<PlayerV1Support>,
+    #[builder(default = None, setter(transform = |x: SourceV1Support| Some(x)))]
+    source_v1_support: Option<SourceV1Support>,
     #[builder(default = None, setter(transform = |x: ArtworkV1Support| Some(x)))]
     artwork_v1_support: Option<ArtworkV1Support>,
     #[builder(default = None, setter(transform = |x: VisualizerV1Support| Some(x)))]
@@ -158,6 +168,10 @@ pub struct ProtocolClientBuilderFields {
     initial_sync_state: ClientSyncState,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
+    /// Initial source state sent in the first `client/state`. Required by the
+    /// spec for a source client, the way player state is for a player.
+    #[builder(default = None, setter(transform = |x: SourceState| Some(x)))]
+    initial_source_state: Option<SourceState>,
     #[builder(default = false, setter(transform = || true))]
     metadata: bool,
     #[builder(default = false, setter(transform = || true))]
@@ -179,10 +193,12 @@ impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
             supported_pair_methods: fields.supported_pair_methods,
             unpaired_access: fields.unpaired_access,
             player_v1_support: fields.player_v1_support,
+            source_v1_support: fields.source_v1_support,
             artwork_v1_support: fields.artwork_v1_support,
             visualizer_v1_support: fields.visualizer_v1_support,
             initial_sync_state: fields.initial_sync_state,
             initial_player_state: fields.initial_player_state,
+            initial_source_state: fields.initial_source_state,
             metadata: fields.metadata,
             controller: fields.controller,
             color: fields.color,
@@ -205,10 +221,12 @@ pub struct ProtocolClientBuilder {
     unpaired_access: UnpairedAccess,
     supported_roles: Vec<String>,
     player_v1_support: Option<PlayerV1Support>,
+    source_v1_support: Option<SourceV1Support>,
     artwork_v1_support: Option<ArtworkV1Support>,
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    initial_source_state: Option<SourceState>,
     clock: Arc<dyn Clock>,
 }
 
@@ -298,12 +316,14 @@ impl ProtocolClientBuilder {
                 mac_address: self.mac_address,
             }),
             player_v1_support: self.player_v1_support,
+            source_v1_support: self.source_v1_support,
             artwork_v1_support: self.artwork_v1_support,
             visualizer_v1_support: self.visualizer_v1_support,
         };
 
         let initial_state = ClientState {
             player: self.initial_player_state,
+            source: self.initial_source_state,
             ..ClientState::availability(self.initial_sync_state)
         };
 

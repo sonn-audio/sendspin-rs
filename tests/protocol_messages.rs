@@ -39,6 +39,7 @@ fn test_client_hello_serialization() {
             buffer_capacity: 50 * 1024 * 1024, // 50 MB
             supported_commands: vec!["volume".to_string(), "mute".to_string()],
         }),
+        source_v1_support: None,
         artwork_v1_support: None,
         visualizer_v1_support: None,
     };
@@ -96,6 +97,7 @@ fn test_client_state_serialization() {
             min_buffer_ms: Some(500),
             supported_commands: None,
         }),
+        source: None,
     };
 
     let message = Message::ClientState(state);
@@ -113,6 +115,7 @@ fn test_client_sync_state_external_source() {
         available: Some(false),
         state: Some(ClientSyncState::ExternalSource),
         player: None,
+        source: None,
     };
 
     let message = Message::ClientState(state);
@@ -216,6 +219,7 @@ fn test_client_command_serialization() {
             position_ms: None,
             offset_ms: None,
         }),
+        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -286,6 +290,7 @@ fn test_client_command_volume() {
             position_ms: None,
             offset_ms: None,
         }),
+        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -304,6 +309,7 @@ fn test_client_command_seek() {
             position_ms: Some(90_500),
             offset_ms: None,
         }),
+        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -336,6 +342,7 @@ fn test_client_command_seek_relative() {
             position_ms: None,
             offset_ms: Some(-10_000),
         }),
+        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -590,6 +597,7 @@ fn test_visualizer_negotiation_serialization() {
         unpaired_access: UnpairedAccess::default(),
         device_info: None,
         player_v1_support: None,
+        source_v1_support: None,
         artwork_v1_support: None,
         visualizer_v1_support: Some(VisualizerV1Support {
             types: vec![VisualizerDataType::Loudness, VisualizerDataType::Spectrum],
@@ -1286,6 +1294,7 @@ fn test_player_state_supported_commands_roundtrip() {
             min_buffer_ms: Some(500),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         }),
+        source: None,
     };
 
     let message = Message::ClientState(state);
@@ -1557,6 +1566,7 @@ fn hello_declares_trust_and_unpaired_access_by_default() {
         unpaired_access: UnpairedAccess::default(),
         device_info: None,
         player_v1_support: None,
+        source_v1_support: None,
         artwork_v1_support: None,
         visualizer_v1_support: None,
     };
