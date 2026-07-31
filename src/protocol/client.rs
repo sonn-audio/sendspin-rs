@@ -216,13 +216,10 @@ impl WsSender {
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?
     }
 
-    /// Send a top-level client synchronization state update.
+    /// Send a top-level client availability update.
     pub async fn send_sync_state(&self, state: ClientSyncState) -> Result<(), Error> {
-        self.send_message(Message::ClientState(ClientState {
-            state: Some(state),
-            player: None,
-        }))
-        .await
+        self.send_message(Message::ClientState(ClientState::availability(state)))
+            .await
     }
 
     /// Tell the server this client is temporarily owned by another audio source.
@@ -242,8 +239,8 @@ impl WsSender {
     /// software [`GainControl`](crate::audio::GainControl).
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
         self.send_message(Message::ClientState(ClientState {
-            state: Some(ClientSyncState::Synchronized),
             player,
+            ..ClientState::availability(ClientSyncState::Synchronized)
         }))
         .await
     }

@@ -274,8 +274,8 @@ impl ProtocolClientBuilder {
         };
 
         let initial_state = ClientState {
-            state: Some(self.initial_sync_state),
             player: self.initial_player_state,
+            ..ClientState::availability(self.initial_sync_state)
         };
 
         (hello, initial_state, self.clock)
