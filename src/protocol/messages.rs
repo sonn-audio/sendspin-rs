@@ -351,8 +351,10 @@ impl ClientState {
     /// update that carries only player volume says nothing about availability, and
     /// reading that as "do not send audio" would silence the room.
     pub fn is_available(&self) -> Option<bool> {
-        self.available
-            .or_else(|| self.state.map(|state| state == ClientSyncState::Synchronized))
+        self.available.or_else(|| {
+            self.state
+                .map(|state| state == ClientSyncState::Synchronized)
+        })
     }
 }
 
