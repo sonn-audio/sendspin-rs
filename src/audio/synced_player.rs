@@ -757,9 +757,7 @@ impl SyncedPlayer {
         let initial_gain = cb_config.gain_control.gain();
         let mut gain_ramp = GainRamp::new(sample_rate, initial_gain);
         let mut f32_buffer = Vec::<f32>::new();
-        let device_config = device
-            .default_output_config()
-            .map_err(|e| Error::Output(e.to_string()))?;
+        let device_config = output_config_for(device, &format)?;
         let mut stream_config = device_config.config();
         stream_config.buffer_size = config.buffer_size;
         stream_config.channels = format.channels.into();
@@ -1465,6 +1463,108 @@ impl SyncedPlayer {
                 device_config.sample_format()
             ))),
         }
+    }
+}
+
+/// Pick an output configuration that can actually carry this stream.
+///
+/// `default_output_config()` describes what the card would like to do, not what this stream needs,
+/// and asking for something else is not refused: cpal's ALSA backend sets the rate with
+/// `ValueOr::Nearest`, so a 44.1 kHz stream on a card whose default configuration only does 48 kHz
+/// opens *successfully* at 48 kHz. The audio then plays 8.8% fast -- clearly pitched, with nothing in
+/// any log to say why, because every layer believes it got what it asked for.
+///
+/// So the configuration is chosen from the ones the device says it supports, and only from those
+/// that contain the requested rate and channel count. The sample format is chosen to fit the
+/// stream's own bit depth, which keeps a 24-bit stream from being folded into 16 bits by a card
+/// whose default happens to be 16.
+fn output_config_for(
+    device: &Device,
+    format: &AudioFormat,
+) -> Result<cpal::SupportedStreamConfig, Error> {
+    let channels = u16::from(format.channels);
+    let rate = format.sample_rate;
+
+    let supported = device
+        .supported_output_configs()
+        .map_err(|e| Error::Output(e.to_string()))?;
+    let mut usable: Vec<_> = supported
+        .filter(|config| config.channels() == channels)
+        .filter(|config| config.min_sample_rate() <= rate && rate <= config.max_sample_rate())
+        .collect();
+    usable.sort_by_key(|config| sample_format_rank(config.sample_format(), format.bit_depth));
+
+    if let Some(config) = usable.into_iter().next() {
+        let config = config.with_sample_rate(rate);
+        log::debug!(
+            "Output configuration for {} Hz/{}-bit/{}ch: {:?}",
+            rate,
+            format.bit_depth,
+            channels,
+            config
+        );
+        return Ok(config);
+    }
+
+    // Nothing advertised fits. Opening anyway is still the best move -- the device may accept more
+    // than it admits to -- but this is the one moment where a resampled or pitched stream becomes
+    // possible, so it is said out loud rather than discovered by ear.
+    let fallback = device
+        .default_output_config()
+        .map_err(|e| Error::Output(e.to_string()))?;
+    log::warn!(
+        "No advertised output configuration supports {} Hz on {} channels; falling back to the device default ({:?}). Playback may be resampled or off-pitch.",
+        rate,
+        channels,
+        fallback
+    );
+    Ok(fallback)
+}
+
+/// How well a sample format carries `bit_depth`, lower is better.
+///
+/// Everything is rendered from `f32`, so any format *works*; this only decides how much of the
+/// stream survives. An exact width is best, a float or a wider integer costs nothing but bytes, and
+/// a narrower one is last because it is the only choice that throws detail away.
+fn sample_format_rank(candidate: SampleFormat, bit_depth: u8) -> u8 {
+    let exact = match bit_depth {
+        16 => candidate == SampleFormat::I16,
+        24 => candidate == SampleFormat::I24,
+        32 => candidate == SampleFormat::I32,
+        _ => false,
+    };
+    if exact {
+        return 0;
+    }
+    match candidate {
+        SampleFormat::F32 | SampleFormat::F64 => 1,
+        SampleFormat::I24 | SampleFormat::I32 | SampleFormat::I64 => 2,
+        SampleFormat::I16 => 3,
+        _ => 4,
+    }
+}
+
+#[cfg(test)]
+mod config_choice_tests {
+    use super::*;
+
+    #[test]
+    fn the_sample_format_follows_the_stream_not_the_card() {
+        // Exact width first: a 24-bit stream should reach a 24-bit card intact.
+        assert_eq!(sample_format_rank(SampleFormat::I24, 24), 0);
+        assert_eq!(sample_format_rank(SampleFormat::I16, 16), 0);
+
+        // Then anything that still carries all of it.
+        assert!(
+            sample_format_rank(SampleFormat::F32, 24) < sample_format_rank(SampleFormat::I16, 24)
+        );
+        assert!(
+            sample_format_rank(SampleFormat::I32, 24) < sample_format_rank(SampleFormat::I16, 24)
+        );
+
+        // Narrowing is last: it is the only option that throws detail away, which is what a card
+        // whose default happens to be 16-bit would otherwise impose on every stream.
+        assert_eq!(sample_format_rank(SampleFormat::I16, 24), 3);
     }
 }
 
