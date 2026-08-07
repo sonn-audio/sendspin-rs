@@ -45,6 +45,8 @@ pub mod keys;
 pub mod models;
 /// The Pairing PSK flow.
 pub mod pairing;
+/// The in-band re-handshake.
+pub mod rehandshake;
 /// The KKpsk2 session: handshake and transport.
 pub mod session;
 /// The client's pairing records and pairing configuration.
@@ -58,6 +60,7 @@ pub use models::{ClientInit, NoiseHandshake, ServerInit};
 pub use pairing::{
     ClientPairFinalize, PairAbort, PairAbortReason, PairingAction, ServerPairFinalize,
 };
+pub use rehandshake::{run_rehandshake_client, RehandshakeResult};
 pub use session::{CipherSuite, NoiseSession};
 pub use trust_store::{InMemoryPairingStore, PairingConfig, PairingRecord, PairingStore};
 pub use wire::{Frame, Reassembler};

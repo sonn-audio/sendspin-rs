@@ -60,6 +60,11 @@ impl CipherSuite {
 pub struct NoiseSession {
     state: SessionState,
     suite: CipherSuite,
+    /// The handshake hash, captured before transport mode consumes the handshake state.
+    ///
+    /// Kept because it is the prologue for a later in-band re-handshake, which happens well
+    /// after the handshake state itself is gone.
+    handshake_hash: Option<[u8; KEY_LEN]>,
 }
 
 enum SessionState {
@@ -91,6 +96,7 @@ impl NoiseSession {
         Ok(Self {
             state: SessionState::Handshake(Box::new(state)),
             suite,
+            handshake_hash: None,
         })
     }
 
@@ -115,6 +121,7 @@ impl NoiseSession {
         Ok(Self {
             state: SessionState::Handshake(Box::new(state)),
             suite,
+            handshake_hash: None,
         })
     }
 
@@ -139,14 +146,18 @@ impl NoiseSession {
 
     /// The handshake hash `h`.
     ///
-    /// This is the prologue for a subsequent in-band re-handshake, so it has to remain
-    /// readable after the session reaches transport mode.
+    /// Remains readable in transport mode, because that is when it is needed: it is the
+    /// prologue for an in-band re-handshake, which the server may start at any point in a
+    /// long-running session.
     pub fn handshake_hash(&self) -> Result<[u8; KEY_LEN], Error> {
+        if let Some(hash) = self.handshake_hash {
+            return Ok(hash);
+        }
         let raw = match &self.state {
             SessionState::Handshake(hs) => hs.get_handshake_hash(),
             SessionState::Transport(_) => {
                 return Err(Error::Protocol(
-                    "handshake hash must be captured before entering transport mode".to_string(),
+                    "handshake hash was not captured before entering transport mode".to_string(),
                 ))
             }
             SessionState::Poisoned => {
@@ -190,6 +201,11 @@ impl NoiseSession {
 
     /// Move to transport mode once the handshake has finished.
     pub fn into_transport_mode(&mut self) -> Result<(), Error> {
+        // Capture the hash while the handshake state still exists: entering transport mode
+        // consumes it, and a re-handshake later needs it as its prologue.
+        if self.handshake_hash.is_none() {
+            self.handshake_hash = self.handshake_hash().ok();
+        }
         let state = std::mem::replace(&mut self.state, SessionState::Poisoned);
         match state {
             SessionState::Handshake(hs) => {

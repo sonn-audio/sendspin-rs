@@ -16,6 +16,13 @@ pub enum Message {
     #[serde(rename = "server/activate")]
     ServerActivate(ServerActivate),
 
+    /// One Noise handshake message, carried inside the encrypted channel.
+    ///
+    /// Only appears for an in-band re-handshake; a first handshake's two messages travel as
+    /// cleartext text frames, before there is a channel to put them in.
+    #[serde(rename = "noise/handshake")]
+    NoiseHandshake(crate::noise::models::NoiseHandshake),
+
     /// Client delivers the long-term PSK for this (client, server) pair.
     #[serde(rename = "client/pair-finalize")]
     ClientPairFinalize(crate::noise::pairing::ClientPairFinalize),
