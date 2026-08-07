@@ -12,6 +12,8 @@
 
 /// Audio types and processing
 pub mod audio;
+/// The Noise-encrypted transport every current Sendspin connection runs on
+pub mod noise;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
 /// Clock synchronization utilities
@@ -20,6 +22,7 @@ pub mod sync;
 pub(crate) mod log_sampling;
 
 pub use audio::GainControl;
+pub use noise::{CipherSuite, ClientHandshake, Identity, Psk, PskCategory};
 pub use protocol::client::{Connection, ConnectionGuard, Controller, ProtocolClient, WsSender};
 pub use protocol::client_builder::ProtocolClientBuilder;
 pub use protocol::listener::ProtocolListener;
