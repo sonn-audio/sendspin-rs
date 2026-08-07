@@ -43,15 +43,23 @@ pub mod handshake;
 pub mod keys;
 /// The cleartext handshake messages.
 pub mod models;
+/// The Pairing PSK flow.
+pub mod pairing;
 /// The KKpsk2 session: handshake and transport.
 pub mod session;
+/// The client's pairing records and pairing configuration.
+pub mod trust_store;
 /// Encrypted binary framing, with fragmentation and reassembly.
 pub mod wire;
 
 pub use handshake::{ClientHandshake, HandshakeResult, HandshakeStep};
 pub use keys::{Identity, Psk, PskCategory};
 pub use models::{ClientInit, NoiseHandshake, ServerInit};
+pub use pairing::{
+    ClientPairFinalize, PairAbort, PairAbortReason, PairingAction, ServerPairFinalize,
+};
 pub use session::{CipherSuite, NoiseSession};
+pub use trust_store::{InMemoryPairingStore, PairingConfig, PairingRecord, PairingStore};
 pub use wire::{Frame, Reassembler};
 
 #[cfg(test)]

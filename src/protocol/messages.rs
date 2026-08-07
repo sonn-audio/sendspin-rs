@@ -16,6 +16,18 @@ pub enum Message {
     #[serde(rename = "server/activate")]
     ServerActivate(ServerActivate),
 
+    /// Client delivers the long-term PSK for this (client, server) pair.
+    #[serde(rename = "client/pair-finalize")]
+    ClientPairFinalize(crate::noise::pairing::ClientPairFinalize),
+
+    /// Server has persisted its pairing record.
+    #[serde(rename = "server/pair-finalize")]
+    ServerPairFinalize(crate::noise::pairing::ServerPairFinalize),
+
+    /// Either side aborts a pairing attempt.
+    #[serde(rename = "pair/abort")]
+    PairAbort(crate::noise::pairing::PairAbort),
+
     /// Server hello handshake response
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),
