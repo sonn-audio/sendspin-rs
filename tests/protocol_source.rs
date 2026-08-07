@@ -3,10 +3,10 @@
 
 use sendspin::protocol::client::pack_source_audio;
 use sendspin::protocol::messages::{
-    ClientCommand, ClientHello, ClientState, InputStreamEnd, InputStreamFormatRequest,
-    InputStreamSource, InputStreamStart, Message, ServerCommand, SourceClientCommand,
-    SourceClientCommandType, SourceCommandType, SourceControl, SourceFeatures, SourceFormat,
-    SourceSignal, SourceState, SourceStateType, SourceV1Support, TrustLevel, UnpairedAccess,
+    ClientCommand, ClientHello, ClientState, ClientStreamEnd, ClientStreamSource,
+    ClientStreamStart, Message, ServerCommand, SourceClientCommand, SourceClientCommandType,
+    SourceCommandType, SourceControl, SourceFeatures, SourceFormat, SourceSignal, SourceState,
+    SourceStateType, SourceV1Support, TrustLevel, UnpairedAccess,
 };
 
 fn support() -> SourceV1Support {
@@ -130,8 +130,8 @@ fn source_events_ride_in_client_command() {
 
 #[test]
 fn input_stream_lifecycle_round_trips() {
-    let start = serde_json::to_string(&Message::InputStreamStart(InputStreamStart {
-        source: InputStreamSource {
+    let start = serde_json::to_string(&Message::ClientStreamStart(ClientStreamStart {
+        source: ClientStreamSource {
             codec: "pcm".to_string(),
             channels: 2,
             sample_rate: 48_000,
@@ -140,28 +140,13 @@ fn input_stream_lifecycle_round_trips() {
         },
     }))
     .unwrap();
-    assert!(start.starts_with(r#"{"type":"input_stream/start""#));
+    assert!(start.starts_with(r#"{"type":"client_stream/start""#));
     assert!(!start.contains("codec_header"));
 
     // An empty payload object, not null: the server parses the envelope either way
     // but a null payload is not what the spec describes.
-    let end = serde_json::to_string(&Message::InputStreamEnd(InputStreamEnd {})).unwrap();
-    assert_eq!(end, r#"{"type":"input_stream/end","payload":{}}"#);
-
-    let raw = r#"{"type":"input_stream/request-format","payload":{"source":{"codec":"flac","sample_rate":44100}}}"#;
-    let parsed: Message = serde_json::from_str(raw).unwrap();
-    let Message::InputStreamRequestFormat(request) = parsed else {
-        panic!("expected input_stream/request-format");
-    };
-    assert_eq!(request.source.codec.as_deref(), Some("flac"));
-    assert_eq!(request.source.sample_rate, Some(44_100));
-    assert_eq!(request.source.bit_depth, None);
-}
-
-#[test]
-fn a_format_request_may_be_empty() {
-    let json = serde_json::to_string(&InputStreamFormatRequest::default()).unwrap();
-    assert_eq!(json, "{}");
+    let end = serde_json::to_string(&Message::ClientStreamEnd(ClientStreamEnd {})).unwrap();
+    assert_eq!(end, r#"{"type":"client_stream/end","payload":{}}"#);
 }
 
 #[test]

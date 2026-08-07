@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add the `source@v1` role: capture a local input and stream it to the server.
   Covers the `source@v1_support` hello object, source state (capture state, level,
   signal presence), server-driven start/stop with signal thresholds and transport
-  controls for the attached device, the `input_stream/start` / `input_stream/end` /
+  controls for the attached device, the `client_stream/start` / `client_stream/end` /
   `input_stream/request-format` lifecycle, and binary type 12 uplink frames
   (`WsSender::send_source_audio`). New `examples/source.rs` streams a test tone.
 

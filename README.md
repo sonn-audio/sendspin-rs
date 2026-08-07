@@ -191,7 +191,7 @@ let client = ProtocolClientBuilder::builder()
 
 The server drives capture with `server/command` (`start`/`stop`, optional signal thresholds,
 and transport controls for the attached device). Each stream is announced with
-`input_stream/start` before its first frame, so a format change is a stream boundary rather
+`client_stream/start` before its first frame, so a format change is a stream boundary rather
 than something the server has to infer:
 
 ```rust
@@ -207,8 +207,7 @@ Level and signal presence (`line_sense`) let a source whose activation is local 
 start a turntable remotely — tell the server the user has begun playing, via
 `send_source_event`. See `examples/source.rs` for a complete client.
 
-Note that `source@v1` is in the spec but not yet in `aiosendspin`; it is pending there as
-PR #286. This crate is ahead on that role rather than behind.
+`aiosendspin` gained the role in #322, which superseded the earlier #286.
 
 ## Architecture
 

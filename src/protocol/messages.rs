@@ -85,17 +85,14 @@ pub enum Message {
 
     // === Input stream control (source role) ===
     /// Client announces the format of the input stream it is about to send
-    #[serde(rename = "input_stream/start")]
-    InputStreamStart(InputStreamStart),
+    #[serde(rename = "client_stream/start")]
+    ClientStreamStart(ClientStreamStart),
 
     /// Client ends its input stream
-    #[serde(rename = "input_stream/end")]
-    InputStreamEnd(InputStreamEnd),
+    #[serde(rename = "client_stream/end")]
+    ClientStreamEnd(ClientStreamEnd),
 
     /// Server asks the source for a different input stream format
-    #[serde(rename = "input_stream/request-format")]
-    InputStreamRequestFormat(InputStreamRequestFormat),
-
     // === Group messages ===
     /// Group update notification
     #[serde(rename = "group/update")]
@@ -1204,7 +1201,7 @@ pub enum GoodbyeReason {
 // A source is the mirror image of a player: it captures audio from a local input
 // and streams it *to* the server, which does the resampling, mixing and
 // distribution. The server drives capture with `server/command` and the client
-// announces each stream's format with `input_stream/start` before the first
+// announces each stream's format with `client_stream/start` before the first
 // binary frame, so a format change is a stream boundary rather than a guess.
 
 /// Audio format of a source stream
@@ -1371,7 +1368,7 @@ pub struct SourceClientCommand {
 
 /// Format details of the input stream a source is about to send
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputStreamSource {
+pub struct ClientStreamSource {
     /// Codec name ("pcm", "flac", "opus")
     pub codec: String,
     /// Number of channels
@@ -1385,41 +1382,17 @@ pub struct InputStreamSource {
     pub codec_header: Option<String>,
 }
 
-/// `input_stream/start` payload
+/// `client_stream/start` payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputStreamStart {
+pub struct ClientStreamStart {
     /// Format of the stream that follows
-    pub source: InputStreamSource,
+    pub source: ClientStreamSource,
 }
 
-/// `input_stream/end` payload. Empty by design — which stream ended is implied by
+/// `client_stream/end` payload. Empty by design — which stream ended is implied by
 /// the connection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InputStreamEnd {}
-
-/// A format the server would prefer the source to send
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InputStreamFormatRequest {
-    /// Requested codec
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codec: Option<String>,
-    /// Requested channel count
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub channels: Option<u8>,
-    /// Requested sample rate in Hz
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<u32>,
-    /// Requested bit depth
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bit_depth: Option<u8>,
-}
-
-/// `input_stream/request-format` payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InputStreamRequestFormat {
-    /// The requested format
-    pub source: InputStreamFormatRequest,
-}
+pub struct ClientStreamEnd {}
 
 // =============================================================================
 // Legacy Aliases (deprecated)

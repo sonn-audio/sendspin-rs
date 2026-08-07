@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Some(SourceCommandType::Stop) if streaming => {
                                 println!("Server asked us to stop");
                                 streaming = false;
-                                sender.send_input_stream_end().await?;
+                                sender.send_client_stream_end().await?;
                                 sender.send_source_state(SourceState {
                                     state: SourceStateType::Idle,
                                     level: Some(0.0),
@@ -145,12 +145,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             _ => {}
                         }
-                    }
-                    Message::InputStreamRequestFormat(request) => {
-                        // This example only produces one format; re-announcing the
-                        // stream is the honest answer, not silently ignoring it.
-                        println!("Server requested {:?}; keeping ours", request.source);
-                        start_stream(&sender, &format).await?;
                     }
                     other => println!("Message: {:?}", other),
                 }
@@ -180,7 +174,7 @@ async fn start_stream(
     format: &SourceFormat,
 ) -> Result<(), Box<dyn std::error::Error>> {
     sender
-        .send_input_stream_start(sendspin::protocol::messages::InputStreamSource {
+        .send_client_stream_start(sendspin::protocol::messages::ClientStreamSource {
             codec: format.codec.clone(),
             channels: format.channels,
             sample_rate: format.sample_rate,

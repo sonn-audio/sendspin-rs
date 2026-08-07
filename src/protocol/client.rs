@@ -4,11 +4,12 @@
 use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
-    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
-    ClientTime, ConnectionReason, ControllerCommand, ControllerCommandType, GoodbyeReason,
-    InputStreamEnd, InputStreamSource, InputStreamStart, Message, PlayerFormatRequest, PlayerState,
-    RepeatMode, ServerHello, SourceClientCommand, SourceClientCommandType, SourceState, StreamEnd,
-    StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
+    ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientStreamEnd,
+    ClientStreamSource, ClientStreamStart, ClientSyncState, ClientTime, ConnectionReason,
+    ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
+    PlayerState, RepeatMode, ServerHello, SourceClientCommand, SourceClientCommandType,
+    SourceState, StreamEnd, StreamRequestFormat, StreamStart, VisualizerDataType,
+    VisualizerFormatRequest,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -733,14 +734,14 @@ impl WsSender {
     ///
     /// Sent before the first chunk of every stream, and again after a format
     /// change: the server treats it as the stream boundary.
-    pub async fn send_input_stream_start(&self, source: InputStreamSource) -> Result<(), Error> {
-        self.send_message(Message::InputStreamStart(InputStreamStart { source }))
+    pub async fn send_client_stream_start(&self, source: ClientStreamSource) -> Result<(), Error> {
+        self.send_message(Message::ClientStreamStart(ClientStreamStart { source }))
             .await
     }
 
     /// End the input stream, so the server tears down its ingest.
-    pub async fn send_input_stream_end(&self) -> Result<(), Error> {
-        self.send_message(Message::InputStreamEnd(InputStreamEnd {}))
+    pub async fn send_client_stream_end(&self) -> Result<(), Error> {
+        self.send_message(Message::ClientStreamEnd(ClientStreamEnd {}))
             .await
     }
 
