@@ -1,136 +1,138 @@
-// ABOUTME: Wire-format tests for the source@v1 role
-// ABOUTME: Covers hello support, state, server commands, input_stream lifecycle and binary framing
+// ABOUTME: Wire tests for the source@v1 role, pinned to the shapes the spec defines and
+// ABOUTME: aiosendspin implements — deliberately small, because the role is.
 
 use sendspin::protocol::client::pack_source_audio;
 use sendspin::protocol::messages::{
-    ClientCommand, ClientHello, ClientState, ClientStreamEnd, ClientStreamSource,
-    ClientStreamStart, Message, ServerCommand, SourceClientCommand, SourceClientCommandType,
-    SourceCommandType, SourceControl, SourceFeatures, SourceFormat, SourceSignal, SourceState,
-    SourceStateType, SourceV1Support, TrustLevel, UnpairedAccess,
+    ClientHello, ClientState, ClientStreamEnd, ClientStreamSource, ClientStreamStart, Message,
+    ServerCommand, SourceCommand, SourceCommandType, SourceFeatures, SourceSignal, SourceState,
+    SourceV1Support, TrustLevel, UnpairedAccess,
 };
 
-fn support() -> SourceV1Support {
-    SourceV1Support {
-        supported_formats: vec![SourceFormat {
-            codec: "pcm".to_string(),
-            channels: 2,
-            sample_rate: 48_000,
-            bit_depth: 16,
-        }],
-        controls: Some(vec![SourceControl::Play, SourceControl::Activate]),
+/// The support object is one optional flag, and that is the whole capability advertisement.
+///
+/// There is no format pre-negotiation in this role: the source announces its format in
+/// `client_stream/start`, and the server — which resamples and transcodes centrally — takes
+/// what it is given.
+#[test]
+fn the_support_object_advertises_only_line_sense() {
+    let support = SourceV1Support {
         features: Some(SourceFeatures {
-            level: Some(true),
             line_sense: Some(true),
         }),
-    }
-}
-
-#[test]
-fn hello_carries_the_versioned_support_key() {
-    let hello = ClientHello {
-        client_id: "kitchen-linein".to_string(),
-        name: "Kitchen Line-In".to_string(),
-        version: 1,
-        supported_roles: vec!["source@v1".to_string()],
-        trust_level: TrustLevel::default(),
-        supported_pair_methods: None,
-        unpaired_access: UnpairedAccess::default(),
-        device_info: None,
-        player_v1_support: None,
-        source_v1_support: Some(support()),
-        artwork_v1_support: None,
-        visualizer_v1_support: None,
     };
-
-    let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
-    // The versioned key is what the server looks for; a plain `source_support`
-    // silently deactivates the role.
-    assert!(json.contains("\"source@v1_support\""));
-    assert!(json.contains("\"supported_formats\""));
-    assert!(json.contains("\"line_sense\":true"));
-}
-
-#[test]
-fn source_state_omits_what_it_does_not_know() {
-    let json = serde_json::to_string(&Message::ClientState(ClientState {
-        available: None,
-        state: None,
-        player: None,
-        source: Some(SourceState {
-            state: SourceStateType::Streaming,
-            level: Some(0.42),
-            signal: Some(SourceSignal::Present),
-        }),
-    }))
-    .unwrap();
-    assert!(json.contains("\"source\":{\"state\":\"streaming\""));
-    assert!(json.contains("\"signal\":\"present\""));
-    // No player object on a source-only client, and no top-level state either.
-    assert!(!json.contains("\"player\""));
-}
-
-#[test]
-fn unknown_signal_is_a_value_not_a_fallback() {
-    let json = serde_json::to_string(&SourceSignal::Unknown).unwrap();
-    assert_eq!(json, "\"unknown\"");
-}
-
-#[test]
-fn server_command_carries_start_and_vad_settings() {
-    let raw = r#"{"type":"server/command","payload":{"source":{"command":"start","vad":{"threshold_db":-45.0,"hold_ms":2000}}}}"#;
-    let parsed: Message = serde_json::from_str(raw).unwrap();
-    let Message::ServerCommand(ServerCommand { source, .. }) = parsed else {
-        panic!("expected server/command");
-    };
-    let source = source.expect("source command");
-    assert_eq!(source.command, Some(SourceCommandType::Start));
-    let vad = source.vad.expect("vad settings");
-    assert_eq!(vad.threshold_db, Some(-45.0));
-    assert_eq!(vad.hold_ms, Some(2000));
-}
-
-#[test]
-fn server_command_control_reaches_the_attached_device() {
-    let raw = r#"{"type":"server/command","payload":{"source":{"control":"next"}}}"#;
-    let parsed: Message = serde_json::from_str(raw).unwrap();
-    let Message::ServerCommand(ServerCommand { source, .. }) = parsed else {
-        panic!("expected server/command");
-    };
-    let source = source.expect("source command");
-    assert_eq!(source.control, Some(SourceControl::Next));
-    assert_eq!(source.command, None);
-}
-
-#[test]
-fn an_unknown_control_parses_instead_of_failing() {
-    // Forward compatibility: a server that learns a new control must not take the
-    // connection down with it.
-    let raw = r#"{"type":"server/command","payload":{"source":{"control":"teleport"}}}"#;
-    let parsed: Message = serde_json::from_str(raw).unwrap();
-    let Message::ServerCommand(ServerCommand { source, .. }) = parsed else {
-        panic!("expected server/command");
-    };
-    assert_eq!(source.unwrap().control, Some(SourceControl::Unknown));
-}
-
-#[test]
-fn source_events_ride_in_client_command() {
-    let json = serde_json::to_string(&Message::ClientCommand(ClientCommand {
-        controller: None,
-        source: Some(SourceClientCommand {
-            command: SourceClientCommandType::Started,
-        }),
-    }))
-    .unwrap();
     assert_eq!(
-        json,
-        r#"{"type":"client/command","payload":{"source":{"command":"started"}}}"#
+        serde_json::to_string(&support).unwrap(),
+        r#"{"features":{"line_sense":true}}"#
+    );
+    // No features at all is valid: a source that senses nothing says nothing.
+    assert_eq!(
+        serde_json::to_string(&SourceV1Support::default()).unwrap(),
+        "{}"
     );
 }
 
 #[test]
-fn input_stream_lifecycle_round_trips() {
-    let start = serde_json::to_string(&Message::ClientStreamStart(ClientStreamStart {
+fn the_support_object_rides_under_its_versioned_key() {
+    let hello = ClientHello {
+        client_id: "c1".to_string(),
+        name: "Line In".to_string(),
+        version: 1,
+        supported_roles: vec!["source@v1".to_string()],
+        trust_level: TrustLevel::None,
+        supported_pair_methods: None,
+        unpaired_access: UnpairedAccess::default(),
+        device_info: None,
+        player_v1_support: None,
+        source_v1_support: Some(SourceV1Support::default()),
+        artwork_v1_support: None,
+        visualizer_v1_support: None,
+    };
+    let json = serde_json::to_string(&Message::ClientHello(hello)).unwrap();
+    assert!(json.contains(r#""source@v1_support":{}"#), "{json}");
+}
+
+/// `client/state.source` carries signal presence and nothing else. Whether the source is
+/// streaming is not reported: the server asked for it, and the stream messages mark the
+/// transitions.
+#[test]
+fn source_state_carries_only_signal() {
+    let state = ClientState {
+        available: Some(true),
+        state: None,
+        player: None,
+        source: Some(SourceState {
+            signal: Some(SourceSignal::Present),
+        }),
+    };
+    let json = serde_json::to_string(&Message::ClientState(state)).unwrap();
+    assert!(json.contains(r#""source":{"signal":"present"}"#), "{json}");
+    assert_eq!(
+        serde_json::to_string(&SourceState::default()).unwrap(),
+        "{}"
+    );
+}
+
+#[test]
+fn signal_values_use_the_spec_spellings() {
+    for (value, wire) in [
+        (SourceSignal::Present, "\"present\""),
+        (SourceSignal::Absent, "\"absent\""),
+    ] {
+        assert_eq!(serde_json::to_string(&value).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<SourceSignal>(wire).unwrap(), value);
+    }
+    // A value this build does not know must not fail the client/state it arrives in.
+    assert_eq!(
+        serde_json::from_str::<SourceSignal>("\"clipping\"").unwrap(),
+        SourceSignal::Unknown
+    );
+}
+
+/// `server/command.source` is one field with two values. The role is server-driven.
+#[test]
+fn server_command_carries_start_or_stop() {
+    for (wire, expected) in [
+        ("start", SourceCommandType::Start),
+        ("stop", SourceCommandType::Stop),
+    ] {
+        let raw =
+            format!(r#"{{"type":"server/command","payload":{{"source":{{"command":"{wire}"}}}}}}"#);
+        let parsed: Message = serde_json::from_str(&raw).unwrap();
+        let Message::ServerCommand(command) = parsed else {
+            panic!("expected server/command");
+        };
+        assert_eq!(command.source.unwrap().command, expected);
+    }
+}
+
+#[test]
+fn an_unknown_source_command_does_not_lose_the_message() {
+    let raw = r#"{"type":"server/command","payload":{"source":{"command":"pause"}}}"#;
+    let parsed: Message = serde_json::from_str(raw).unwrap();
+    let Message::ServerCommand(command) = parsed else {
+        panic!("expected server/command");
+    };
+    assert_eq!(command.source.unwrap().command, SourceCommandType::Unknown);
+}
+
+#[test]
+fn a_server_command_round_trips() {
+    let command = ServerCommand {
+        player: None,
+        source: Some(SourceCommand {
+            command: SourceCommandType::Start,
+        }),
+    };
+    assert_eq!(
+        serde_json::to_string(&Message::ServerCommand(command)).unwrap(),
+        r#"{"type":"server/command","payload":{"source":{"command":"start"}}}"#
+    );
+}
+
+/// The format announcement, which is where a source's format is settled for good.
+#[test]
+fn client_stream_start_announces_the_format() {
+    let start = ClientStreamStart {
         source: ClientStreamSource {
             codec: "pcm".to_string(),
             channels: 2,
@@ -138,32 +140,61 @@ fn input_stream_lifecycle_round_trips() {
             bit_depth: 16,
             codec_header: None,
         },
+    };
+    assert_eq!(
+        serde_json::to_string(&Message::ClientStreamStart(start)).unwrap(),
+        r#"{"type":"client_stream/start","payload":{"source":{"codec":"pcm","channels":2,"sample_rate":48000,"bit_depth":16}}}"#
+    );
+}
+
+#[test]
+fn a_flac_stream_carries_its_codec_header() {
+    // FLAC needs the fLaC marker and STREAMINFO out of band, standard Base64 with padding.
+    let start = ClientStreamStart {
+        source: ClientStreamSource {
+            codec: "flac".to_string(),
+            channels: 2,
+            sample_rate: 44_100,
+            bit_depth: 16,
+            codec_header: Some("ZkxhQwAAACI=".to_string()),
+        },
+    };
+    let json = serde_json::to_string(&start).unwrap();
+    assert!(json.contains(r#""codec_header":"ZkxhQwAAACI=""#), "{json}");
+}
+
+#[test]
+fn client_stream_end_is_an_empty_payload_object() {
+    // An empty object, not null: the envelope parses either way, but `{}` is what the spec
+    // and the reference both put on the wire.
+    assert_eq!(
+        serde_json::to_string(&Message::ClientStreamEnd(ClientStreamEnd {})).unwrap(),
+        r#"{"type":"client_stream/end","payload":{}}"#
+    );
+}
+
+#[test]
+fn the_stream_messages_use_the_names_the_spec_defines() {
+    // Regression: these were `input_stream/*`, which appears nowhere in the spec or in
+    // aiosendspin, so a source built on them could not reach any server.
+    let json = serde_json::to_string(&Message::ClientStreamStart(ClientStreamStart {
+        source: ClientStreamSource {
+            codec: "opus".to_string(),
+            channels: 2,
+            sample_rate: 48_000,
+            bit_depth: 16,
+            codec_header: None,
+        },
     }))
     .unwrap();
-    assert!(start.starts_with(r#"{"type":"client_stream/start""#));
-    assert!(!start.contains("codec_header"));
-
-    // An empty payload object, not null: the server parses the envelope either way
-    // but a null payload is not what the spec describes.
-    let end = serde_json::to_string(&Message::ClientStreamEnd(ClientStreamEnd {})).unwrap();
-    assert_eq!(end, r#"{"type":"client_stream/end","payload":{}}"#);
+    assert!(json.contains(r#""type":"client_stream/start""#), "{json}");
+    assert!(!json.contains("input_stream"), "{json}");
 }
 
 #[test]
-fn source_audio_frames_are_type_12_with_a_big_endian_timestamp() {
-    let framed = pack_source_audio(0x0102_0304_0506_0708, &[0xAA, 0xBB]);
-    assert_eq!(framed[0], 12);
-    assert_eq!(
-        &framed[1..9],
-        &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
-    );
-    assert_eq!(&framed[9..], &[0xAA, 0xBB]);
-}
-
-#[test]
-fn a_capture_timestamp_before_the_epoch_survives_the_round_trip() {
-    // i64, not u64: a monotonic-to-server conversion can legitimately land
-    // negative while the filter is still settling.
-    let framed = pack_source_audio(-1, &[]);
-    assert_eq!(&framed[1..9], &[0xFF; 8]);
+fn a_source_audio_chunk_is_type_12_with_a_big_endian_timestamp() {
+    let frame = pack_source_audio(0x0102_0304_0506_0708, &[0xAA, 0xBB]);
+    assert_eq!(frame[0], 12, "source audio is binary type 12");
+    assert_eq!(&frame[1..9], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(&frame[9..], &[0xAA, 0xBB]);
 }

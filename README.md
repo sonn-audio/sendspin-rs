@@ -167,47 +167,38 @@ tracing, and `RUST_LOG=trace` adds the per-callback sync detail.
 ## Sources (`source@v1`)
 
 A source is a player in reverse: it captures a local input — line-in, a turntable preamp, an
-HDMI capture card — and streams it to the server, which does the resampling, mixing and
-distribution. The device stays simple.
+HDMI capture card — and streams it to the server, which resamples, mixes and distributes it.
+
+The role is deliberately small. A source advertises at most that it can sense signal; there
+is no format negotiation, because the server transcodes centrally and takes whatever a source
+announces:
 
 ```rust
 let client = ProtocolClientBuilder::builder()
     .client_id("kitchen-linein".to_string())
     .name("Kitchen Line-In".to_string())
     .source_v1_support(SourceV1Support {
-        supported_formats: vec![SourceFormat {
-            codec: "pcm".to_string(), channels: 2, sample_rate: 48_000, bit_depth: 16,
-        }],
-        controls: None,
-        features: Some(SourceFeatures { level: Some(true), line_sense: Some(true) }),
+        features: Some(SourceFeatures { line_sense: Some(true) }),
     })
-    .initial_source_state(SourceState {
-        state: SourceStateType::Idle, level: Some(0.0), signal: Some(SourceSignal::Unknown),
-    })
+    .initial_source_state(SourceState { signal: Some(SourceSignal::Absent) })
     .build()
     .connect(url)
     .await?;
 ```
 
-The server drives capture with `server/command` (`start`/`stop`, optional signal thresholds,
-and transport controls for the attached device). Each stream is announced with
-`client_stream/start` before its first frame, so a format change is a stream boundary rather
-than something the server has to infer:
+The server drives capture with `server/command` (`start` / `stop`, both idempotent). Each
+stream is announced with `client_stream/start` before its first frame, so a format change is
+a stream boundary rather than something the server has to infer:
 
 ```rust
-sender.send_input_stream_start(InputStreamSource { /* codec, rate, depth */ }).await?;
-sender.send_source_state(SourceState { state: SourceStateType::Streaming, .. }).await?;
+sender.send_message(Message::ClientStreamStart(ClientStreamStart { source: format })).await?;
 
 // Capture timestamps go out in the *server's* clock.
 let server_us = clock_sync.lock().client_to_server_micros(capture_us).unwrap();
 sender.send_source_audio(server_us, &pcm_frame).await?;
 ```
 
-Level and signal presence (`line_sense`) let a source whose activation is local — nobody can
-start a turntable remotely — tell the server the user has begun playing, via
-`send_source_event`. See `examples/source.rs` for a complete client.
-
-`aiosendspin` gained the role in #322, which superseded the earlier #286.
+See `examples/source.rs` for a complete client.
 
 ## Architecture
 

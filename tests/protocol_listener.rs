@@ -343,10 +343,7 @@ async fn test_listen_send_message_fails_after_disconnect() {
         .expect("disconnect");
 
     let result = sender
-        .send_message(Message::ClientCommand(ClientCommand {
-            controller: None,
-            source: None,
-        }))
+        .send_message(Message::ClientCommand(ClientCommand { controller: None }))
         .await;
     assert!(
         result.is_err(),

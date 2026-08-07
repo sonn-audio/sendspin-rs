@@ -219,7 +219,6 @@ fn test_client_command_serialization() {
             position_ms: None,
             offset_ms: None,
         }),
-        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -290,7 +289,6 @@ fn test_client_command_volume() {
             position_ms: None,
             offset_ms: None,
         }),
-        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -309,7 +307,6 @@ fn test_client_command_seek() {
             position_ms: Some(90_500),
             offset_ms: None,
         }),
-        source: None,
     };
 
     let message = Message::ClientCommand(command);
@@ -342,7 +339,6 @@ fn test_client_command_seek_relative() {
             position_ms: None,
             offset_ms: Some(-10_000),
         }),
-        source: None,
     };
 
     let message = Message::ClientCommand(command);

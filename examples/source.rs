@@ -1,213 +1,158 @@
-// ABOUTME: End-to-end source@v1 example
-// ABOUTME: Streams a synthesised tone to the server on demand, with level and line-sense reporting
+// ABOUTME: A source@v1 client: captures a local input and streams it to the server,
+// ABOUTME: which resamples, mixes and distributes it to players.
 
-//! A source is a player in reverse: the server tells it when to capture, and it
-//! sends timestamped audio upstream for the server to resample, mix and
-//! distribute. This example uses a sine generator rather than a sound card so it
-//! runs anywhere, and mirrors the reference CLI's `--input sine` mode.
+//! A minimal `source@v1` client.
 //!
-//! ```sh
-//! RUST_LOG=info cargo run --example source -- --server ws://localhost:8927/sendspin
-//! ```
+//! A source is a player in reverse. The role is deliberately small: the client advertises at
+//! most that it can sense signal, the server drives capture with `server/command`, and the
+//! client announces its format in `client_stream/start` before the first chunk. There is no
+//! format negotiation — the server takes whatever a source announces and transcodes centrally.
+//!
+//! This example synthesizes a tone rather than opening a capture device, so it runs anywhere.
 
 use clap::Parser;
+use sendspin::protocol::messages::{ClientStreamSource, ClientStreamStart};
 use sendspin::protocol::messages::{
-    Message, SourceClientCommandType, SourceCommandType, SourceFeatures, SourceFormat,
-    SourceSignal, SourceState, SourceStateType, SourceV1Support,
+    Message, SourceCommandType, SourceFeatures, SourceSignal, SourceState, SourceV1Support,
 };
-use sendspin::ProtocolClientBuilder;
-use std::f64::consts::TAU;
-use std::time::Duration;
+use sendspin::{ProtocolClientBuilder, WsSender};
 
-/// Sendspin source client
 #[derive(Parser, Debug)]
-#[command(name = "source")]
-#[command(about = "Stream a test tone to a Sendspin server as a source@v1 client", long_about = None)]
+#[command(about = "Stream a local input to a Sendspin server", long_about = None)]
 struct Args {
-    /// WebSocket URL of the Sendspin server
+    /// WebSocket URL of the server.
     #[arg(short, long, default_value = "ws://localhost:8927/sendspin")]
     server: String,
 
-    /// Client name
-    #[arg(short, long, default_value = "Sendspin-RS Source")]
+    /// Client name.
+    #[arg(short, long, default_value = "Rust Line-In")]
     name: String,
-
-    /// Client ID (random UUID when omitted)
-    #[arg(short = 'i', long = "id")]
-    id: Option<String>,
-
-    /// Tone frequency in Hz
-    #[arg(long, default_value_t = 440.0)]
-    tone_hz: f64,
-
-    /// Frame size in milliseconds
-    #[arg(long, default_value_t = 20)]
-    frame_ms: u64,
-
-    /// Stream without waiting for the server to ask (for servers that only select
-    /// a source once it reports audio)
-    #[arg(long)]
-    start_streaming: bool,
 }
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u8 = 2;
 const BIT_DEPTH: u8 = 16;
+/// 20 ms of audio per chunk.
+const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE as usize) / 50;
+
+fn format() -> ClientStreamSource {
+    ClientStreamSource {
+        codec: "pcm".to_string(),
+        channels: CHANNELS,
+        sample_rate: SAMPLE_RATE,
+        bit_depth: BIT_DEPTH,
+        // PCM needs no header; FLAC would carry fLaC + STREAMINFO here.
+        codec_header: None,
+    }
+}
+
+async fn start_stream(sender: &WsSender) -> Result<(), Box<dyn std::error::Error>> {
+    sender
+        .send_message(Message::ClientStreamStart(ClientStreamStart {
+            source: format(),
+        }))
+        .await?;
+    sender
+        .send_source_state(SourceState {
+            signal: Some(SourceSignal::Present),
+        })
+        .await?;
+    println!("stream started");
+    Ok(())
+}
+
+async fn stop_stream(sender: &WsSender) -> Result<(), Box<dyn std::error::Error>> {
+    sender.send_client_stream_end().await?;
+    sender
+        .send_source_state(SourceState {
+            signal: Some(SourceSignal::Absent),
+        })
+        .await?;
+    println!("stream ended");
+    Ok(())
+}
+
+/// One 20 ms chunk of a 440 Hz tone, interleaved stereo, little-endian 16-bit.
+fn tone_chunk(phase: &mut f32) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(FRAMES_PER_CHUNK * CHANNELS as usize * 2);
+    let step = std::f32::consts::TAU * 440.0 / SAMPLE_RATE as f32;
+    for _ in 0..FRAMES_PER_CHUNK {
+        let sample = ((phase.sin() * 0.2) * i16::MAX as f32) as i16;
+        for _ in 0..CHANNELS {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        *phase += step;
+    }
+    pcm
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
-    let client_id = args.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let format = SourceFormat {
-        codec: "pcm".to_string(),
-        channels: CHANNELS,
-        sample_rate: SAMPLE_RATE,
-        bit_depth: BIT_DEPTH,
-    };
-
-    println!("Connecting to {}...", args.server);
     let client = ProtocolClientBuilder::builder()
-        .client_id(client_id)
-        .name(args.name)
+        .client_id(uuid::Uuid::new_v4().to_string())
+        .name(args.name.clone())
         .source_v1_support(SourceV1Support {
-            supported_formats: vec![format.clone()],
-            controls: None,
             features: Some(SourceFeatures {
-                level: Some(true),
                 line_sense: Some(true),
             }),
         })
-        // A source reports state from its first message, the way a player does.
         .initial_source_state(SourceState {
-            state: SourceStateType::Idle,
-            level: Some(0.0),
-            signal: Some(SourceSignal::Unknown),
+            signal: Some(SourceSignal::Absent),
         })
         .build()
         .connect(&args.server)
         .await?;
-    println!("Connected as {:?}", client.server_hello().active_roles);
 
-    let connection = client.split();
-    let mut messages = connection.messages;
-    let clock_sync = connection.clock_sync;
-    let sender = connection.sender;
-    let _guard = connection.guard;
+    println!("connected to {}", client.server_hello().name);
 
-    // Capture timestamps must be in the same timebase the filter runs on, which is the
-    // library's raw monotonic clock -- not SystemTime. Clock sync itself is handled
-    // inside the client; `server/time` never reaches this loop.
-    let clock = clock_sync.lock().clock();
+    let conn = client.split();
+    let mut messages = conn.messages;
+    let clock_sync = conn.clock_sync;
+    let sender = conn.sender;
+    let _guard = conn.guard;
 
-    let mut streaming = args.start_streaming;
-    if streaming {
-        start_stream(&sender, &format).await?;
-    }
-
-    let frame_samples = (SAMPLE_RATE as u64 * args.frame_ms / 1000) as usize;
-    let phase_step = TAU * args.tone_hz / SAMPLE_RATE as f64;
-    let mut phase = 0.0f64;
-    let mut ticker = tokio::time::interval(Duration::from_millis(args.frame_ms));
+    let mut streaming = false;
+    let mut phase = 0.0f32;
+    let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(20));
 
     loop {
         tokio::select! {
-            message = messages.recv() => {
-                let Some(message) = message else { break };
-                match message {
-                    Message::ServerCommand(command) => {
-                        let Some(source) = command.source else { continue };
-                        if let Some(vad) = source.vad {
-                            println!("VAD settings: {:?}", vad);
+            msg = messages.recv() => {
+                let Some(msg) = msg else { break };
+                if let Message::ServerCommand(command) = msg {
+                    let Some(source) = command.source else { continue };
+                    match source.command {
+                        // Both commands are idempotent by spec: a start while already
+                        // streaming must not restart the stream.
+                        SourceCommandType::Start if !streaming => {
+                            start_stream(&sender).await?;
+                            streaming = true;
                         }
-                        if let Some(control) = source.control {
-                            // A real source would forward this to whatever device is
-                            // wired to the input.
-                            println!("Control for the attached device: {:?}", control);
+                        SourceCommandType::Stop if streaming => {
+                            stop_stream(&sender).await?;
+                            streaming = false;
                         }
-                        match source.command {
-                            Some(SourceCommandType::Start) if !streaming => {
-                                println!("Server asked us to start");
-                                start_stream(&sender, &format).await?;
-                                streaming = true;
-                            }
-                            Some(SourceCommandType::Stop) if streaming => {
-                                println!("Server asked us to stop");
-                                streaming = false;
-                                sender.send_client_stream_end().await?;
-                                sender.send_source_state(SourceState {
-                                    state: SourceStateType::Idle,
-                                    level: Some(0.0),
-                                    signal: Some(SourceSignal::Absent),
-                                }).await?;
-                                sender.send_source_event(SourceClientCommandType::Stopped).await?;
-                            }
-                            _ => {}
-                        }
+                        _ => {}
                     }
-                    other => println!("Message: {:?}", other),
                 }
             }
             _ = ticker.tick() => {
                 if !streaming {
                     continue;
                 }
-                // Capture time in the *server's* clock. While the filter is still
-                // settling there is no conversion yet, so there is nothing worth
-                // sending: a frame stamped with local time would never line up.
-                let capture_us = clock.now_micros();
+                // Capture time goes out in the *server's* clock. While the filter is still
+                // settling there is no conversion yet, and a frame stamped with local time
+                // would never line up, so there is nothing worth sending.
+                let capture_us = clock_sync.lock().clock().now_micros();
                 let Some(server_us) = clock_sync.lock().client_to_server_micros(capture_us) else {
                     continue;
                 };
-                let frame = tone_frame(&mut phase, phase_step, frame_samples);
-                sender.send_source_audio(server_us, &frame).await?;
+                sender.send_source_audio(server_us, &tone_chunk(&mut phase)).await?;
             }
         }
     }
-
     Ok(())
-}
-
-async fn start_stream(
-    sender: &sendspin::WsSender,
-    format: &SourceFormat,
-) -> Result<(), Box<dyn std::error::Error>> {
-    sender
-        .send_client_stream_start(sendspin::protocol::messages::ClientStreamSource {
-            codec: format.codec.clone(),
-            channels: format.channels,
-            sample_rate: format.sample_rate,
-            bit_depth: format.bit_depth,
-            codec_header: None,
-        })
-        .await?;
-    sender
-        .send_source_state(SourceState {
-            state: SourceStateType::Streaming,
-            level: Some(0.5),
-            signal: Some(SourceSignal::Present),
-        })
-        .await?;
-    sender
-        .send_source_event(SourceClientCommandType::Started)
-        .await?;
-    Ok(())
-}
-
-/// One frame of 16-bit little-endian interleaved stereo.
-fn tone_frame(phase: &mut f64, phase_step: f64, samples: usize) -> Vec<u8> {
-    let amplitude = 0.3 * f64::from(i16::MAX);
-    let mut out = Vec::with_capacity(samples * usize::from(CHANNELS) * 2);
-    for _ in 0..samples {
-        let sample = (amplitude * phase.sin()) as i16;
-        *phase += phase_step;
-        if *phase > TAU {
-            *phase -= TAU;
-        }
-        for _ in 0..CHANNELS {
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
-    }
-    out
 }

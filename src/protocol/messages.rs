@@ -849,9 +849,6 @@ pub struct ClientCommand {
     /// Controller command
     #[serde(skip_serializing_if = "Option::is_none")]
     pub controller: Option<ControllerCommand>,
-    /// Source event (if the client has the source role)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<SourceClientCommand>,
 }
 
 /// Controller command from client
@@ -1204,166 +1201,71 @@ pub enum GoodbyeReason {
 // announces each stream's format with `client_stream/start` before the first
 // binary frame, so a format change is a stream boundary rather than a guess.
 
-/// Audio format of a source stream
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceFormat {
-    /// Codec name ("pcm", "flac", "opus")
-    pub codec: String,
-    /// Number of channels
-    pub channels: u8,
-    /// Sample rate in Hz
-    pub sample_rate: u32,
-    /// Bit depth per sample
-    pub bit_depth: u8,
-}
-
-/// Optional source capabilities
+/// What a source can report about its input.
+///
+/// The whole of the role's capability advertisement. There is no format negotiation: the
+/// spec is explicit that a source announces its input format in `client_stream/start` and
+/// the server, which resamples and transcodes centrally, accepts whatever it announces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceFeatures {
-    /// Client reports a normalized input level
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<bool>,
-    /// Client reports whether a signal is present on the input
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// True if this source reports signal presence in `client/state`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_sense: Option<bool>,
 }
 
-/// Transport controls a source client accepts on behalf of its input
-///
-/// An input that is a device of its own — a CD player, a tuner — can be told to
-/// play or skip. The server sends these; what they mean is the client's business.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceControl {
-    /// Start playback on the attached device
-    Play,
-    /// Pause playback on the attached device
-    Pause,
-    /// Next track on the attached device
-    Next,
-    /// Previous track on the attached device
-    Previous,
-    /// Power up / select the attached device
-    Activate,
-    /// Power down / deselect the attached device
-    Deactivate,
-    /// Unknown control (forward compatibility)
-    #[serde(other)]
-    Unknown,
-}
-
-/// Source@v1 capabilities, sent in `client/hello`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Source@v1 capabilities, as sent in `client/hello`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceV1Support {
-    /// Formats this input can deliver, best first
-    pub supported_formats: Vec<SourceFormat>,
-    /// Transport controls the client will act on
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub controls: Option<Vec<SourceControl>>,
-    /// Optional level/line-sense reporting
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional feature hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<SourceFeatures>,
 }
 
-/// Capture state of a source
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceStateType {
-    /// Not capturing
-    Idle,
-    /// Capturing and sending audio
-    Streaming,
-    /// Capture failed
-    Error,
-    /// Unknown state (forward compatibility)
-    #[serde(other)]
-    Unknown,
-}
-
-/// Whether a signal is present on the input.
-///
-/// `Unknown` is a real value here, not a parse fallback: a source that has just
-/// been started genuinely does not know yet.
+/// Whether audio is present on a source's input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceSignal {
-    /// Presence not determined yet
-    Unknown,
-    /// Audio is present on the input
+    /// Audio is present.
     Present,
-    /// The input is silent
+    /// No audio detected.
     Absent,
+    /// A value this build does not know (forward compatibility).
+    #[serde(other)]
+    Unknown,
 }
 
-/// Source state, sent in `client/state`
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Source state, as sent in `client/state`.
+///
+/// One field. Whether the source is streaming is not reported: the server asked for it, so
+/// it already knows, and `client_stream/start` and `client_stream/end` mark the transitions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SourceState {
-    /// Capture state
-    pub state: SourceStateType,
-    /// Normalized input level (0.0-1.0), if `level` is supported
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub level: Option<f32>,
-    /// Signal presence, if `line_sense` is supported
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Signal presence, only meaningful when `line_sense` is supported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal: Option<SourceSignal>,
 }
 
-/// What the server asks a source to do
+/// What the server asks a source to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceCommandType {
-    /// Begin capturing and streaming
+    /// Begin streaming: send `client_stream/start`, then audio chunks.
     Start,
-    /// Stop capturing
+    /// Stop streaming: send `client_stream/end` and stop sending chunks.
     Stop,
-    /// Unknown command (forward compatibility)
+    /// A command this build does not know (forward compatibility).
     #[serde(other)]
     Unknown,
 }
 
-/// Signal-detection settings the server can push down
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SourceVadSettings {
-    /// Level below which the input counts as silent, in dBFS
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub threshold_db: Option<f32>,
-    /// How long a level change must persist before it is reported, in ms
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hold_ms: Option<u64>,
-}
-
-/// Source command from the server
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SourceCommand {
-    /// Start or stop capture
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command: Option<SourceCommandType>,
-    /// Transport control for the attached device
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub control: Option<SourceControl>,
-    /// Updated signal-detection settings
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vad: Option<SourceVadSettings>,
-}
-
-/// A user-initiated capture event the client reports upstream
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceClientCommandType {
-    /// Audio appeared on the input
-    Started,
-    /// Audio disappeared from the input
-    Stopped,
-    /// Unknown event (forward compatibility)
-    #[serde(other)]
-    Unknown,
-}
-
-/// Source event, sent in `client/command`
+/// Source command, as sent in `server/command`.
+///
+/// Both commands are idempotent: a `start` while the stream is open must not restart it, and
+/// a `stop` while already stopped is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SourceClientCommand {
-    /// The event
-    pub command: SourceClientCommandType,
+pub struct SourceCommand {
+    /// What to do.
+    pub command: SourceCommandType,
 }
 
 /// Format details of the input stream a source is about to send

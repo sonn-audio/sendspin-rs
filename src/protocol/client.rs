@@ -7,9 +7,8 @@ use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientStreamEnd,
     ClientStreamSource, ClientStreamStart, ClientSyncState, ClientTime, ConnectionReason,
     ControllerCommand, ControllerCommandType, GoodbyeReason, Message, PlayerFormatRequest,
-    PlayerState, RepeatMode, ServerHello, SourceClientCommand, SourceClientCommandType,
-    SourceState, StreamEnd, StreamRequestFormat, StreamStart, VisualizerDataType,
-    VisualizerFormatRequest,
+    PlayerState, RepeatMode, ServerHello, SourceState, StreamEnd, StreamRequestFormat, StreamStart,
+    VisualizerDataType, VisualizerFormatRequest,
 };
 use crate::sync::raw_clock::Clock;
 use crate::sync::ClockSync;
@@ -760,14 +759,6 @@ impl WsSender {
     ///
     /// This is how a source whose activation is local — a turntable, a tape deck —
     /// tells the server the user has started something.
-    pub async fn send_source_event(&self, command: SourceClientCommandType) -> Result<(), Error> {
-        self.send_message(Message::ClientCommand(ClientCommand {
-            controller: None,
-            source: Some(SourceClientCommand { command }),
-        }))
-        .await
-    }
-
     /// Send a top-level client availability update.
     pub async fn send_sync_state(&self, state: ClientSyncState) -> Result<(), Error> {
         self.send_message(Message::ClientState(ClientState::availability(state)))
@@ -792,7 +783,6 @@ impl WsSender {
     pub async fn exit_external_source(&self, player: Option<PlayerState>) -> Result<(), Error> {
         self.send_message(Message::ClientState(ClientState {
             player,
-            source: None,
             ..ClientState::availability(ClientSyncState::Synchronized)
         }))
         .await
@@ -918,7 +908,6 @@ impl Controller {
     async fn send_controller_command(&self, cmd: ControllerCommand) -> Result<(), Error> {
         let msg = Message::ClientCommand(ClientCommand {
             controller: Some(cmd),
-            source: None,
         });
         self.sender.send_message(msg).await
     }
