@@ -11,6 +11,7 @@
 //!
 //! ```text
 //! cargo run --example noise_interop -- --server ws://127.0.0.1:8927/sendspin
+//! cargo run --example noise_interop -- --full   # whole client, not just the handshake
 //! ```
 
 use clap::Parser;
@@ -33,6 +34,18 @@ struct Args {
     /// Seconds to keep reading encrypted frames after the handshake.
     #[arg(long, default_value = "5")]
     listen_secs: u64,
+
+    /// Drive the whole ProtocolClient over the encrypted transport, rather than only the
+    /// handshake: client/hello, server/activate, clock sync and role messages included.
+    #[arg(long)]
+    full: bool,
+
+    /// Byte to fill a deterministic private key with, so client_id is stable across runs.
+    ///
+    /// Only for interop testing — a real client generates its identity once and persists
+    /// it. A fixed key is exactly what you must not ship.
+    #[arg(long)]
+    seed: Option<u8>,
 }
 
 #[tokio::main]
@@ -44,9 +57,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => CipherSuite::ChaChaPoly,
     };
 
-    let identity = Identity::generate()?;
+    let identity = match args.seed {
+        Some(byte) => Identity::from_private_key([byte; 32]),
+        None => Identity::generate()?,
+    };
     println!("client_id : {}", identity.client_id());
     println!("suite     : {}", suite.as_wire_str());
+
+    if args.full {
+        return run_full_client(&args, identity, suite).await;
+    }
 
     let (mut ws, _) = tokio_tungstenite::connect_async(&args.server).await?;
     println!("connected : {}", args.server);
@@ -179,5 +199,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("handshake succeeded but no application message was decrypted");
     }
+    Ok(())
+}
+
+/// Bring up a complete client over the encrypted transport and watch what the server
+/// sends. This exercises the paths the handshake-only check cannot reach: the shrunk
+/// `server/hello`, `client/hello` going out encrypted, `server/activate`, and the clock
+/// sync that follows.
+async fn run_full_client(
+    args: &Args,
+    identity: Identity,
+    suite: CipherSuite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sendspin::protocol::client::{Encryption, EncryptionSettings};
+    use sendspin::ProtocolClientBuilder;
+
+    let mut settings = EncryptionSettings::unpaired(identity.clone());
+    settings.suite = suite;
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id(identity.client_id())
+        .name("Rust Interop Client".to_string())
+        .encryption(Encryption::Enabled(settings))
+        .build()
+        .connect(&args.server)
+        .await?;
+
+    let hello = client.server_hello().clone();
+    println!("\nCLIENT UP");
+    println!("  server    : {} ({})", hello.name, hello.server_id);
+    println!("  version   : {}", hello.version);
+    println!("  roles     : {:?}", hello.active_roles);
+    println!("  reason    : {:?}", hello.connection_reason);
+
+    let conn = client.split();
+    let mut messages = conn.messages;
+    let clock_sync = conn.clock_sync;
+    let _guard = conn.guard;
+
+    println!("\nwatching messages for {}s...", args.listen_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(args.listen_secs);
+    let mut seen = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, messages.recv()).await {
+            Err(_) => break,
+            Ok(None) => {
+                println!("  message stream ended");
+                break;
+            }
+            Ok(Some(msg)) => {
+                seen += 1;
+                println!("  {msg:?}");
+            }
+        }
+    }
+
+    let synced = clock_sync.lock().is_synchronized();
+    println!("\nmessages seen : {seen}");
+    println!("clock synced  : {synced}");
+    println!("\nFULL CLIENT INTEROP OK: encrypted connection came up end to end");
     Ok(())
 }

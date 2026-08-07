@@ -5,9 +5,9 @@ use crate::error::Error;
 use crate::log_sampling::should_log_sample;
 use crate::protocol::messages::{
     ArtworkFormatRequest, ClientCommand, ClientGoodbye, ClientHello, ClientState, ClientSyncState,
-    ClientTime, ControllerCommand, ControllerCommandType, GoodbyeReason, InputStreamEnd,
-    InputStreamSource, InputStreamStart, Message, PlayerFormatRequest, PlayerState, RepeatMode,
-    ServerHello, SourceClientCommand, SourceClientCommandType, SourceState, StreamEnd,
+    ClientTime, ConnectionReason, ControllerCommand, ControllerCommandType, GoodbyeReason,
+    InputStreamEnd, InputStreamSource, InputStreamStart, Message, PlayerFormatRequest, PlayerState,
+    RepeatMode, ServerHello, SourceClientCommand, SourceClientCommandType, SourceState, StreamEnd,
     StreamRequestFormat, StreamStart, VisualizerDataType, VisualizerFormatRequest,
 };
 use crate::sync::raw_clock::Clock;
@@ -25,12 +25,15 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+use super::transport::{Inbound, Outbound, Transport};
+use crate::noise::{CipherSuite, ClientHandshake, HandshakeStep, Identity, Psk};
+
 /// `Goodbye` is one variant (not `Send` + `Close`) so the writer processes it
 /// atomically: once dequeued it flushes goodbye + close and exits, so nothing
 /// *enqueued after it* reaches the wire.
 enum WriteCommand {
     Send {
-        msg: WsMessage,
+        payload: Outbound,
         ack: tokio::sync::oneshot::Sender<Result<(), Error>>,
     },
     Goodbye {
@@ -42,16 +45,21 @@ enum WriteCommand {
 async fn writer_task<S>(
     mut sink: SplitSink<WebSocketStream<S>, WsMessage>,
     mut rx: UnboundedReceiver<WriteCommand>,
+    transport: Arc<Mutex<Transport>>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            WriteCommand::Send { msg, ack } => {
-                let result = sink
-                    .send(msg)
-                    .await
-                    .map_err(|e| Error::WebSocket(e.to_string()));
+            WriteCommand::Send { payload, ack } => {
+                // Encode under the lock, send outside it: encryption is quick and
+                // synchronous, whereas holding a lock across `send().await` would let a
+                // slow socket block the reader's decryption.
+                let framed = transport.lock().encode(payload);
+                let result = match framed {
+                    Ok(frames) => send_all(&mut sink, frames).await,
+                    Err(e) => Err(e),
+                };
                 let failed = result.is_err();
                 // Ignore SendError: the caller may have dropped its receiver.
                 let _ = ack.send(result);
@@ -60,7 +68,7 @@ async fn writer_task<S>(
                 }
             }
             WriteCommand::Goodbye { reason, ack } => {
-                let _ = ack.send(perform_goodbye(&mut sink, reason).await);
+                let _ = ack.send(perform_goodbye(&mut sink, reason, &transport).await);
                 break;
             }
         }
@@ -71,21 +79,228 @@ async fn writer_task<S>(
     // connection (see `WsSender::send_message`).
 }
 
+/// Write every WebSocket frame one message became — more than one after fragmentation.
+async fn send_all<S>(
+    sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
+    frames: Vec<WsMessage>,
+) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    for frame in frames {
+        sink.send(frame)
+            .await
+            .map_err(|e| Error::WebSocket(e.to_string()))?;
+    }
+    Ok(())
+}
+
 async fn perform_goodbye<S>(
     sink: &mut SplitSink<WebSocketStream<S>, WsMessage>,
     reason: GoodbyeReason,
+    transport: &Arc<Mutex<Transport>>,
 ) -> Result<(), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let goodbye = Message::ClientGoodbye(ClientGoodbye { reason });
     let json = serde_json::to_string(&goodbye).map_err(|e| Error::Protocol(e.to_string()))?;
-    sink.send(WsMessage::Text(json.into()))
-        .await
-        .map_err(|e| Error::WebSocket(e.to_string()))?;
+    let frames = transport.lock().encode(Outbound::Json(json))?;
+    send_all(sink, frames).await?;
     sink.close()
         .await
         .map_err(|e| Error::WebSocket(e.to_string()))
+}
+
+/// Drive the cleartext init exchange and Noise handshake over `ws_stream`.
+///
+/// On success the socket is in transport mode and every subsequent message travels as an
+/// encrypted binary frame. On failure the socket is closed without an application-level
+/// error message: the spec gives a handshake failure nothing to say, and saying anything
+/// would leak which step failed.
+async fn run_noise_handshake<S>(
+    ws_stream: &mut WebSocketStream<S>,
+    settings: EncryptionSettings,
+) -> Result<crate::noise::HandshakeResult, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let EncryptionSettings {
+        identity,
+        suite,
+        psks,
+    } = settings;
+    let (mut handshake, client_init) = ClientHandshake::start(identity, suite, psks)?;
+
+    log::debug!("Sending client/init ({} bytes)", client_init.len());
+    send_cleartext(ws_stream, client_init).await?;
+
+    let deadline = tokio::time::Instant::now()
+        + tokio::time::Duration::from_secs(crate::noise::constants::HANDSHAKE_TIMEOUT_SECS);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            let _ = ws_stream.close(None).await;
+            return Err(Error::Connection("Noise handshake timed out".to_string()));
+        }
+        let next = match tokio::time::timeout(remaining, ws_stream.next()).await {
+            Err(_) => {
+                let _ = ws_stream.close(None).await;
+                return Err(Error::Connection("Noise handshake timed out".to_string()));
+            }
+            Ok(None) => {
+                return Err(Error::Connection(
+                    "connection closed during the Noise handshake".to_string(),
+                ))
+            }
+            Ok(Some(frame)) => frame.map_err(|e| Error::WebSocket(e.to_string()))?,
+        };
+
+        // Handshake messages are cleartext text frames; the socket only turns binary once
+        // both sides are in transport mode.
+        let raw = match &next {
+            WsMessage::Text(text) => text.as_bytes().to_vec(),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
+            WsMessage::Close(_) => {
+                return Err(Error::Connection(
+                    "server closed during the Noise handshake".to_string(),
+                ))
+            }
+            other => {
+                let _ = ws_stream.close(None).await;
+                return Err(Error::Protocol(format!(
+                    "unexpected frame during the Noise handshake: {other:?}"
+                )));
+            }
+        };
+
+        match handshake.handle_message(&raw) {
+            Ok(HandshakeStep::Continue { send }) => {
+                if let Some(bytes) = send {
+                    send_cleartext(ws_stream, bytes).await?;
+                }
+            }
+            Ok(HandshakeStep::Complete { send, result }) => {
+                send_cleartext(ws_stream, send).await?;
+                return Ok(*result);
+            }
+            Err(e) => {
+                let _ = ws_stream.close(None).await;
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Minimal view of the message envelope, for the one message whose payload shape depends
+/// on the transport rather than on its `type`.
+#[derive(serde::Deserialize)]
+struct TypedPayload<T> {
+    r#type: String,
+    payload: T,
+}
+
+/// Map an activation onto the legacy `connection_reason`, so a connection reached over
+/// either transport arbitrates the same way.
+fn activity_to_reason(activate: &super::messages::ServerActivate) -> ConnectionReason {
+    use super::messages::Activity;
+    // Highest-ranked activity wins, matching the ladder in `should_switch`. An empty set is
+    // the lowest rank there is, which `Discovery` already represents.
+    let mut reason = ConnectionReason::Discovery;
+    let mut rank = 0u8;
+    for activity in &activate.activities {
+        let (candidate, candidate_rank) = match activity {
+            Activity::Management => (ConnectionReason::Management, 4),
+            Activity::Playback => (ConnectionReason::Playback, 3),
+            Activity::Pairing => (ConnectionReason::Pairing, 2),
+            Activity::Unknown => (ConnectionReason::Unknown, 1),
+        };
+        if candidate_rank > rank {
+            rank = candidate_rank;
+            reason = candidate;
+        }
+    }
+    reason
+}
+
+/// Read frames until `server/activate` arrives, which is the point a client may start
+/// sending anything else.
+async fn await_server_activate<S>(
+    read: &mut SplitStream<WebSocketStream<S>>,
+    transport: &Arc<Mutex<Transport>>,
+) -> Result<super::messages::ServerActivate, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while let Some(frame) = read.next().await {
+        let ws_msg = frame.map_err(|e| Error::WebSocket(e.to_string()))?;
+        if matches!(ws_msg, WsMessage::Close(_)) {
+            return Err(Error::Connection(
+                "server closed before server/activate".to_string(),
+            ));
+        }
+        let Some(Inbound::Json(text)) = transport.lock().decode(&ws_msg)? else {
+            continue;
+        };
+        match serde_json::from_str::<Message>(&text) {
+            Ok(Message::ServerActivate(activate)) => return Ok(activate),
+            Ok(other) => log::debug!("Ignoring {:?} while awaiting server/activate", other),
+            Err(e) => log::warn!("Unparseable message before server/activate: {e} ({text})"),
+        }
+    }
+    Err(Error::Connection(
+        "connection ended before server/activate".to_string(),
+    ))
+}
+
+/// Send one cleartext handshake message as a WebSocket text frame.
+async fn send_cleartext<S>(ws: &mut WebSocketStream<S>, bytes: Vec<u8>) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let text = String::from_utf8(bytes)
+        .map_err(|e| Error::Protocol(format!("handshake message was not UTF-8: {e}")))?;
+    ws.send(WsMessage::Text(text.into()))
+        .await
+        .map_err(|e| Error::WebSocket(e.to_string()))
+}
+
+/// Whether a connection is encrypted, and what to key it with.
+///
+/// The spec defines no unencrypted mode, so [`Encryption::Enabled`] is the compliant
+/// choice; [`Encryption::Disabled`] reaches servers that still accept the legacy hello.
+#[derive(Debug, Clone)]
+pub enum Encryption {
+    /// Transition mode: no Noise layer. Not a mode the current spec defines.
+    Disabled,
+    /// The spec's transport.
+    Enabled(EncryptionSettings),
+}
+
+/// What an encrypted connection is keyed with.
+#[derive(Debug, Clone)]
+pub struct EncryptionSettings {
+    /// This client's static keypair. Its public half is the `client_id`.
+    pub identity: Identity,
+    /// The suite to announce in `client/init`.
+    pub suite: CipherSuite,
+    /// The PSKs this client will accept being keyed with.
+    ///
+    /// A key whose pairing method is currently disabled must be left out, so a handshake
+    /// naming it fails as a lookup miss rather than succeeding against a disabled method.
+    pub psks: Vec<Psk>,
+}
+
+impl EncryptionSettings {
+    /// Settings for a client with no pairing record: Sentinel PSK only.
+    pub fn unpaired(identity: Identity) -> Self {
+        Self {
+            identity,
+            suite: CipherSuite::default(),
+            psks: vec![Psk::sentinel()],
+        }
+    }
 }
 
 /// Connection components returned by [`ProtocolClient::split()`].
@@ -205,7 +420,7 @@ impl WsSender {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteCommand::Send {
-                msg: WsMessage::Text(json.into()),
+                payload: Outbound::Json(json),
                 ack: ack_tx,
             })
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
@@ -228,7 +443,7 @@ impl WsSender {
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriteCommand::Send {
-                msg: WsMessage::Binary(frame.into()),
+                payload: Outbound::Binary(frame),
                 ack: ack_tx,
             })
             .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
@@ -922,15 +1137,39 @@ impl ProtocolClient {
         hello: ClientHello,
         initial_state: ClientState,
         clock: Arc<dyn Clock>,
+        encryption: Encryption,
     ) -> Result<Self, Error>
     where
         R: IntoClientRequest + Unpin,
     {
-        let (ws_stream, _) = connect_async(request)
+        let (mut ws_stream, _) = connect_async(request)
             .await
             .map_err(|e| Error::Connection(e.to_string()))?;
 
-        Self::drive(ws_stream, hello, initial_state, clock).await
+        let mut encrypted_server_id = None;
+        let transport = match encryption {
+            Encryption::Disabled => Transport::Plain,
+            Encryption::Enabled(settings) => {
+                let result = run_noise_handshake(&mut ws_stream, settings).await?;
+                log::info!(
+                    "Noise handshake complete: server_id={}, psk={:?}",
+                    result.server_id,
+                    result.psk_category
+                );
+                encrypted_server_id = Some(result.server_id.clone());
+                Transport::encrypted(result.session)?
+            }
+        };
+
+        Self::drive(
+            ws_stream,
+            hello,
+            initial_state,
+            clock,
+            transport,
+            encrypted_server_id,
+        )
+        .await
     }
 
     /// Drive the protocol-client state machine over an already-handshaked
@@ -941,11 +1180,15 @@ impl ProtocolClient {
         hello: ClientHello,
         initial_state: ClientState,
         clock: Arc<dyn Clock>,
+        transport: Transport,
+        encrypted_server_id: Option<String>,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut write, mut read) = ws_stream.split();
+        let encrypted = transport.is_encrypted();
+        let transport = Arc::new(Mutex::new(transport));
 
         // The handshake exchange (hello + state) sends directly on the sink
         // rather than through the writer task, so handshake failures are
@@ -953,11 +1196,15 @@ impl ProtocolClient {
         let hello_msg = Message::ClientHello(hello);
         let hello_json =
             serde_json::to_string(&hello_msg).map_err(|e| Error::Protocol(e.to_string()))?;
-        log::debug!("Sending client/hello: {}", hello_json);
-        write
-            .send(WsMessage::Text(hello_json.into()))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
+        if !encrypted {
+            // Transition mode: the client speaks first and the server answers with the
+            // legacy hello carrying its identity, roles and purpose.
+            log::debug!("Sending client/hello: {}", hello_json);
+            let frames = transport
+                .lock()
+                .encode(Outbound::Json(hello_json.clone()))?;
+            send_all(&mut write, frames).await?;
+        }
 
         log::debug!("Waiting for server/hello...");
         let server_hello = loop {
@@ -966,8 +1213,71 @@ impl ProtocolClient {
                 return Err(Error::Connection("No server hello received".to_string()));
             };
             match result {
-                Ok(WsMessage::Text(text)) => {
-                    log::trace!("Received text frame: {}", text);
+                Ok(ws_msg) => {
+                    let decoded = transport.lock().decode(&ws_msg)?;
+                    let text = match decoded {
+                        Some(Inbound::Json(text)) => text,
+                        Some(Inbound::Binary(bytes)) => {
+                            log::warn!(
+                                "Unexpected binary frame (type {}) while waiting for server/hello",
+                                bytes.first().copied().unwrap_or_default()
+                            );
+                            continue;
+                        }
+                        None => match ws_msg {
+                            WsMessage::Close(_) => {
+                                log::error!("Server closed connection");
+                                return Err(Error::Connection(
+                                    "Server closed connection".to_string(),
+                                ));
+                            }
+                            _ => continue,
+                        },
+                    };
+                    if let Some(server_id) = encrypted_server_id.as_deref() {
+                        // The encrypted hello carries only {name}: identity was settled by
+                        // the Noise handshake, and roles and purpose arrive in
+                        // server/activate. Parse it directly rather than through `Message`,
+                        // which cannot hold two shapes under one `type` tag.
+                        let hello: super::messages::ServerHelloEncrypted =
+                            match serde_json::from_str::<TypedPayload<_>>(&text) {
+                                Ok(wrapper) if wrapper.r#type == "server/hello" => wrapper.payload,
+                                _ => {
+                                    log::error!("Expected server/hello, got: {}", text);
+                                    return Err(Error::Protocol(
+                                        "Expected server/hello".to_string(),
+                                    ));
+                                }
+                            };
+                        log::info!("Connected to server: {} ({})", hello.name, server_id);
+
+                        // Now it is the client's turn, and only then does the server declare
+                        // what this connection is for.
+                        log::debug!("Sending client/hello: {}", hello_json);
+                        let frames = transport
+                            .lock()
+                            .encode(Outbound::Json(hello_json.clone()))?;
+                        send_all(&mut write, frames).await?;
+
+                        let activate = await_server_activate(&mut read, &transport).await?;
+                        log::info!(
+                            "Server activated: activities={:?}, active_roles={:?}",
+                            activate.activities,
+                            activate.active_roles
+                        );
+                        // Bridge onto the shape the rest of the client already reads. The
+                        // rank ladder is the same for both spellings, so arbitration is
+                        // unaffected by which one a server used.
+                        break ServerHello {
+                            server_id: server_id.to_string(),
+                            name: hello.name,
+                            version: crate::noise::constants::PROTOCOL_VERSION,
+                            active_roles: activate.active_roles.clone().unwrap_or_default(),
+                            connection_reason: activity_to_reason(&activate),
+                            selected_pair_method: activate.pairing.as_ref().map(|p| p.method),
+                        };
+                    }
+                    log::trace!("Received message: {}", text);
                     let msg: Message = serde_json::from_str(&text).map_err(|e| {
                         log::error!("Failed to parse server message: {} (payload: {})", e, text);
                         Error::Protocol(e.to_string())
@@ -989,21 +1299,6 @@ impl ProtocolClient {
                         }
                     }
                 }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {
-                    log::debug!("Received Ping/Pong, continuing to wait for server/hello");
-                    continue;
-                }
-                Ok(WsMessage::Close(_)) => {
-                    log::error!("Server closed connection");
-                    return Err(Error::Connection("Server closed connection".to_string()));
-                }
-                Ok(other) => {
-                    log::warn!(
-                        "Unexpected message type while waiting for hello: {:?}",
-                        other
-                    );
-                    continue;
-                }
                 Err(e) => {
                     log::error!("WebSocket error: {}", e);
                     return Err(Error::WebSocket(e.to_string()));
@@ -1015,10 +1310,8 @@ impl ProtocolClient {
         let state_json =
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;
         log::debug!("Sending initial client/state: {}", state_json);
-        write
-            .send(WsMessage::Text(state_json.into()))
-            .await
-            .map_err(|e| Error::WebSocket(e.to_string()))?;
+        let frames = transport.lock().encode(Outbound::Json(state_json))?;
+        send_all(&mut write, frames).await?;
 
         let (out_tx, out_rx) = unbounded_channel::<WriteCommand>();
         let (audio_tx, audio_rx) = unbounded_channel();
@@ -1028,11 +1321,12 @@ impl ProtocolClient {
         let clock_sync = Arc::new(Mutex::new(ClockSync::new(Arc::clone(&clock))));
         let stream_state = Arc::new(StreamState::default());
 
-        let writer_handle = tokio::spawn(writer_task(write, out_rx));
+        let writer_handle = tokio::spawn(writer_task(write, out_rx, Arc::clone(&transport)));
 
         let clock_sync_router = Arc::clone(&clock_sync);
         let clock_router = Arc::clone(&clock);
         let stream_state_router = Arc::clone(&stream_state);
+        let transport_router = Arc::clone(&transport);
         // The router task handle is used by ConnectionGuard::closed() observers.
         let router_handle = tokio::spawn(async move {
             Self::message_router(
@@ -1044,6 +1338,7 @@ impl ProtocolClient {
                 clock_sync_router,
                 clock_router,
                 stream_state_router,
+                transport_router,
             )
             .await;
         });
@@ -1111,6 +1406,7 @@ impl ProtocolClient {
         clock_sync: Arc<Mutex<ClockSync>>,
         clock: Arc<dyn Clock>,
         stream_state: Arc<StreamState>,
+        transport_router: Arc<Mutex<Transport>>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1122,8 +1418,29 @@ impl ProtocolClient {
         let mut visualizer_chunk_count = 0u64;
 
         while let Some(msg) = read.next().await {
-            match msg {
-                Ok(WsMessage::Binary(data)) => match BinaryFrame::from_bytes(&data) {
+            let ws_msg = match msg {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("WebSocket error: {}", e);
+                    break;
+                }
+            };
+            if matches!(ws_msg, WsMessage::Close(_)) {
+                log::info!("Server closed connection");
+                break;
+            }
+            // A decode failure on an encrypted connection is fatal: an AEAD failure or a
+            // malformed fragment sequence are both protocol errors the spec answers by
+            // closing, and there is no state to resynchronise from.
+            let decoded = match transport_router.lock().decode(&ws_msg) {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    log::error!("Transport error, closing connection: {}", e);
+                    break;
+                }
+            };
+            match decoded {
+                Some(Inbound::Binary(data)) => match BinaryFrame::from_bytes(&data) {
                     Ok(BinaryFrame::Audio(chunk)) => {
                         audio_chunk_count += 1;
                         if should_log_sample(audio_chunk_count) {
@@ -1181,11 +1498,11 @@ impl ProtocolClient {
                         log::warn!("Failed to parse binary frame: {}", e);
                     }
                 },
-                Ok(WsMessage::Text(text)) => {
+                Some(Inbound::Json(text)) => {
                     // Capture receive time before deserialization so
                     // t4 is as close to the true arrival time as possible.
                     let t4 = clock.now_micros();
-                    log::trace!("Received text frame: {}", text);
+                    log::trace!("Received message body: {}", text);
                     match serde_json::from_str::<Message>(&text) {
                         Ok(msg) => {
                             // ServerTime is consumed here for clock sync
@@ -1227,16 +1544,7 @@ impl ProtocolClient {
                         }
                     }
                 }
-                Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
-                Ok(WsMessage::Close(_)) => {
-                    log::info!("Server closed connection");
-                    break;
-                }
-                Err(e) => {
-                    log::error!("WebSocket error: {}", e);
-                    break;
-                }
-                _ => {}
+                None => {}
             }
         }
         log::debug!("Message router: WebSocket stream ended");

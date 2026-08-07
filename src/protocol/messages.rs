@@ -12,6 +12,10 @@ pub enum Message {
     #[serde(rename = "client/hello")]
     ClientHello(ClientHello),
 
+    /// Server declares its active purpose on this connection (encrypted transport).
+    #[serde(rename = "server/activate")]
+    ServerActivate(ServerActivate),
+
     /// Server hello handshake response
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),
@@ -374,6 +378,94 @@ pub struct ServerHello {
     /// a `goodbye(unauthorized)` rather than a silent failure to pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_pair_method: Option<PairMethod>,
+}
+
+/// Server hello on an encrypted connection.
+///
+/// Under encryption the server's identity has already been established by the Noise
+/// handshake — `server_id` came from `server/init` and the static key authenticated it — so
+/// all that is left to say is the friendly name. Roles and purpose arrive separately, in
+/// [`ServerActivate`].
+///
+/// This shares its `type` tag with the legacy [`ServerHello`], which is why it is not a
+/// variant of [`Message`]: an internally-tagged union cannot hold two shapes under one tag.
+/// The handshake parses whichever one the transport implies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerHelloEncrypted {
+    /// Human-readable server name.
+    pub name: String,
+}
+
+/// A purpose a connection is currently serving.
+///
+/// Ranked by how much it displaces, the same ladder the legacy [`ConnectionReason`] uses:
+/// see [`should_switch`](crate::protocol::should_switch).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Activity {
+    /// A pairing handshake.
+    Pairing,
+    /// Active or upcoming playback.
+    Playback,
+    /// A dedicated management session.
+    Management,
+    /// A purpose this build does not know (forward compatibility).
+    ///
+    /// Lowest rank, which is the safe end: an unrecognised purpose does not displace a
+    /// server that is playing.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Parameters of the pairing attempt an activation admits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivationPairing {
+    /// The method the server picked, drawn from the client's `supported_pair_methods`.
+    pub method: PairMethod,
+    /// Digit count for this session. Required when `method` is `dynamic_pin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_length: Option<u8>,
+    /// BCP 47 language tags in descending operator preference, for a spoken PIN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+}
+
+/// `server/activate` — what this connection is currently for.
+///
+/// Replaces the legacy hello's `connection_reason` and `active_roles`. It may be re-sent at
+/// any time to change the activity set, and `active_roles` persists across activations that
+/// omit it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerActivate {
+    /// The currently-active purposes. May be empty; members are unordered and unique.
+    pub activities: Vec<Activity>,
+    /// Versioned roles active for this client.
+    ///
+    /// Required on the first activation and persists across later ones that omit it, so
+    /// `None` here means "unchanged" rather than "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_roles: Option<Vec<String>>,
+    /// Present when `activities` includes `pairing`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing: Option<ActivationPairing>,
+}
+
+impl ServerActivate {
+    /// The highest-ranked activity declared, for admission between competing connections.
+    ///
+    /// An empty activity set ranks lowest, below every named purpose.
+    pub fn rank(&self) -> u8 {
+        self.activities
+            .iter()
+            .map(|a| match a {
+                Activity::Management => 4,
+                Activity::Playback => 3,
+                Activity::Pairing => 2,
+                Activity::Unknown => 1,
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Why a server opened this connection.

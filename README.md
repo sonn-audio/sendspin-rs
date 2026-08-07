@@ -4,9 +4,8 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 for synchronized multi-room audio streaming.
 
 > [!WARNING]
-> Pre-1.0 and under active development. The client is usable today against current
-> Sendspin servers, but the API is not yet stable and the encrypted transport is not
-> implemented — see [Status](#status).
+> Pre-1.0 and under active development. The API is not yet stable, and pairing is not
+> implemented yet — see [Status](#status).
 
 ## What this is
 
@@ -22,6 +21,8 @@ clock locked to the server's, and drives the audio device.
   ±0.5 ms *target* rather than its ±1 ms floor.
 - **Async I/O** — Tokio and `tokio-tungstenite`, with the audio thread deliberately outside
   the runtime.
+- **End-to-end encrypted** — the spec's `KKpsk2` Noise transport, in both defined cipher
+  suites, validated against the reference implementation's own server.
 - **Type-safe protocol** — messages are enums and structs, not maps. Where a server may
   introduce a value this build has not seen, it deserializes to an `Unknown` variant rather
   than failing the message: a client should not throw away a whole `group/update`, or a whole
@@ -41,17 +42,41 @@ clock locked to the server's, and drives the audio device.
 
 ## Status
 
-**Working:** the unencrypted (transition-mode) handshake including `trust_level`,
-`unpaired_access` and the pairing-method advertisement; clock synchronization; all seven
-roles above; synchronized playback with drift correction; volume and mute with a perceptual
-curve and anti-click ramp; static-delay compensation; both connection directions
-(client-initiated, and server-initiated via `ProtocolListener`); and multi-server
-arbitration by connection purpose via `ConnectionManager`.
+**Working:** the encrypted `KKpsk2` transport — `client/init`, the Noise handshake, PSK
+selection, fragmentation, and `server/activate` — on both cipher suites; the legacy
+transition-mode handshake as an opt-out; clock synchronization; all seven roles above;
+synchronized playback with drift correction; volume and mute with a perceptual curve and
+anti-click ramp; static-delay compensation; both connection directions (client-initiated,
+and server-initiated via `ProtocolListener`); and multi-server arbitration by connection
+purpose via `ConnectionManager`.
 
-**Not implemented:** the Noise-encrypted transport, and everything that hangs off it —
-pairing, the trust store, and the `management/*` messages. The current spec mandates
-encryption and defines no unencrypted mode; this client reaches today's servers because
-they still send the legacy `server/hello`. This is the single largest gap and the priority.
+Encryption is verified against `aiosendspin`'s own server rather than only against itself —
+see [scripts/interop](scripts/interop). Loopback tests cannot tell you whether the spec is
+being read the same way the reference reads it, which is exactly where a transport layer
+fails.
+
+**Not implemented:** pairing and everything keyed to it — the trust store, the PSK and PIN
+pairing flows, and the `management/*` messages. A client reaches a server today on the
+Sentinel PSK, which is what the protocol keys a first connection with; pairing is what
+promotes that to a trusted session. The PIN methods additionally need CPace, for which no
+usable Rust crate exists.
+
+**Encryption is opt-in for now**, because turning it on changes which servers a client can
+reach. Pass it explicitly:
+
+```rust
+use sendspin::noise::Identity;
+use sendspin::protocol::client::{Encryption, EncryptionSettings};
+
+let identity = Identity::generate()?;   // persist the private key; the public half is the client_id
+let client = ProtocolClientBuilder::builder()
+    .client_id(identity.client_id())
+    .name("My Player".to_string())
+    .encryption(Encryption::Enabled(EncryptionSettings::unpaired(identity)))
+    .build()
+    .connect("ws://localhost:8927/sendspin")
+    .await?;
+```
 
 **Known divergences,** both deliberate: the visualizer `pitch` type on binary slot 21, which
 `aiosendspin` ships and the spec still reserves; and the `client_id` / `version` fields in

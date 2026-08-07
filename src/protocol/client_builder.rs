@@ -1,12 +1,14 @@
 // ABOUTME: Builder exposed for public usage of the library
 
 use crate::error::Error;
+use crate::protocol::client::Encryption;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
     PairMethodDescriptor, PlayerState, PlayerV1Support, SourceState, SourceV1Support, TrustLevel,
     UnpairedAccess, VisualizerV1Support,
 };
+use crate::protocol::transport::Transport;
 use crate::sync::raw_clock::{Clock, DefaultClock};
 use crate::ProtocolClient;
 use std::sync::Arc;
@@ -34,6 +36,7 @@ pub(crate) struct ProtocolClientBuilderRaw {
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    encryption: Encryption,
     initial_source_state: Option<SourceState>,
     metadata: bool,
     controller: bool,
@@ -105,6 +108,7 @@ impl From<ProtocolClientBuilderRaw> for ProtocolClientBuilder {
         }
 
         ProtocolClientBuilder {
+            encryption: raw.encryption,
             client_id: raw.client_id,
             name: raw.name,
             product_name: raw.product_name,
@@ -168,6 +172,14 @@ pub struct ProtocolClientBuilderFields {
     initial_sync_state: ClientSyncState,
     #[builder(default = None, setter(transform = |x: PlayerState| Some(x)))]
     initial_player_state: Option<PlayerState>,
+    /// Whether this connection runs the spec's Noise transport.
+    ///
+    /// Defaults to [`Encryption::Disabled`] — the transition-mode handshake — because
+    /// flipping it changes which servers a client can reach. Pass
+    /// [`EncryptionSettings::unpaired`](crate::protocol::client::EncryptionSettings::unpaired)
+    /// to speak the compliant transport.
+    #[builder(default = Encryption::Disabled)]
+    encryption: Encryption,
     /// Initial source state sent in the first `client/state`. Required by the
     /// spec for a source client, the way player state is for a player.
     #[builder(default = None, setter(transform = |x: SourceState| Some(x)))]
@@ -183,6 +195,7 @@ pub struct ProtocolClientBuilderFields {
 impl From<ProtocolClientBuilderFields> for ProtocolClientBuilder {
     fn from(fields: ProtocolClientBuilderFields) -> Self {
         let raw = ProtocolClientBuilderRaw {
+            encryption: fields.encryption.clone(),
             client_id: fields.client_id,
             name: fields.name,
             product_name: fields.product_name,
@@ -226,6 +239,7 @@ pub struct ProtocolClientBuilder {
     visualizer_v1_support: Option<VisualizerV1Support>,
     initial_sync_state: ClientSyncState,
     initial_player_state: Option<PlayerState>,
+    encryption: Encryption,
     initial_source_state: Option<SourceState>,
     clock: Arc<dyn Clock>,
 }
@@ -267,8 +281,9 @@ impl ProtocolClientBuilder {
         self,
         request: R,
     ) -> Result<ProtocolClient, Error> {
+        let encryption = self.encryption.clone();
         let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::connect(request, hello, initial_state, clock).await
+        ProtocolClient::connect(request, hello, initial_state, clock, encryption).await
     }
 
     /// Adopt an already-handshaked WebSocket stream and drive the protocol
@@ -283,7 +298,15 @@ impl ProtocolClientBuilder {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (hello, initial_state, clock) = self.into_parts();
-        ProtocolClient::drive(ws_stream, hello, initial_state, clock).await
+        ProtocolClient::drive(
+            ws_stream,
+            hello,
+            initial_state,
+            clock,
+            Transport::Plain,
+            None,
+        )
+        .await
     }
 
     /// Bind a TCP listener and produce a [`ProtocolListener`] that accepts

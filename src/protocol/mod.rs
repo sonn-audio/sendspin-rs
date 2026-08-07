@@ -11,6 +11,8 @@ pub mod listener;
 pub mod manager;
 /// Protocol message type definitions and serialization
 pub mod messages;
+/// The seam between protocol logic and the socket: plain frames, or Noise ciphertexts
+pub(crate) mod transport;
 
 pub use client::{Connection, ConnectionGuard, Controller, WsSender};
 pub use listener::ProtocolListener;
