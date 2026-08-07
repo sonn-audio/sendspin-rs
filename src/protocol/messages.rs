@@ -467,9 +467,33 @@ pub struct ServerActivate {
     /// Present when `activities` includes `pairing`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing: Option<ActivationPairing>,
+    /// The older spelling of `pairing.method`, carrying just the method.
+    ///
+    /// The spec replaced it with the [`pairing`](Self::pairing) object, which can also carry
+    /// `pin_length` and language hints, but `aiosendspin` still sends this one. Both are
+    /// accepted on receive — see [`Self::pair_method`] — because a client that insists on the
+    /// newer spelling cannot pair with the reference server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_pair_method: Option<PairMethod>,
 }
 
 impl ServerActivate {
+    /// The pairing method this activation selected, from whichever spelling it used.
+    ///
+    /// Prefers the `pairing` object, since it is the one the spec defines and the only one
+    /// that can carry a PIN length.
+    pub fn pair_method(&self) -> Option<PairMethod> {
+        self.pairing
+            .as_ref()
+            .map(|p| p.method)
+            .or(self.selected_pair_method)
+    }
+
+    /// The dynamic PIN length for this session, when one was given.
+    pub fn pin_length(&self) -> Option<u8> {
+        self.pairing.as_ref().and_then(|p| p.pin_length)
+    }
+
     /// The highest-ranked activity declared, for admission between competing connections.
     ///
     /// An empty activity set ranks lowest, below every named purpose.

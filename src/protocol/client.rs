@@ -250,22 +250,17 @@ async fn handle_pairing_activation(
     if !activate.activities.contains(&Activity::Pairing) {
         return None;
     }
-    // `pairing` is required when the activity set includes pairing; without it there is no
-    // method to check against, which is itself a reason to decline.
-    let Some(pairing) = activate.pairing.as_ref() else {
-        log::warn!("Pairing activation carried no pairing object");
+    // A method is required when the activity set includes pairing; without one there is
+    // nothing to check against, which is itself a reason to decline.
+    let Some(method) = activate.pair_method() else {
+        log::warn!("Pairing activation named no method");
         let _ = send_abort(out_tx, PairAbortReason::MethodNotSupported).await;
         return None;
     };
 
     let matched = *context.psk_category.lock();
 
-    let action = match plan_pairing(
-        pairing.method,
-        matched,
-        &context.server_id,
-        context.store.as_ref(),
-    ) {
+    let action = match plan_pairing(method, matched, &context.server_id, context.store.as_ref()) {
         Ok(action) => action,
         Err(e) => {
             log::error!("Could not plan pairing: {e}");
@@ -275,11 +270,7 @@ async fn handle_pairing_activation(
 
     match action {
         PairingAction::Finalize { message, record } => {
-            log::info!(
-                "Pairing with {} via {:?}",
-                context.server_id,
-                pairing.method
-            );
+            log::info!("Pairing with {} via {method:?}", context.server_id);
             let json = match serde_json::to_string(&Message::ClientPairFinalize(message)) {
                 Ok(json) => json,
                 Err(e) => {
@@ -347,6 +338,61 @@ async fn handle_rehandshake(
         result.psk_id
     );
     Ok(())
+}
+
+/// Re-run `server/hello` -> `client/hello` -> `server/activate` after a re-handshake.
+///
+/// The spec restarts the connection here rather than resuming mid-stream, and the reference
+/// server enforces it: anything else arriving in this window is a sequence violation it
+/// answers by dropping the connection. That is why the caller holds the outbound gate for the
+/// duration.
+async fn restart_hello_exchange<S>(
+    read: &mut SplitStream<WebSocketStream<S>>,
+    transport: &Arc<Mutex<Transport>>,
+    out_tx: &UnboundedSender<WriteCommand>,
+    hello_json: &str,
+) -> Result<super::messages::ServerActivate, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // The post-re-handshake hello is the encrypted shape, carrying only {name}.
+    loop {
+        let Some(frame) = read.next().await else {
+            return Err(Error::Connection(
+                "connection ended before the post-re-handshake server/hello".to_string(),
+            ));
+        };
+        let ws_msg = frame.map_err(|e| Error::WebSocket(e.to_string()))?;
+        if matches!(ws_msg, WsMessage::Close(_)) {
+            return Err(Error::Connection(
+                "server closed before the post-re-handshake server/hello".to_string(),
+            ));
+        }
+        let Some(Inbound::Json(text)) = transport.lock().decode(&ws_msg)? else {
+            continue;
+        };
+        match serde_json::from_str::<TypedPayload<super::messages::ServerHelloEncrypted>>(&text) {
+            Ok(wrapper) if wrapper.r#type == "server/hello" => {
+                log::debug!("Re-handshake: server/hello from {}", wrapper.payload.name);
+                break;
+            }
+            _ => {
+                log::debug!("Ignoring {text} while awaiting the post-re-handshake server/hello");
+            }
+        }
+    }
+
+    send_and_flush(out_tx, Outbound::Json(hello_json.to_string())).await?;
+    let activate = await_server_activate(read, transport).await?;
+    log::info!(
+        "Re-handshake complete: activities={:?}, active_roles={:?}",
+        activate.activities,
+        activate.active_roles
+    );
+    // Handed back rather than consumed: this is the activation that carries the pairing the
+    // re-handshake was run for, so swallowing it here leaves the server waiting for a
+    // client/pair-finalize that never comes.
+    Ok(activate)
 }
 
 /// Minimal view of the message envelope, for the one message whose payload shape depends
@@ -597,6 +643,14 @@ pub struct WsSender {
     /// / `stream/end`, so a consumer that reacts to those messages already
     /// observes the settled state.
     stream_state: Arc<StreamState>,
+    /// Raised by the router while a re-handshake and the hello exchange that follows it are
+    /// in flight.
+    ///
+    /// The spec is explicit that no other message flows during a re-handshake, and that the
+    /// connection restarts at `server/hello` afterwards. A clock ping landing in the middle
+    /// of that is not merely early — the reference server reports it as a sequence violation
+    /// and drops the connection.
+    handshake_gate: Arc<AtomicBool>,
 }
 
 impl WsSender {
@@ -610,6 +664,18 @@ impl WsSender {
         } else {
             log::Level::Debug
         };
+        if self.handshake_gate.load(Ordering::Acquire) {
+            // Time sync is housekeeping and resumes on its own, so skipping a sample costs
+            // one interval. Anything else during the exchange is a caller error worth
+            // surfacing rather than swallowing.
+            if matches!(msg, Message::ClientTime(_)) {
+                log::trace!("Skipping client/time: a handshake exchange is in flight");
+                return Ok(());
+            }
+            return Err(Error::Protocol(
+                "cannot send while a Noise handshake exchange is in flight".to_string(),
+            ));
+        }
         log::log!(level, "Sending message: {}", json);
 
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -1232,6 +1298,8 @@ pub struct ProtocolClient {
     clock_sync: Arc<Mutex<ClockSync>>,
     server_hello: ServerHello,
     stream_state: Arc<StreamState>,
+    /// Shared with the router; see [`WsSender::handshake_gate`].
+    handshake_gate: Arc<AtomicBool>,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
@@ -1537,8 +1605,13 @@ impl ProtocolClient {
         let clock_router = Arc::clone(&clock);
         let stream_state_router = Arc::clone(&stream_state);
         let transport_router = Arc::clone(&transport);
+        // Shared with the router, which raises it for the duration of a re-handshake and the
+        // hello exchange that follows.
+        let handshake_gate = Arc::new(AtomicBool::new(false));
+        let handshake_gate_router = Arc::clone(&handshake_gate);
         let security_router = security.clone();
         let out_tx_router = out_tx.clone();
+        let hello_json_router = hello_json.clone();
         // The router task handle is used by ConnectionGuard::closed() observers.
         let router_handle = tokio::spawn(async move {
             Self::message_router(
@@ -1553,6 +1626,8 @@ impl ProtocolClient {
                 transport_router,
                 security_router,
                 out_tx_router,
+                hello_json_router,
+                handshake_gate_router,
             )
             .await;
         });
@@ -1563,6 +1638,7 @@ impl ProtocolClient {
         let sync_sender = WsSender {
             tx: out_tx.clone(),
             stream_state: Arc::clone(&stream_state),
+            handshake_gate: Arc::clone(&handshake_gate),
         };
         let sync_handle = tokio::spawn(async move {
             let mut sample_count: u32 = 0;
@@ -1598,10 +1674,12 @@ impl ProtocolClient {
             clock_sync,
             server_hello,
             stream_state: Arc::clone(&stream_state),
+            handshake_gate: Arc::clone(&handshake_gate),
             guard: ConnectionGuard {
                 sender: WsSender {
                     tx: out_tx,
                     stream_state,
+                    handshake_gate,
                 },
                 router_handle: Some(router_handle),
                 sync_handle: Some(sync_handle),
@@ -1623,6 +1701,8 @@ impl ProtocolClient {
         transport_router: Arc<Mutex<Transport>>,
         security: Option<SecurityContext>,
         out_tx: UnboundedSender<WriteCommand>,
+        hello_json: String,
+        handshake_gate: Arc<AtomicBool>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1775,20 +1855,45 @@ impl ProtocolClient {
                                         pending_pairing = None;
                                     }
                                     Message::NoiseHandshake(hs) => {
-                                        if let Err(e) = handle_rehandshake(
+                                        // No other message may flow until the exchange and the
+                                        // hello restart that follows it are done.
+                                        handshake_gate.store(true, Ordering::Release);
+                                        let outcome = handle_rehandshake(
                                             &hs.data,
                                             context,
                                             &transport_router,
                                             &out_tx,
                                         )
-                                        .await
+                                        .await;
+                                        let outcome = match outcome {
+                                            Ok(()) => {
+                                                restart_hello_exchange(
+                                                    &mut read,
+                                                    &transport_router,
+                                                    &out_tx,
+                                                    &hello_json,
+                                                )
+                                                .await
+                                            }
+                                            Err(e) => Err(e),
+                                        };
+                                        let activate = match outcome {
+                                            Ok(activate) => activate,
+                                            Err(e) => {
+                                                handshake_gate.store(false, Ordering::Release);
+                                                log::error!("Re-handshake failed: {e}");
+                                                break;
+                                            }
+                                        };
+                                        // Still gated: client/pair-finalize is part of this
+                                        // exchange, and nothing else may interleave with it.
+                                        if let Some(record) =
+                                            handle_pairing_activation(&activate, context, &out_tx)
+                                                .await
                                         {
-                                            log::error!("Re-handshake failed: {e}");
-                                            break;
+                                            pending_pairing = Some(record);
                                         }
-                                        // No other message flows during the exchange, and the
-                                        // connection restarts at server/hello afterwards, so
-                                        // there is nothing to forward.
+                                        handshake_gate.store(false, Ordering::Release);
                                         continue;
                                     }
                                     _ => {}
@@ -1831,6 +1936,7 @@ impl ProtocolClient {
         WsSender {
             tx: self.out_tx.clone(),
             stream_state: Arc::clone(&self.stream_state),
+            handshake_gate: Arc::clone(&self.handshake_gate),
         }
         .enter_external_source()
         .await
@@ -1841,6 +1947,7 @@ impl ProtocolClient {
         WsSender {
             tx: self.out_tx.clone(),
             stream_state: Arc::clone(&self.stream_state),
+            handshake_gate: Arc::clone(&self.handshake_gate),
         }
         .exit_external_source(player)
         .await
@@ -1868,6 +1975,7 @@ impl ProtocolClient {
         let sender = WsSender {
             tx: self.out_tx,
             stream_state: self.stream_state,
+            handshake_gate: self.handshake_gate,
         };
         let controller = self
             .server_hello

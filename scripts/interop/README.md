@@ -59,7 +59,10 @@ Covered today: both cipher suites, the Sentinel-PSK path, the transition from cl
 frames to encrypted binary frames, `client/hello` and `server/activate` over Noise, clock
 sync converging through the encrypted transport, and role activation.
 
-Three defects came out of pointing it at the reference server, none of which a loopback test
+Pairing completes end to end: the server reports `PAIRING_OK` and the client persists a
+long-term record bound to the server's id.
+
+Five defects came out of pointing it at the reference server, none of which a loopback test
 would have surfaced:
 
 1. **`client/hello` advertised no `supported_pair_methods`.** The server will not pair with a
@@ -69,11 +72,22 @@ would have surfaced:
 2. **`client/state` still carries the legacy top-level `state` field**, and the server logs
    `non-compliant client` for it. Known and deliberate — see the conformance notes — but this
    is the first time it was observed rather than reasoned about.
-3. **The hello sequence is not re-run after a re-handshake.** Still open. The server
-   re-handshakes to the Pairing PSK before activating pairing, and the spec restarts the
-   connection at `server/hello` → `client/hello` → `server/activate` once the new keys are in
-   place. This client swaps the session correctly but then carries on mid-stream, and the
-   clock-sync task keeps sending `client/time`, so the server reports
-   `Expected client/hello, got ClientTimeMessage` and drops the connection. Pairing cannot
-   complete until the restart is implemented, which also needs outbound traffic gated for the
-   duration of the exchange.
+3. **The hello sequence was not re-run after a re-handshake.** The server re-handshakes to
+   the Pairing PSK before activating pairing, and the spec restarts the connection at
+   `server/hello` → `client/hello` → `server/activate` once the new keys are in place. This
+   client swapped the session and carried on mid-stream while the clock-sync task kept
+   sending `client/time`, so the server answered
+   `Expected client/hello, got ClientTimeMessage` and dropped the connection. Fixed: the
+   router re-runs the exchange, behind a gate that holds outbound traffic for its duration.
+4. **The restart swallowed the activation it was run for.** With the restart in place the
+   server then waited for a `client/pair-finalize` that never came:
+   `malformed message awaiting ClientPairFinalizeMessage`. The helper consumed the pairing
+   `server/activate` to log it and never handed it on. Fixed by returning it to the caller.
+5. **`aiosendspin` sends `selected_pair_method`, the spec says `pairing.method`.** The spec
+   replaced the bare field with a `pairing` object that can also carry `pin_length` and
+   language hints; the reference still sends the older spelling. A client that reads only the
+   newer one sees an activation naming no method and declines with `method_not_supported` —
+   which is what happened. Both spellings are now accepted on receive, preferring the spec's.
+   This is the mirror image of the visualizer `pitch` divergence: there the reference is ahead
+   of the prose, here the prose is ahead of the reference, and a client that wants to work has
+   to read both.
