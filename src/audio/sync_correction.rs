@@ -19,10 +19,39 @@ impl CorrectionSchedule {
     }
 }
 
+/// Spec dead band for the suggested correction strategy: below this, a chunk
+/// goes out unchanged. Used as the disengage threshold.
+const SPEC_DEADBAND_US: i64 = 100;
+
+/// Spec accuracy *target* (`SHOULD` aim for ±0.5 ms), under the `MUST` floor of
+/// ±1 ms. Engaging below the target is what keeps steady state inside it rather
+/// than merely inside the floor.
+const SPEC_ACCURACY_TARGET_US: i64 = 500;
+
+/// Spec cap on effective playback speed: `MUST` stay within ±0.5% of normal,
+/// measured as a sliding average over 150 ms.
+const SPEC_MAX_SPEED_DEVIATION: f64 = 0.005;
+
 /// Planner that converts sync error into a correction schedule.
 ///
 /// Uses hysteresis to prevent oscillation at the deadband boundary:
 /// correction engages at `engage_us` and disengages at `deadband_us`.
+///
+/// The thresholds are bounded by the spec's playback-synchronization rules, not
+/// chosen for comfort: steady-state error `MUST` stay within ±1 ms and `SHOULD`
+/// be within ±0.5 ms, and the effective playback speed `MUST` stay within ±0.5%
+/// of normal over a 150 ms sliding average. [`CorrectionPlanner::new`] targets
+/// the `SHOULD`, on the principle that this implementation should have headroom
+/// the reference implementations do not.
+///
+/// Tight thresholds are only safe because the measurement in front of the
+/// planner is filtered: presentation-latency noise is one-sided, so
+/// `SyncErrorFilter` takes a windowed *minimum* rather than an average, and
+/// `EngageGate` additionally requires a sustained run of correcting plans over
+/// a warm filter before any frame is actually dropped or repeated. A backend
+/// whose presentation timestamps are coarser than the defaults assume can relax
+/// them with [`CorrectionPlanner::with_thresholds`], at the cost of a wider
+/// steady-state band.
 #[derive(Debug, Clone, Copy)]
 pub struct CorrectionPlanner {
     deadband_us: i64,
@@ -33,14 +62,38 @@ pub struct CorrectionPlanner {
 }
 
 impl CorrectionPlanner {
-    /// Create a planner with default thresholds.
+    /// Create a planner with spec-aligned thresholds.
+    ///
+    /// Engages below the ±0.5 ms accuracy target and releases at the suggested
+    /// strategy's ~100 µs dead band, so a settled stream sits inside the target
+    /// rather than inside the ±1 ms floor.
     pub fn new() -> Self {
         Self {
-            deadband_us: 1_500,
-            engage_us: 3_000,
+            deadband_us: SPEC_DEADBAND_US,
+            engage_us: SPEC_ACCURACY_TARGET_US - SPEC_DEADBAND_US,
             reanchor_threshold_us: 500_000,
             target_seconds: 2.0,
-            max_speed_correction: 0.04,
+            max_speed_correction: SPEC_MAX_SPEED_DEVIATION,
+        }
+    }
+
+    /// Create a planner with explicit engage/disengage thresholds in µs.
+    ///
+    /// For backends whose presentation timestamps are too coarse for the
+    /// spec-aligned defaults to settle — a raw reading can sit a whole engine
+    /// period above true alignment, and while `SyncErrorFilter` is built to
+    /// recover the floor from exactly that noise, it can only do so when the
+    /// floor mode is sampled within its window. Widening the band trades
+    /// steady-state accuracy for fewer engagements; it does not relax the speed
+    /// cap, which stays at the spec's ±0.5% either way.
+    ///
+    /// `engage_us` is clamped to at least `deadband_us` so hysteresis cannot
+    /// invert.
+    pub fn with_thresholds(deadband_us: i64, engage_us: i64) -> Self {
+        Self {
+            deadband_us,
+            engage_us: engage_us.max(deadband_us),
+            ..Self::new()
         }
     }
 
@@ -272,37 +325,37 @@ mod tests {
     #[test]
     fn test_no_correction_within_engage_threshold() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(2_500, 48_000, false);
-        assert!(!schedule.is_correcting(), "should not engage below 3ms");
+        let schedule = planner.plan(300, 48_000, false);
+        assert!(!schedule.is_correcting(), "should not engage below 400µs");
     }
 
     #[test]
     fn test_correction_engages_above_threshold() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(3_500, 48_000, false);
-        assert!(schedule.is_correcting(), "should engage above 3ms");
+        let schedule = planner.plan(600, 48_000, false);
+        assert!(schedule.is_correcting(), "should engage above 400µs");
         assert!(schedule.drop_every_n_frames > 0, "positive error = drop");
     }
 
     #[test]
     fn test_hysteresis_keeps_correcting_above_deadband() {
         let planner = CorrectionPlanner::new();
-        // 2ms error: below engage (3ms) but above deadband (1.5ms).
+        // 250µs error: below engage (400µs) but above the dead band (100µs).
         // Should keep correcting if already active.
-        let schedule = planner.plan(2_000, 48_000, true);
+        let schedule = planner.plan(250, 48_000, true);
         assert!(
             schedule.is_correcting(),
-            "should keep correcting above 1.5ms deadband"
+            "should keep correcting above the 100µs dead band"
         );
     }
 
     #[test]
     fn test_hysteresis_stops_below_deadband() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(1_000, 48_000, true);
+        let schedule = planner.plan(50, 48_000, true);
         assert!(
             !schedule.is_correcting(),
-            "should stop below 1.5ms deadband"
+            "should stop below the 100µs dead band"
         );
     }
 
@@ -327,7 +380,7 @@ mod tests {
     #[test]
     fn test_exact_engage_threshold_does_not_engage() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(3_000, 48_000, false);
+        let schedule = planner.plan(400, 48_000, false);
         assert!(
             !schedule.is_correcting(),
             "exactly at engage threshold should not engage (<=)"
@@ -337,11 +390,73 @@ mod tests {
     #[test]
     fn test_exact_deadband_threshold_disengages() {
         let planner = CorrectionPlanner::new();
-        let schedule = planner.plan(1_500, 48_000, true);
+        let schedule = planner.plan(100, 48_000, true);
         assert!(
             !schedule.is_correcting(),
             "exactly at deadband threshold should disengage (<=)"
         );
+    }
+
+    /// The spec caps effective playback speed at ±0.5% of normal over a 150 ms
+    /// sliding average. One correction moves the output by one frame, so the
+    /// deviation is the correction rate over the sample rate — assert it across
+    /// error magnitudes and rates, including errors far past the reanchor
+    /// threshold and rates where rounding is coarsest.
+    #[test]
+    fn test_speed_deviation_never_exceeds_spec_cap() {
+        let planner = CorrectionPlanner::new();
+        for sample_rate in [44_100u32, 48_000, 96_000, 192_000] {
+            for error_us in [
+                101i64, 250, 401, 1_000, 5_000, 10_000, 50_000, 250_000, 499_999,
+            ] {
+                for error_us in [error_us, -error_us] {
+                    let schedule = planner.plan(error_us, sample_rate, true);
+                    let interval = schedule
+                        .insert_every_n_frames
+                        .max(schedule.drop_every_n_frames);
+                    if interval == 0 {
+                        continue;
+                    }
+                    let deviation =
+                        f64::from(sample_rate) / f64::from(interval) / f64::from(sample_rate);
+                    assert!(
+                        deviation <= SPEC_MAX_SPEED_DEVIATION,
+                        "{deviation} exceeds the ±0.5% cap at {error_us}µs / {sample_rate}Hz"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The spec puts a hard floor of ±1 ms on steady-state error. Correction has
+    /// to begin below it, or a stream behaving exactly as designed sits outside
+    /// the floor indefinitely.
+    #[test]
+    fn test_steady_state_band_is_inside_the_spec_floor() {
+        const SPEC_ACCURACY_FLOOR_US: i64 = 1_000;
+        let planner = CorrectionPlanner::new();
+        let schedule = planner.plan(SPEC_ACCURACY_FLOOR_US, 48_000, false);
+        assert!(
+            schedule.is_correcting(),
+            "an error at the ±1ms floor must already be correcting"
+        );
+        assert!(
+            planner.engage_us < SPEC_ACCURACY_FLOOR_US,
+            "engage threshold {}µs must sit below the ±1ms floor",
+            planner.engage_us
+        );
+        assert!(
+            planner.deadband_us < SPEC_ACCURACY_TARGET_US,
+            "dead band {}µs must sit below the ±0.5ms target",
+            planner.deadband_us
+        );
+    }
+
+    #[test]
+    fn test_with_thresholds_cannot_invert_hysteresis() {
+        let planner = CorrectionPlanner::with_thresholds(2_000, 500);
+        assert!(!planner.plan(1_500, 48_000, false).is_correcting());
+        assert!(!planner.plan(1_500, 48_000, true).is_correcting());
     }
 
     #[test]
@@ -400,13 +515,14 @@ mod tests {
         // 200ms error — large enough that the desired rate exceeds the cap:
         //   frames_error                = 200000 * 48000 / 1_000_000 = 9600
         //   desired_corrections_per_sec = 9600 / 2.0                 = 4800
-        //   max_corrections_per_sec     = 48000 * 0.04               = 1920 (binding)
-        //   interval_frames             = round(48000 / 1920)        = 25
+        //   max_corrections_per_sec     = 48000 * 0.005              = 240 (binding)
+        //   interval_frames             = round(48000 / 240)         = 200
+        // One frame every 200 is a 0.5% speed deviation: the spec's cap exactly.
         let planner = CorrectionPlanner::new();
         let s = planner.plan(200_000, 48_000, true);
         assert_eq!(
-            s.drop_every_n_frames, 25,
-            "large drift should be capped at max speed correction (interval = 25 frames)"
+            s.drop_every_n_frames, 200,
+            "large drift should be capped at the spec's ±0.5% speed deviation"
         );
     }
 

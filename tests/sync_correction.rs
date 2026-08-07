@@ -3,8 +3,18 @@ use sendspin::audio::{CorrectionPlanner, CorrectionSchedule};
 #[test]
 fn test_correction_deadband() {
     let planner = CorrectionPlanner::new();
-    let schedule = planner.plan(1_000, 48_000, false);
+    let schedule = planner.plan(50, 48_000, false);
     assert_eq!(schedule, CorrectionSchedule::default());
+}
+
+/// A 1ms error is the spec's steady-state floor, not something to sit inside:
+/// it must already be correcting from idle.
+#[test]
+fn test_correction_engages_at_the_spec_floor() {
+    let planner = CorrectionPlanner::new();
+    let schedule = planner.plan(1_000, 48_000, false);
+    assert!(schedule.is_correcting());
+    assert!(schedule.drop_every_n_frames > 0);
 }
 
 #[test]
