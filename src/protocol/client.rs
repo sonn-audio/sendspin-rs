@@ -26,7 +26,9 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use super::transport::{Inbound, Outbound, Transport};
-use crate::noise::{CipherSuite, ClientHandshake, HandshakeStep, Identity, Psk};
+use crate::noise::pairing::{plan_pairing, PairAbort, PairAbortReason, PairingAction};
+use crate::noise::trust_store::{InMemoryPairingStore, PairingRecord, PairingStore};
+use crate::noise::{CipherSuite, ClientHandshake, HandshakeStep, Identity};
 
 /// `Goodbye` is one variant (not `Send` + `Close`) so the writer processes it
 /// atomically: once dequeued it flushes goodbye + close and exits, so nothing
@@ -128,8 +130,10 @@ where
     let EncryptionSettings {
         identity,
         suite,
-        psks,
+        store,
     } = settings;
+    let psks = crate::noise::trust_store::handshake_candidates(store.as_ref())?;
+    log::debug!("Offering {} PSK candidate(s)", psks.len());
     let (mut handshake, client_init) = ClientHandshake::start(identity, suite, psks)?;
 
     log::debug!("Sending client/init ({} bytes)", client_init.len());
@@ -191,6 +195,158 @@ where
             }
         }
     }
+}
+
+/// Settle the request-format gate, then hand the message to consumers.
+fn forward_message(
+    msg: Message,
+    stream_state: &Arc<StreamState>,
+    message_tx: &UnboundedSender<Message>,
+    message_closed: &mut bool,
+) {
+    // Before forwarding, so a consumer reacting to this stream/start or stream/end sees
+    // current state.
+    match &msg {
+        Message::StreamStart(start) => stream_state.note_stream_start(start),
+        Message::StreamEnd(end) => stream_state.note_stream_end(end),
+        _ => {}
+    }
+    if !*message_closed && message_tx.send(msg).is_err() {
+        log::error!("Message receiver dropped — messages will be discarded");
+        *message_closed = true;
+    }
+}
+
+/// Send one message through the writer, waiting until it has actually reached the socket.
+///
+/// The wait matters wherever ordering does — notably a re-handshake, whose reply has to be
+/// on the wire under the old keys before the session is swapped.
+async fn send_and_flush(
+    out_tx: &UnboundedSender<WriteCommand>,
+    payload: Outbound,
+) -> Result<(), Error> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    out_tx
+        .send(WriteCommand::Send {
+            payload,
+            ack: ack_tx,
+        })
+        .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+    ack_rx
+        .await
+        .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+}
+
+/// React to a `server/activate` that asks to pair.
+///
+/// Returns the record to persist once the server acknowledges, or `None` when there was
+/// nothing to do or the attempt was declined.
+async fn handle_pairing_activation(
+    activate: &super::messages::ServerActivate,
+    context: &SecurityContext,
+    out_tx: &UnboundedSender<WriteCommand>,
+) -> Option<PairingRecord> {
+    use super::messages::Activity;
+    if !activate.activities.contains(&Activity::Pairing) {
+        return None;
+    }
+    // `pairing` is required when the activity set includes pairing; without it there is no
+    // method to check against, which is itself a reason to decline.
+    let Some(pairing) = activate.pairing.as_ref() else {
+        log::warn!("Pairing activation carried no pairing object");
+        let _ = send_abort(out_tx, PairAbortReason::MethodNotSupported).await;
+        return None;
+    };
+
+    let matched = *context.psk_category.lock();
+
+    let action = match plan_pairing(
+        pairing.method,
+        matched,
+        &context.server_id,
+        context.store.as_ref(),
+    ) {
+        Ok(action) => action,
+        Err(e) => {
+            log::error!("Could not plan pairing: {e}");
+            return None;
+        }
+    };
+
+    match action {
+        PairingAction::Finalize { message, record } => {
+            log::info!(
+                "Pairing with {} via {:?}",
+                context.server_id,
+                pairing.method
+            );
+            let json = match serde_json::to_string(&Message::ClientPairFinalize(message)) {
+                Ok(json) => json,
+                Err(e) => {
+                    log::error!("Could not encode client/pair-finalize: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = send_and_flush(out_tx, Outbound::Json(json)).await {
+                log::error!("Could not send client/pair-finalize: {e}");
+                return None;
+            }
+            Some(record)
+        }
+        PairingAction::Abort(reason) => {
+            log::warn!("Declining pairing: {reason:?}");
+            let _ = send_abort(out_tx, reason).await;
+            None
+        }
+    }
+}
+
+/// Send a `pair/abort`.
+///
+/// Every reason but `concurrent_attempt` leaves the connection open, so the server can offer
+/// another method rather than being dropped.
+async fn send_abort(
+    out_tx: &UnboundedSender<WriteCommand>,
+    reason: PairAbortReason,
+) -> Result<(), Error> {
+    let json = serde_json::to_string(&Message::PairAbort(PairAbort { reason }))
+        .map_err(|e| Error::Protocol(e.to_string()))?;
+    send_and_flush(out_tx, Outbound::Json(json)).await
+}
+
+/// Drive an in-band re-handshake and swap the transport onto the new session.
+async fn handle_rehandshake(
+    msg1_data: &str,
+    context: &SecurityContext,
+    transport: &Arc<Mutex<Transport>>,
+    out_tx: &UnboundedSender<WriteCommand>,
+) -> Result<(), Error> {
+    let previous_hash = transport.lock().handshake_hash()?;
+    let candidates = crate::noise::trust_store::handshake_candidates(context.store.as_ref())?;
+    let result = crate::noise::run_rehandshake_client(
+        context.suite,
+        &context.identity,
+        &context.server_static,
+        &previous_hash,
+        &context.server_id,
+        &candidates,
+        msg1_data,
+    )?;
+    let reply = String::from_utf8(result.reply)
+        .map_err(|e| Error::Protocol(format!("re-handshake reply was not UTF-8: {e}")))?;
+
+    // Message 2 goes out under the OLD keys, so it has to be on the wire before the swap —
+    // hence the flush rather than a fire-and-forget send.
+    send_and_flush(out_tx, Outbound::Json(reply)).await?;
+    transport.lock().swap_session(result.session)?;
+    *context.psk_category.lock() = result.psk_category;
+    context.store.mark_record_used(&result.psk_id)?;
+    log::info!(
+        "Re-handshake complete: session now keyed by {:?} ({})",
+        result.psk_category,
+        result.psk_id
+    );
+    Ok(())
 }
 
 /// Minimal view of the message envelope, for the one message whose payload shape depends
@@ -279,28 +435,67 @@ pub enum Encryption {
 }
 
 /// What an encrypted connection is keyed with.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EncryptionSettings {
     /// This client's static keypair. Its public half is the `client_id`.
     pub identity: Identity,
     /// The suite to announce in `client/init`.
     pub suite: CipherSuite,
-    /// The PSKs this client will accept being keyed with.
+    /// Where this client's pairing records and pairing configuration live.
     ///
-    /// A key whose pairing method is currently disabled must be left out, so a handshake
-    /// naming it fails as a lookup miss rather than succeeding against a disabled method.
-    pub psks: Vec<Psk>,
+    /// The handshake candidate set is derived from it rather than supplied, because the rules
+    /// are easy to get wrong: see
+    /// [`handshake_candidates`](crate::noise::trust_store::handshake_candidates).
+    pub store: Arc<dyn PairingStore>,
+}
+
+impl std::fmt::Debug for EncryptionSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionSettings")
+            .field("client_id", &self.identity.client_id())
+            .field("suite", &self.suite)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EncryptionSettings {
-    /// Settings for a client with no pairing record: Sentinel PSK only.
-    pub fn unpaired(identity: Identity) -> Self {
+    /// Settings for a client that has not paired yet, with an in-memory store.
+    ///
+    /// The store is in memory, so records do not survive the process. A client that means to
+    /// stay paired needs a durable one — the identity and the records are exactly what has to
+    /// outlive a reboot for a pairing to still mean anything.
+    pub fn unpaired(identity: Identity) -> Result<Self, Error> {
+        Ok(Self {
+            identity,
+            suite: CipherSuite::default(),
+            store: Arc::new(InMemoryPairingStore::new()?),
+        })
+    }
+
+    /// Settings over a caller-supplied store.
+    pub fn with_store(identity: Identity, store: Arc<dyn PairingStore>) -> Self {
         Self {
             identity,
             suite: CipherSuite::default(),
-            psks: vec![Psk::sentinel()],
+            store,
         }
     }
+}
+
+/// What the router needs to carry on a pairing or a re-handshake mid-connection.
+#[derive(Clone)]
+pub(crate) struct SecurityContext {
+    identity: Identity,
+    suite: CipherSuite,
+    server_static: [u8; 32],
+    server_id: String,
+    store: Arc<dyn PairingStore>,
+    /// Which PSK category keys the live session.
+    ///
+    /// Shared and mutable because a re-handshake changes it — that is what a re-handshake is
+    /// for — and the pairing check reads it at the moment an activation arrives, not at
+    /// connect time.
+    psk_category: Arc<Mutex<crate::noise::PskCategory>>,
 }
 
 /// Connection components returned by [`ProtocolClient::split()`].
@@ -1147,16 +1342,29 @@ impl ProtocolClient {
             .map_err(|e| Error::Connection(e.to_string()))?;
 
         let mut encrypted_server_id = None;
+        let mut security: Option<SecurityContext> = None;
         let transport = match encryption {
             Encryption::Disabled => Transport::Plain,
             Encryption::Enabled(settings) => {
+                let identity = settings.identity.clone();
+                let suite = settings.suite;
+                let store = Arc::clone(&settings.store);
                 let result = run_noise_handshake(&mut ws_stream, settings).await?;
                 log::info!(
                     "Noise handshake complete: server_id={}, psk={:?}",
                     result.server_id,
                     result.psk_category
                 );
+                store.mark_record_used(&result.psk_id)?;
                 encrypted_server_id = Some(result.server_id.clone());
+                security = Some(SecurityContext {
+                    identity,
+                    suite,
+                    server_static: crate::noise::keys::b64_decode(&result.server_id)?,
+                    server_id: result.server_id.clone(),
+                    store,
+                    psk_category: Arc::new(Mutex::new(result.psk_category)),
+                });
                 Transport::encrypted(result.session)?
             }
         };
@@ -1168,6 +1376,7 @@ impl ProtocolClient {
             clock,
             transport,
             encrypted_server_id,
+            security,
         )
         .await
     }
@@ -1182,6 +1391,7 @@ impl ProtocolClient {
         clock: Arc<dyn Clock>,
         transport: Transport,
         encrypted_server_id: Option<String>,
+        security: Option<SecurityContext>,
     ) -> Result<Self, Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1327,6 +1537,8 @@ impl ProtocolClient {
         let clock_router = Arc::clone(&clock);
         let stream_state_router = Arc::clone(&stream_state);
         let transport_router = Arc::clone(&transport);
+        let security_router = security.clone();
+        let out_tx_router = out_tx.clone();
         // The router task handle is used by ConnectionGuard::closed() observers.
         let router_handle = tokio::spawn(async move {
             Self::message_router(
@@ -1339,6 +1551,8 @@ impl ProtocolClient {
                 clock_router,
                 stream_state_router,
                 transport_router,
+                security_router,
+                out_tx_router,
             )
             .await;
         });
@@ -1407,6 +1621,8 @@ impl ProtocolClient {
         clock: Arc<dyn Clock>,
         stream_state: Arc<StreamState>,
         transport_router: Arc<Mutex<Transport>>,
+        security: Option<SecurityContext>,
+        out_tx: UnboundedSender<WriteCommand>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1416,6 +1632,10 @@ impl ProtocolClient {
         let mut message_closed = false;
         let mut audio_chunk_count = 0u64;
         let mut visualizer_chunk_count = 0u64;
+        // Pairing is a two-message exchange, so the record waits here between sending
+        // client/pair-finalize and the server acknowledging it. Held rather than stored,
+        // because persisting early leaves a record for a pairing the server never completed.
+        let mut pending_pairing: Option<PairingRecord> = None;
 
         while let Some(msg) = read.next().await {
             let ws_msg = match msg {
@@ -1519,24 +1739,74 @@ impl ProtocolClient {
                                     st.server_transmitted,
                                     t4,
                                 );
-                            } else {
-                                log::debug!("Received message: {:?}", msg);
-                                // Settle the request-format gate before
-                                // forwarding, so a consumer reacting to this
-                                // stream/start or stream/end sees current state.
+                            } else if let Some(context) = security.as_ref() {
                                 match &msg {
-                                    Message::StreamStart(start) => {
-                                        stream_state.note_stream_start(start)
+                                    Message::ServerActivate(activate) => {
+                                        if let Some(record) =
+                                            handle_pairing_activation(activate, context, &out_tx)
+                                                .await
+                                        {
+                                            pending_pairing = Some(record);
+                                        }
                                     }
-                                    Message::StreamEnd(end) => stream_state.note_stream_end(end),
+                                    Message::ServerPairFinalize(_) => {
+                                        match pending_pairing.take() {
+                                            Some(record) => {
+                                                // The server has persisted its side; now it
+                                                // is safe for the client to persist its own.
+                                                match context.store.add_record(record.clone()) {
+                                                    Ok(()) => log::info!(
+                                                        "Paired with {}: record {}",
+                                                        context.server_id,
+                                                        record.psk_id()
+                                                    ),
+                                                    Err(e) => log::error!(
+                                                        "Could not persist pairing record: {e}"
+                                                    ),
+                                                }
+                                            }
+                                            None => log::warn!(
+                                                "server/pair-finalize arrived with no pairing in flight"
+                                            ),
+                                        }
+                                    }
+                                    Message::PairAbort(abort) => {
+                                        log::warn!("Pairing aborted by server: {:?}", abort.reason);
+                                        pending_pairing = None;
+                                    }
+                                    Message::NoiseHandshake(hs) => {
+                                        if let Err(e) = handle_rehandshake(
+                                            &hs.data,
+                                            context,
+                                            &transport_router,
+                                            &out_tx,
+                                        )
+                                        .await
+                                        {
+                                            log::error!("Re-handshake failed: {e}");
+                                            break;
+                                        }
+                                        // No other message flows during the exchange, and the
+                                        // connection restarts at server/hello afterwards, so
+                                        // there is nothing to forward.
+                                        continue;
+                                    }
                                     _ => {}
                                 }
-                                if !message_closed && message_tx.send(msg).is_err() {
-                                    log::error!(
-                                        "Message receiver dropped — messages will be discarded"
-                                    );
-                                    message_closed = true;
-                                }
+                                forward_message(
+                                    msg,
+                                    &stream_state,
+                                    &message_tx,
+                                    &mut message_closed,
+                                );
+                            } else {
+                                log::debug!("Received message: {:?}", msg);
+                                forward_message(
+                                    msg,
+                                    &stream_state,
+                                    &message_tx,
+                                    &mut message_closed,
+                                );
                             }
                         }
                         Err(e) => {

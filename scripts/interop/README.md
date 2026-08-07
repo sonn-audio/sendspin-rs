@@ -39,11 +39,41 @@ what matters: decrypting an application message means both sides derived the sam
 keys from the same prologue and the same PSK, which is everything the handshake had to get
 right.
 
-## What it currently covers
+## Driving a real pairing
 
-Both cipher suites, the Sentinel-PSK path, and the transition from cleartext text frames to
-encrypted binary frames.
+`PAIR_WITH=<client_id>:<pairing_psk>` makes the harness pair with that client as soon as it
+connects, which is what an operator pasting a pairing token does. Both values are printed by
+`--full --seed N`:
 
-`TRUST_UNPAIRED_CLIENT_ID=<client_id>` admits one unpaired client to playback, so a
-Sentinel-keyed connection can be activated rather than merely tolerated — useful once
-`server/activate` handling lands.
+```bash
+cargo run --example noise_interop -- --full --seed 9 --listen-secs 15 \
+    --server ws://127.0.0.1:8931/sendspin
+```
+
+`TRUST_UNPAIRED_CLIENT_ID=<client_id>` instead admits one unpaired client to playback, so a
+Sentinel-keyed connection gets roles activated rather than merely tolerated.
+
+## What it covers, and what it found
+
+Covered today: both cipher suites, the Sentinel-PSK path, the transition from cleartext text
+frames to encrypted binary frames, `client/hello` and `server/activate` over Noise, clock
+sync converging through the encrypted transport, and role activation.
+
+Three defects came out of pointing it at the reference server, none of which a loopback test
+would have surfaced:
+
+1. **`client/hello` advertised no `supported_pair_methods`.** The server will not pair with a
+   client that offered nothing, so pairing failed before it began. The advertisement is now
+   derived from the pairing store rather than left to a caller, so it cannot drift from what
+   the client can actually do.
+2. **`client/state` still carries the legacy top-level `state` field**, and the server logs
+   `non-compliant client` for it. Known and deliberate — see the conformance notes — but this
+   is the first time it was observed rather than reasoned about.
+3. **The hello sequence is not re-run after a re-handshake.** Still open. The server
+   re-handshakes to the Pairing PSK before activating pairing, and the spec restarts the
+   connection at `server/hello` → `client/hello` → `server/activate` once the new keys are in
+   place. This client swaps the session correctly but then carries on mid-stream, and the
+   clock-sync task keeps sending `client/time`, so the server reports
+   `Expected client/hello, got ClientTimeMessage` and drops the connection. Pairing cannot
+   complete until the restart is implemented, which also needs outbound traffic gated for the
+   duration of the exchange.

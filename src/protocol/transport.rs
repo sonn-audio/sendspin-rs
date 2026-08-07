@@ -72,6 +72,42 @@ impl Transport {
         matches!(self, Self::Encrypted { .. })
     }
 
+    /// The current session's handshake hash — the prologue for a re-handshake.
+    pub(crate) fn handshake_hash(&self) -> Result<[u8; 32], Error> {
+        match self {
+            Self::Plain => Err(Error::Protocol(
+                "an unencrypted connection has no handshake to re-run".to_string(),
+            )),
+            Self::Encrypted { session, .. } => session.handshake_hash(),
+        }
+    }
+
+    /// Replace the session after a re-handshake.
+    ///
+    /// Reassembly state is dropped with the old session, which is correct: no other message
+    /// flows during the exchange, so nothing can be half-reassembled across it, and carrying
+    /// a buffer over would mean carrying it across a key change.
+    pub(crate) fn swap_session(&mut self, new_session: NoiseSession) -> Result<(), Error> {
+        match self {
+            Self::Plain => Err(Error::Protocol(
+                "cannot install a Noise session on an unencrypted connection".to_string(),
+            )),
+            Self::Encrypted {
+                session,
+                reassembler,
+            } => {
+                if !new_session.in_transport_mode() {
+                    return Err(Error::Protocol(
+                        "the replacement session must be in transport mode".to_string(),
+                    ));
+                }
+                **session = new_session;
+                *reassembler = Reassembler::new();
+                Ok(())
+            }
+        }
+    }
+
     /// Turn one outbound message into the WebSocket frames that carry it.
     ///
     /// More than one frame comes back when the message had to be fragmented.

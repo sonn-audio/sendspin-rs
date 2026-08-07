@@ -211,10 +211,30 @@ async fn run_full_client(
     identity: Identity,
     suite: CipherSuite,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use sendspin::noise::trust_store::{InMemoryPairingStore, PairingConfig, PairingStore};
     use sendspin::protocol::client::{Encryption, EncryptionSettings};
     use sendspin::ProtocolClientBuilder;
+    use std::sync::Arc;
 
-    let mut settings = EncryptionSettings::unpaired(identity.clone());
+    // A deterministic Pairing PSK when seeded, so the harness can be told which key to pair
+    // with. Real clients keep one CSPRNG key for the life of the device.
+    let pairing_psk = args.seed.map(|byte| [byte ^ 0xA5; 32]);
+    let config = match pairing_psk {
+        Some(psk) => PairingConfig {
+            pairing_psk: Some(psk),
+            unpaired_access: true,
+        },
+        None => PairingConfig::generate()?,
+    };
+    if let Some(psk) = pairing_psk {
+        println!(
+            "pairing_psk: {}",
+            sendspin::noise::trust_store::psk_to_wire(&psk)
+        );
+    }
+    let store: Arc<dyn PairingStore> = Arc::new(InMemoryPairingStore::with_config(config));
+
+    let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::clone(&store));
     settings.suite = suite;
 
     let client = ProtocolClientBuilder::builder()
@@ -261,6 +281,20 @@ async fn run_full_client(
     let synced = clock_sync.lock().is_synchronized();
     println!("\nmessages seen : {seen}");
     println!("clock synced  : {synced}");
-    println!("\nFULL CLIENT INTEROP OK: encrypted connection came up end to end");
+
+    let records = store.records()?;
+    println!("pairing records: {}", records.len());
+    for record in &records {
+        println!(
+            "  {} -> {}",
+            record.psk_id(),
+            record.server_id().unwrap_or("<shared>")
+        );
+    }
+    if records.is_empty() {
+        println!("\nFULL CLIENT INTEROP OK: encrypted connection came up end to end");
+    } else {
+        println!("\nPAIRING INTEROP OK: paired and persisted a long-term record");
+    }
     Ok(())
 }

@@ -5,8 +5,8 @@ use crate::protocol::client::Encryption;
 use crate::protocol::listener::ProtocolListener;
 use crate::protocol::messages::{
     ArtworkV1Support, AudioFormatSpec, ClientHello, ClientState, ClientSyncState, DeviceInfo,
-    PairMethodDescriptor, PlayerState, PlayerV1Support, SourceState, SourceV1Support, TrustLevel,
-    UnpairedAccess, VisualizerV1Support,
+    PairMethod, PairMethodDescriptor, PlayerState, PlayerV1Support, SourceState, SourceV1Support,
+    TrustLevel, UnpairedAccess, VisualizerV1Support,
 };
 use crate::protocol::transport::Transport;
 use crate::sync::raw_clock::{Clock, DefaultClock};
@@ -282,7 +282,27 @@ impl ProtocolClientBuilder {
         request: R,
     ) -> Result<ProtocolClient, Error> {
         let encryption = self.encryption.clone();
-        let (hello, initial_state, clock) = self.into_parts();
+        let (mut hello, initial_state, clock) = self.into_parts();
+        // A client's pairing advertisement has to reflect its live configuration: a method it
+        // does not offer must be absent, and the reference server refuses to pair with a
+        // client whose hello offered nothing. Deriving it from the store keeps the two from
+        // drifting apart.
+        if let Encryption::Enabled(settings) = &encryption {
+            let config = settings.store.pairing_config()?;
+            let mut methods = Vec::new();
+            if config.pairing_psk.is_some() {
+                methods.push(PairMethodDescriptor {
+                    method: PairMethod::PairingPsk,
+                    out_channels: None,
+                    locked_out: None,
+                    min_pin_length: None,
+                });
+            }
+            hello.supported_pair_methods = Some(methods);
+            hello.unpaired_access = UnpairedAccess {
+                enabled: config.unpaired_access,
+            };
+        }
         ProtocolClient::connect(request, hello, initial_state, clock, encryption).await
     }
 
@@ -304,6 +324,7 @@ impl ProtocolClientBuilder {
             initial_state,
             clock,
             Transport::Plain,
+            None,
             None,
         )
         .await

@@ -9,13 +9,16 @@ that completes a handshake.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import sys
 
 from aiohttp import web
 
+from aiosendspin.models.types import PairMethod
 from aiosendspin.noise import Identity, InMemoryServerPairingStore
+from aiosendspin.noise.pairing import PairingAttempt
 from aiosendspin.server.server import SendspinServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8927
@@ -58,12 +61,35 @@ async def main() -> None:
     print(f"URL=ws://127.0.0.1:{PORT}/sendspin", flush=True)
     print("READY", flush=True)
 
+    # PAIR_WITH=<client_id>:<pairing_psk_b64url> drives a real Pairing PSK pairing as soon
+    # as that client connects, which is what an operator pasting a pairing token does.
+    pair_spec = os.environ.get("PAIR_WITH")
+    pair_client, pair_psk = (None, None)
+    if pair_spec:
+        cid, _, psk_b64 = pair_spec.partition(":")
+        pair_client = cid
+        pair_psk = base64.urlsafe_b64decode(psk_b64 + "=" * (-len(psk_b64) % 4))
+        print(f"WILL_PAIR_WITH={pair_client}", flush=True)
+
+    paired = False
     try:
         while True:
             await asyncio.sleep(1)
             clients = getattr(server, "clients", None)
-            if clients:
-                print(f"CLIENTS={list(clients)}", flush=True)
+            ids = [getattr(c, "client_id", None) for c in clients or []]
+            if ids:
+                print(f"CLIENTS={ids}", flush=True)
+            if pair_client and not paired and pair_client in ids:
+                paired = True
+                print("PAIRING_START", flush=True)
+                try:
+                    await server.initiate_pairing(
+                        pair_client,
+                        PairingAttempt(method=PairMethod.PAIRING_PSK, pairing_psk=pair_psk),
+                    )
+                    print("PAIRING_OK", flush=True)
+                except Exception as exc:  # noqa: BLE001 - report whatever the server raised
+                    print(f"PAIRING_FAILED={type(exc).__name__}: {exc}", flush=True)
     except asyncio.CancelledError:
         pass
     finally:
