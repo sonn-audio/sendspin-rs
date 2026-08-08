@@ -17,6 +17,9 @@ native-tls = [
 # mDNS advertisement, so a server can discover a listening client. Off by default: an
 # appliance whose address is configured has no use for an mDNS daemon and should not link one.
 discovery = ["dep:mdns-sd"]
+# The `sendspin` command-line player. Off by default, and for the same reason `discovery` is:
+# a device embedding this crate should not link an argument parser or a logger to get a player.
+cli = ["dep:clap", "dep:env_logger", "discovery"]
 
 [dependencies]
 # Async runtime
@@ -61,6 +64,10 @@ subtle = "2"
 chacha20poly1305 = "0.11"
 aes-gcm = "0.11"
 
+# Command-line only, and optional so a library consumer never pulls them in.
+clap = { version = "4.6", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
@@ -80,6 +87,11 @@ tokio-test = "0.4"
 base64 = "0.22"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
+
+[[bin]]
+name = "sendspin"
+path = "src/bin/sendspin/main.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "server_initiated_metadata"

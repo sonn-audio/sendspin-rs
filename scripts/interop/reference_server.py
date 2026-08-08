@@ -279,8 +279,11 @@ async def main() -> None:
         server_name="Interop Reference Server",
         pairing_store=InMemoryServerPairingStore(),
         # Left at its default on purpose: the point is to prove the Rust client speaks
-        # the encrypted transport, not to fall back to the legacy hello.
-        allow_unencrypted=False,
+        # the encrypted transport, not to fall back to the legacy hello. ALLOW_UNENCRYPTED=1
+        # opens the transition-mode path, which is the only way to exercise a client that has
+        # no persisted identity yet — everything about encryption stays covered by the runs
+        # that leave this alone.
+        allow_unencrypted=os.environ.get("ALLOW_UNENCRYPTED") == "1",
     )
 
     # Optionally admit one unpaired client to playback, so a Sentinel-keyed handshake

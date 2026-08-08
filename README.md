@@ -131,6 +131,37 @@ sudo apt install libasound2-dev
 dnf install alsa-lib-devel
 ```
 
+## The `sendspin` command
+
+A headless player, behind the `cli` feature so a device embedding this crate as a library
+never links an argument parser or a logger to get one:
+
+```bash
+cargo run --features cli --bin sendspin -- daemon --name "Kitchen"
+```
+
+With no `--url` it listens on port 8928 for server-initiated connections and advertises
+`_sendspin._tcp.local.`, which is what a fixed appliance on a network with a discovering
+server wants. With `--url` it dials that server instead. Volume, mute and static delay
+arrive as `server/command` and are reported back in `client/state`; multi-server arbitration
+is `ConnectionManager`'s, so a server that takes over is served and the previous one is let
+go.
+
+The flag names track `sendspin-cli`'s, so an operator who knows one does not have to learn
+the other. Two limits worth knowing before you deploy it:
+
+- **It speaks transition mode**, not the encrypted transport, so a server with
+  `allow_unencrypted` off refuses it. Under Noise the `client_id` *is* the public half of a
+  keypair, so turning encryption on means keeping that key across restarts — which needs the
+  settings directory that is not built yet. The daemon says so on startup rather than
+  failing with a bare disconnect.
+- **`--interface` binds the listening socket only.** It does not yet restrict which
+  interface mDNS advertises on, because the advertisement API takes no interface.
+
+Still to come, in the order they are being built: a durable settings directory (which also
+fixes the pairing failure counter losing its state on restart), audio device selection with
+`--audio-device` and `--audio-format`, then hooks, hardware volume and MPRIS.
+
 ## Quick start
 
 ```toml
