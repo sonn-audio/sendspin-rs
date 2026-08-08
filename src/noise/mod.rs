@@ -37,6 +37,8 @@
 
 /// Protocol constants: labels, the published Sentinel PSK, frame tags and size limits.
 pub mod constants;
+/// CPACE-X25519-SHA512, the PAKE the PIN pairing flows run.
+pub mod cpace;
 /// The client-side handshake driver.
 pub mod handshake;
 /// Identities, pre-shared keys, and `psk_id` derivation.

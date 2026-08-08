@@ -55,6 +55,9 @@ sha2 = "0.11.0"
 base64 = "0.22"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 mdns-sd = { version = "0.20", optional = true }
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
+hmac = "0.13"
+subtle = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
