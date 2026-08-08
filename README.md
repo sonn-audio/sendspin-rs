@@ -194,6 +194,16 @@ Exactly one thing owns the level at a time: the `--hook-set-volume` script, the 
 or this process's gain, in that order of precedence. Applying it in two places would attenuate
 twice.
 
+### As a dedicated player
+
+For the case this is really built for — a Raspberry Pi wired to speakers, no screen, nobody
+watching — `packaging/systemd/` has a unit file and the reasoning behind its choices. Two
+things matter there and are handled: with `--url` the daemon redials on its own
+(`--reconnect-secs`, five seconds by default, backing off to a minute), so a server that
+restarts costs a few seconds of silence rather than the evening; and the settings directory
+comes from `$STATE_DIRECTORY` when systemd provides one, so the daemon works as a system
+service with no `HOME` at all.
+
 One limit worth knowing: **`--interface` binds the listening socket only.** It does not yet
 restrict which interface mDNS advertises on, because the advertisement API takes no
 interface.

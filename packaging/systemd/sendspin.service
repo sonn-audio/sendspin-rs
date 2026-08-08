@@ -1,0 +1,68 @@
+# A dedicated Sendspin player: a Raspberry Pi wired to speakers, with no screen and nobody
+# watching it. Install to /etc/systemd/system/sendspin.service, edit the ExecStart line, then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now sendspin
+#   journalctl -u sendspin -f
+#
+# See packaging/systemd/README.md for what each choice is for.
+
+[Unit]
+Description=Sendspin synchronized audio player
+Documentation=https://github.com/Sendspin/spec
+# Sound before audio, and a routable address before mDNS. `network-online` rather than
+# `network` because a client that advertises itself on an interface with no address yet
+# advertises nothing, and nothing retries it.
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit this line. With no --url it listens on 8928 and advertises over mDNS; add
+# --url ws://your-server:8927/sendspin to dial a fixed server instead.
+ExecStart=/usr/local/bin/sendspin daemon --name "%H"
+
+# Always, not on-failure: this daemon exits 0 when it is told to stop, and a player that goes
+# quiet after a clean shutdown of its server is the failure mode this whole unit exists to
+# avoid. The daemon reconnects on its own; this is the backstop for the cases it cannot handle,
+# like the audio device disappearing.
+Restart=always
+RestartSec=10
+
+# The identity key and pairing records live here. systemd creates it 0700 owned by the
+# service user and hands the path over as $STATE_DIRECTORY, which the daemon reads.
+StateDirectory=sendspin
+StateDirectoryMode=0700
+
+# A dedicated player needs the sound card and nothing else.
+DynamicUser=yes
+SupplementaryGroups=audio
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=no
+DeviceAllow=char-alsa rw
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The audio callback has a deadline; missing it is an audible click rather than a slow frame.
+# Modest and bounded on purpose: a runaway real-time thread on a single-core Pi locks the box.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=10
+LimitRTPRIO=20
+LimitMEMLOCK=infinity
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

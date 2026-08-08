@@ -72,8 +72,8 @@ pub struct DaemonArgs {
     /// Directory holding the identity key and pairing records.
     ///
     /// Both have to outlive a reboot for a pairing to still mean anything, and the failure
-    /// counter that limits PIN guessing lives here too. Defaults to `$XDG_CONFIG_HOME/sendspin`,
-    /// or `~/.config/sendspin`.
+    /// counter that limits PIN guessing lives here too. Defaults to `$STATE_DIRECTORY` under
+    /// systemd, else `$XDG_CONFIG_HOME/sendspin`, else `~/.config/sendspin`.
     #[arg(long)]
     pub settings_dir: Option<std::path::PathBuf>,
 
@@ -93,6 +93,15 @@ pub struct DaemonArgs {
     /// refuse the connection outright.
     #[arg(long)]
     pub no_encryption: bool,
+
+    /// Seconds to wait before redialling after `--url` loses its server. 0 disables it.
+    ///
+    /// A dedicated player has to come back on its own: a server that restarts should leave the
+    /// speaker silent for a few seconds, not until someone notices. Backs off up to a minute so
+    /// a server that is down for the night is not dialled fifty times a second, and resets once
+    /// a connection comes up. Only meaningful with `--url`; the listening path already waits.
+    #[arg(long, default_value_t = 5)]
+    pub reconnect_secs: u64,
 
     /// Logging level.
     #[arg(long, default_value = "info",
@@ -211,13 +220,25 @@ impl DaemonArgs {
         if let Some(dir) = &self.settings_dir {
             return Ok(dir.clone());
         }
+        // systemd sets this from `StateDirectory=` and creates it with the right owner. It
+        // comes first because a system service usually has no HOME at all, and a daemon that
+        // refused to start there would be a daemon that cannot be a system service.
+        if let Some(state) = std::env::var_os("STATE_DIRECTORY").filter(|v| !v.is_empty()) {
+            // The variable is colon-separated when several are configured; the first is ours.
+            let first = std::env::split_paths(&state).next();
+            if let Some(first) = first.filter(|p| !p.as_os_str().is_empty()) {
+                return Ok(first);
+            }
+        }
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
             return Ok(std::path::PathBuf::from(xdg).join("sendspin"));
         }
         let home = std::env::var_os("HOME")
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
-                "no --settings-dir given and neither XDG_CONFIG_HOME nor HOME is set".to_string()
+                "no --settings-dir given, and none of STATE_DIRECTORY, XDG_CONFIG_HOME or HOME \
+                 is set"
+                    .to_string()
             })?;
         Ok(std::path::PathBuf::from(home)
             .join(".config")

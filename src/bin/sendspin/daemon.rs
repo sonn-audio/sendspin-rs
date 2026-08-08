@@ -169,8 +169,43 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match args.url.clone() {
-        Some(url) => run_outbound(&args, &url, &device).await,
+        Some(url) => run_outbound_forever(&args, &url, &device).await,
         None => run_inbound(&args, &device).await,
+    }
+}
+
+/// Dial `url`, play, and dial again when the server goes away.
+///
+/// The loop is the point. A dedicated player is not a program someone is watching: a server
+/// that restarts, a switch that reboots, a cable that is nudged — all of them end a connection,
+/// and every one of them should cost a few seconds of silence rather than the rest of the
+/// evening. `--reconnect-secs 0` opts out, for a foreground run where an exit is wanted.
+async fn run_outbound_forever(
+    args: &DaemonArgs,
+    url: &str,
+    device: &Device,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.reconnect_secs == 0 {
+        return run_outbound(args, url, device).await;
+    }
+
+    let base = std::time::Duration::from_secs(args.reconnect_secs);
+    // A minute is long enough that an overnight outage is quiet, and short enough that nobody
+    // waits noticeably once the server is back.
+    let ceiling = std::time::Duration::from_secs(60);
+    let mut wait = base;
+    loop {
+        match run_outbound(args, url, device).await {
+            // A connection that came up and then ended is ordinary; start over at the short
+            // delay rather than carrying a backoff earned by an earlier outage.
+            Ok(()) => wait = base,
+            Err(e) => {
+                log::warn!("Connection to {url} failed: {e}");
+                wait = (wait * 2).min(ceiling);
+            }
+        }
+        log::info!("Reconnecting to {url} in {}s", wait.as_secs());
+        tokio::time::sleep(wait).await;
     }
 }
 
