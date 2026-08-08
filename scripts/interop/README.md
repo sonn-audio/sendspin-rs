@@ -53,6 +53,29 @@ cargo run --example noise_interop -- --full --seed 9 --listen-secs 15 \
 `TRUST_UNPAIRED_CLIENT_ID=<client_id>` instead admits one unpaired client to playback, so a
 Sentinel-keyed connection gets roles activated rather than merely tolerated.
 
+## Driving `source@v1`
+
+`--source` runs the flow a real source runs, because the role is pairing-gated: a server
+filters `source@v1` out of `active_roles` on a Sentinel-keyed connection, so the harness
+connects once to pair, disconnects, and comes back on the long-term PSK. The server then
+asks for capture and decodes what arrives.
+
+```bash
+# Start the server with PAIR_WITH; --source prints the client_id and pairing_psk to use.
+cargo run --example noise_interop -- --source --seed 9 --listen-secs 20 \
+    --server ws://127.0.0.1:8941/sendspin
+```
+
+A pass prints `SOURCE INTEROP OK` on the client and `SOURCE_INTEROP_OK` on the server, with
+matching byte counts on both sides — the client's `chunks sent` against the server's
+`SOURCE_DRAINED`. That equality is the point: the server only reaches a non-zero byte count
+if the chunk header, binary type 12 and the server-clock timestamp were all packed the way
+the reference unpacks them. The run also covers `server/command` in both directions, so
+`client_stream/start`, the chunk stream and `client_stream/end` are each exercised.
+
+`SOURCE_STOP_AFTER=<seconds>` (default 3) sets how much capture the server accepts before
+asking the source to stop.
+
 ## What it covers, and what it found
 
 Covered today: both cipher suites, the Sentinel-PSK path, the transition from cleartext text
@@ -62,7 +85,10 @@ sync converging through the encrypted transport, and role activation.
 Pairing completes end to end: the server reports `PAIRING_OK` and the client persists a
 long-term record bound to the server's id.
 
-Five defects came out of pointing it at the reference server, none of which a loopback test
+`source@v1` streams end to end on both suites: the role activates on the long-term PSK, and
+150 chunks (576000 bytes) sent arrive as 576000 bytes decoded on the server.
+
+Six defects came out of pointing it at the reference server, none of which a loopback test
 would have surfaced:
 
 1. **`client/hello` advertised no `supported_pair_methods`.** The server will not pair with a
@@ -91,3 +117,11 @@ would have surfaced:
    This is the mirror image of the visualizer `pitch` divergence: there the reference is ahead
    of the prose, here the prose is ahead of the reference, and a client that wants to work has
    to read both.
+6. **The initial `client/state` reported state for roles the server had not activated.** The
+   builder is told which roles a client *can* fill; `server/activate` decides which it
+   actually got. Sending a `source` object regardless is flagged by the server as
+   `client/state carried a source object for an inactive role` — and it happens on every
+   unpaired connection, because `source@v1` is pairing-gated and filtered out there. Fixed
+   by `ClientState::retain_active_roles`, which drops role objects the activation did not
+   grant. `available` is kept either way: it is a property of the client, not of a role, and
+   a server withholds binary data until it arrives.

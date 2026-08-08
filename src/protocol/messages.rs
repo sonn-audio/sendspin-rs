@@ -592,6 +592,30 @@ impl ClientState {
         }
     }
 
+    /// Drop role objects for roles the server did not activate.
+    ///
+    /// A client configures the roles it *can* fill; the server decides which of them this
+    /// connection actually gets, and `client/state` reports state only for those. Sending a
+    /// `source` object on a connection where `source@v1` was filtered out — which is every
+    /// unpaired connection, since the role is pairing-gated — is flagged as non-compliant
+    /// by a conforming server.
+    ///
+    /// `available` is never dropped: it is a property of the client, not of a role, and a
+    /// server withholds binary data until it arrives.
+    pub fn retain_active_roles(&mut self, active_roles: &[String]) {
+        let active = |family: &str| {
+            active_roles
+                .iter()
+                .any(|role| role.split('@').next() == Some(family))
+        };
+        if !active("player") {
+            self.player = None;
+        }
+        if !active("source") {
+            self.source = None;
+        }
+    }
+
     /// Whether the sender said it is available, preferring the field that can say more.
     ///
     /// `None` when it said neither, which is not the same as "unavailable": a partial

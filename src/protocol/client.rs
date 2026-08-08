@@ -1574,6 +1574,10 @@ impl ProtocolClient {
             }
         };
 
+        // The builder was told which roles this client can fill; `server/activate` decided
+        // which it actually got. State for the rest has no addressee.
+        let mut initial_state = initial_state;
+        initial_state.retain_active_roles(&server_hello.active_roles);
         let state_msg = Message::ClientState(initial_state);
         let state_json =
             serde_json::to_string(&state_msg).map_err(|e| Error::Protocol(e.to_string()))?;

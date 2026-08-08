@@ -16,8 +16,13 @@
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
+use sendspin::noise::trust_store::{
+    psk_to_wire, InMemoryPairingStore, PairingConfig, PairingStore,
+};
 use sendspin::noise::wire::Reassembler;
 use sendspin::noise::{CipherSuite, ClientHandshake, HandshakeStep, Identity, Psk};
+use sendspin::protocol::client::{Encryption, EncryptionSettings};
+use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[derive(Parser, Debug)]
@@ -46,6 +51,14 @@ struct Args {
     /// it. A fixed key is exactly what you must not ship.
     #[arg(long)]
     seed: Option<u8>,
+
+    /// Drive the `source@v1` role: pair, reconnect on the long-term PSK, then stream
+    /// captured audio up to the server when it asks for it.
+    ///
+    /// The role is pairing-gated — a server will not activate it on a Sentinel-keyed
+    /// connection — so this implies the pairing flow and needs `PAIR_WITH` on the server.
+    #[arg(long)]
+    source: bool,
 }
 
 #[tokio::main]
@@ -64,6 +77,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("client_id : {}", identity.client_id());
     println!("suite     : {}", suite.as_wire_str());
 
+    if args.source {
+        return run_source_client(&args, identity, suite).await;
+    }
     if args.full {
         return run_full_client(&args, identity, suite).await;
     }
@@ -202,22 +218,207 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Bring up a complete client over the encrypted transport and watch what the server
-/// sends. This exercises the paths the handshake-only check cannot reach: the shrunk
-/// `server/hello`, `client/hello` going out encrypted, `server/activate`, and the clock
-/// sync that follows.
-async fn run_full_client(
+/// Drive `source@v1` against the reference server.
+///
+/// The role is pairing-gated, and a server filters it out of `active_roles` on a
+/// Sentinel-keyed connection. So this runs the flow a real source runs: connect once to
+/// pair, come back on the long-term PSK, and only then expect the role. What it proves that
+/// a loopback test cannot is that the reference *decodes* what this client packs — the
+/// chunk header, binary type 12, and the server-clock timestamp.
+async fn run_source_client(
     args: &Args,
     identity: Identity,
     suite: CipherSuite,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use sendspin::noise::trust_store::{InMemoryPairingStore, PairingConfig, PairingStore};
-    use sendspin::protocol::client::{Encryption, EncryptionSettings};
+    use sendspin::protocol::messages::{
+        ClientStreamSource, GoodbyeReason, Message, SourceCommandType, SourceFeatures,
+        SourceSignal, SourceState, SourceV1Support,
+    };
     use sendspin::ProtocolClientBuilder;
-    use std::sync::Arc;
 
-    // A deterministic Pairing PSK when seeded, so the harness can be told which key to pair
-    // with. Real clients keep one CSPRNG key for the life of the device.
+    const SAMPLE_RATE: u32 = 48_000;
+    const CHANNELS: u8 = 2;
+    const BIT_DEPTH: u8 = 16;
+    /// 20 ms of audio per chunk.
+    const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE as usize) / 50;
+
+    let store = build_pairing_store(args)?;
+
+    // Pass 1: pair. The server re-handshakes onto a long-term PSK and this client
+    // persists a record bound to the server's id.
+    println!("\n=== pass 1: pairing ===");
+    let paired_settings = encryption_settings(&identity, &store, suite);
+    let pairing_client = ProtocolClientBuilder::builder()
+        .client_id(identity.client_id())
+        .name("Rust Interop Source".to_string())
+        .encryption(Encryption::Enabled(paired_settings))
+        .source_v1_support(SourceV1Support {
+            features: Some(SourceFeatures {
+                line_sense: Some(true),
+            }),
+        })
+        .initial_source_state(SourceState {
+            signal: Some(SourceSignal::Absent),
+        })
+        .build()
+        .connect(&args.server)
+        .await?;
+    println!(
+        "  roles     : {:?}",
+        pairing_client.server_hello().active_roles
+    );
+
+    let conn = pairing_client.split();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(args.listen_secs);
+    while tokio::time::Instant::now() < deadline && store.records()?.is_empty() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+    let records = store.records()?;
+    println!("  records   : {}", records.len());
+    conn.guard.disconnect(GoodbyeReason::Restart).await?;
+    if records.is_empty() {
+        println!("\nFAILED: never paired, so source@v1 can never activate");
+        println!("        (start the server with PAIR_WITH=<client_id>:<pairing_psk>)");
+        return Ok(());
+    }
+
+    // Pass 2: reconnect on the long-term PSK. Only now can the role activate.
+    println!("\n=== pass 2: source@v1 on the long-term PSK ===");
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    let client = ProtocolClientBuilder::builder()
+        .client_id(identity.client_id())
+        .name("Rust Interop Source".to_string())
+        .encryption(Encryption::Enabled(encryption_settings(
+            &identity, &store, suite,
+        )))
+        .source_v1_support(SourceV1Support {
+            features: Some(SourceFeatures {
+                line_sense: Some(true),
+            }),
+        })
+        .initial_source_state(SourceState {
+            signal: Some(SourceSignal::Absent),
+        })
+        .build()
+        .connect(&args.server)
+        .await?;
+
+    let active = client.server_hello().active_roles.clone();
+    println!("  roles     : {active:?}");
+    let activated = active.iter().any(|r| r == "source@v1");
+    if !activated {
+        println!("\nFAILED: server did not activate source@v1 on a paired connection");
+        return Ok(());
+    }
+
+    let conn = client.split();
+    let mut messages = conn.messages;
+    let clock_sync = conn.clock_sync;
+    let sender = conn.sender;
+
+    let mut streaming = false;
+    let mut phase = 0.0f32;
+    let mut chunks_sent = 0usize;
+    let mut bytes_sent = 0usize;
+    let mut skipped_unsynced = 0usize;
+    let mut saw_start = false;
+    let mut saw_stop = false;
+    let mut ticker = tokio::time::interval(tokio::time::Duration::from_millis(20));
+
+    println!("\nstreaming for up to {}s...", args.listen_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(args.listen_secs);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            msg = messages.recv() => {
+                let Some(msg) = msg else {
+                    println!("  message stream ended");
+                    break;
+                };
+                let Message::ServerCommand(command) = msg else { continue };
+                let Some(source) = command.source else { continue };
+                match source.command {
+                    // Both commands are idempotent by spec: a start while already
+                    // streaming must not restart the stream.
+                    SourceCommandType::Start if !streaming => {
+                        saw_start = true;
+                        println!("  <-- server/command start");
+                        sender
+                            .send_client_stream_start(ClientStreamSource {
+                                codec: "pcm".to_string(),
+                                channels: CHANNELS,
+                                sample_rate: SAMPLE_RATE,
+                                bit_depth: BIT_DEPTH,
+                                // PCM needs no header; FLAC would carry STREAMINFO here.
+                                codec_header: None,
+                            })
+                            .await?;
+                        sender
+                            .send_source_state(SourceState { signal: Some(SourceSignal::Present) })
+                            .await?;
+                        println!("  --> client_stream/start (pcm 48000/16/2)");
+                        streaming = true;
+                    }
+                    SourceCommandType::Stop if streaming => {
+                        saw_stop = true;
+                        println!("  <-- server/command stop");
+                        sender.send_client_stream_end().await?;
+                        sender
+                            .send_source_state(SourceState { signal: Some(SourceSignal::Absent) })
+                            .await?;
+                        println!("  --> client_stream/end after {chunks_sent} chunks");
+                        // The stop is the last thing this check needs; anything further
+                        // would only be idle time.
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            _ = ticker.tick() => {
+                if !streaming {
+                    continue;
+                }
+                // Capture time goes out in the *server's* clock. Until the filter has
+                // converged there is no conversion, and a frame stamped with local time
+                // would never line up, so there is nothing worth sending.
+                let capture_us = clock_sync.lock().clock().now_micros();
+                let Some(server_us) = clock_sync.lock().client_to_server_micros(capture_us) else {
+                    skipped_unsynced += 1;
+                    continue;
+                };
+                let chunk = tone_chunk(&mut phase, SAMPLE_RATE, CHANNELS, FRAMES_PER_CHUNK);
+                bytes_sent += chunk.len();
+                sender.send_source_audio(server_us, &chunk).await?;
+                chunks_sent += 1;
+            }
+        }
+    }
+
+    println!("\nserver/command start : {saw_start}");
+    println!("server/command stop  : {saw_stop}");
+    println!("chunks sent          : {chunks_sent} ({bytes_sent} bytes)");
+    println!("skipped pre-sync     : {skipped_unsynced}");
+
+    println!();
+    if saw_start && chunks_sent > 0 {
+        println!("SOURCE INTEROP OK: role activated, capture streamed to the reference server");
+        println!("  check the server log for SOURCE_INTEROP_OK and the decoded byte count");
+    } else if saw_start {
+        println!("FAILED: stream started but no chunk was ever sent (clock sync never converged?)");
+    } else {
+        println!("FAILED: server never asked this source to start");
+    }
+    Ok(())
+}
+
+/// A pairing store seeded so the harness can be told which key to pair with.
+///
+/// Real clients keep one CSPRNG key for the life of the device; a deterministic one exists
+/// here only so `PAIR_WITH` on the server side has something to name.
+fn build_pairing_store(args: &Args) -> Result<Arc<dyn PairingStore>, Box<dyn std::error::Error>> {
     let pairing_psk = args.seed.map(|byte| [byte ^ 0xA5; 32]);
     let config = match pairing_psk {
         Some(psk) => PairingConfig {
@@ -227,15 +428,50 @@ async fn run_full_client(
         None => PairingConfig::generate()?,
     };
     if let Some(psk) = pairing_psk {
-        println!(
-            "pairing_psk: {}",
-            sendspin::noise::trust_store::psk_to_wire(&psk)
-        );
+        println!("pairing_psk: {}", psk_to_wire(&psk));
     }
-    let store: Arc<dyn PairingStore> = Arc::new(InMemoryPairingStore::with_config(config));
+    Ok(Arc::new(InMemoryPairingStore::with_config(config)))
+}
 
-    let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::clone(&store));
+/// Encryption settings sharing one store, so a second connection sees the record the
+/// first one persisted.
+fn encryption_settings(
+    identity: &Identity,
+    store: &Arc<dyn PairingStore>,
+    suite: CipherSuite,
+) -> EncryptionSettings {
+    let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::clone(store));
     settings.suite = suite;
+    settings
+}
+
+/// One 20 ms chunk of a 440 Hz tone, interleaved, little-endian 16-bit.
+fn tone_chunk(phase: &mut f32, sample_rate: u32, channels: u8, frames: usize) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(frames * channels as usize * 2);
+    let step = std::f32::consts::TAU * 440.0 / sample_rate as f32;
+    for _ in 0..frames {
+        let sample = ((phase.sin() * 0.2) * f32::from(i16::MAX)) as i16;
+        for _ in 0..channels {
+            pcm.extend_from_slice(&sample.to_le_bytes());
+        }
+        *phase += step;
+    }
+    pcm
+}
+
+/// Bring up a complete client over the encrypted transport and watch what the server
+/// sends. This exercises the paths the handshake-only check cannot reach: the shrunk
+/// `server/hello`, `client/hello` going out encrypted, `server/activate`, and the clock
+/// sync that follows.
+async fn run_full_client(
+    args: &Args,
+    identity: Identity,
+    suite: CipherSuite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sendspin::ProtocolClientBuilder;
+
+    let store = build_pairing_store(args)?;
+    let settings = encryption_settings(&identity, &store, suite);
 
     let client = ProtocolClientBuilder::builder()
         .client_id(identity.client_id())

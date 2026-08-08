@@ -198,3 +198,44 @@ fn a_source_audio_chunk_is_type_12_with_a_big_endian_timestamp() {
     assert_eq!(&frame[1..9], &[1, 2, 3, 4, 5, 6, 7, 8]);
     assert_eq!(&frame[9..], &[0xAA, 0xBB]);
 }
+
+/// A role object in `client/state` is only meaningful for a role the server activated.
+///
+/// `source@v1` is pairing-gated, so an unpaired connection never has it in `active_roles` —
+/// and the reference server flags a `source` object arriving there as a non-compliant
+/// client. Found by pointing the interop harness at that server.
+#[test]
+fn client_state_drops_role_objects_the_server_did_not_activate() {
+    let mut state = ClientState {
+        available: Some(true),
+        state: None,
+        player: Some(sendspin::protocol::messages::PlayerState::default()),
+        source: Some(SourceState {
+            signal: Some(SourceSignal::Absent),
+        }),
+    };
+    state.retain_active_roles(&["player@v1".to_string()]);
+
+    assert!(state.player.is_some(), "an activated role keeps its state");
+    assert!(
+        state.source.is_none(),
+        "an inactive role must not report state"
+    );
+    // Availability is a property of the client, not of a role: a server withholds binary
+    // data until it arrives, so dropping it would stall the connection.
+    assert_eq!(state.available, Some(true));
+}
+
+#[test]
+fn client_state_keeps_source_once_the_role_is_active() {
+    let mut state = ClientState {
+        available: Some(true),
+        state: None,
+        player: None,
+        source: Some(SourceState {
+            signal: Some(SourceSignal::Present),
+        }),
+    };
+    state.retain_active_roles(&["source@v1".to_string(), "metadata@v1".to_string()]);
+    assert!(state.source.is_some());
+}

@@ -19,11 +19,79 @@ from aiohttp import web
 from aiosendspin.models.types import PairMethod
 from aiosendspin.noise import Identity, InMemoryServerPairingStore
 from aiosendspin.noise.pairing import PairingAttempt
+from aiosendspin.server.roles.source import (
+    SourceSignalChangedEvent,
+    SourceStreamEndedEvent,
+    SourceStreamStartedEvent,
+)
 from aiosendspin.server.server import SendspinServer
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8927
 # A fixed private key, so restarting the harness keeps the same server_id.
 SERVER_PRIVATE = bytes(range(32))
+
+# Seconds of capture to accept before asking the source to stop, so the run also
+# exercises server/command(stop) -> client_stream/end rather than only the start path.
+SOURCE_STOP_AFTER = float(os.environ.get("SOURCE_STOP_AFTER", "3"))
+
+
+async def _drain_source(handle: object, stats: dict[str, int]) -> None:
+    """Consume the decoded PCM the server hands back, and report what arrived.
+
+    The byte count is the point: it can only be non-zero if the chunk header, the
+    binary message type and the server-clock timestamp were all read the way the
+    reference reads them.
+    """
+    async for pcm, timestamp_us in handle:  # type: ignore[attr-defined]
+        stats["chunks"] += 1
+        stats["bytes"] += len(pcm)
+        stats["last_ts"] = timestamp_us
+        if stats["chunks"] == 1:
+            print(f"SOURCE_FIRST_CHUNK bytes={len(pcm)} ts={timestamp_us}", flush=True)
+    print(f"SOURCE_DRAINED chunks={stats['chunks']} bytes={stats['bytes']}", flush=True)
+
+
+def _drive_source(client: object, loop: asyncio.AbstractEventLoop) -> None:
+    """Ask a source client to stream, and watch what the role decodes out of it.
+
+    `source@v1` only activates on a long-term paired connection, so this fires after
+    pairing has moved the client off the Sentinel PSK.
+    """
+    role = client.role("source@v1")  # type: ignore[attr-defined]
+    if role is None:
+        return
+    stats = {"chunks": 0, "bytes": 0, "last_ts": 0}
+
+    def _on_event(_client: object, event: object) -> None:
+        if isinstance(event, SourceStreamStartedEvent):
+            fmt = event.audio_format
+            print(
+                f"SOURCE_STREAM_STARTED codec_pcm {fmt.sample_rate}Hz "
+                f"{fmt.bit_depth}bit {fmt.channels}ch",
+                flush=True,
+            )
+            loop.create_task(_drain_source(event.handle, stats))
+            loop.create_task(_stop_later(role, stats))
+        elif isinstance(event, SourceStreamEndedEvent):
+            print(
+                f"SOURCE_STREAM_ENDED chunks={stats['chunks']} bytes={stats['bytes']}",
+                flush=True,
+            )
+            if stats["chunks"] > 0:
+                print("SOURCE_INTEROP_OK", flush=True)
+        elif isinstance(event, SourceSignalChangedEvent):
+            print(f"SOURCE_SIGNAL={event.signal.value}", flush=True)
+
+    client.add_event_listener(_on_event)  # type: ignore[attr-defined]
+    print(f"SOURCE_START_REQUESTED={client.client_id}", flush=True)  # type: ignore[attr-defined]
+    role.request_start()
+
+
+async def _stop_later(role: object, stats: dict[str, int]) -> None:
+    """Exercise the stop path once enough capture has arrived to prove the start path."""
+    await asyncio.sleep(SOURCE_STOP_AFTER)
+    print(f"SOURCE_STOP_REQUESTED after={SOURCE_STOP_AFTER}s chunks={stats['chunks']}", flush=True)
+    role.request_stop()  # type: ignore[attr-defined]
 
 
 async def main() -> None:
@@ -72,6 +140,8 @@ async def main() -> None:
         print(f"WILL_PAIR_WITH={pair_client}", flush=True)
 
     paired = False
+    sourced: set[str] = set()
+    reported_roles: dict[str, list[str]] = {}
     try:
         while True:
             await asyncio.sleep(1)
@@ -79,6 +149,19 @@ async def main() -> None:
             ids = [getattr(c, "client_id", None) for c in clients or []]
             if ids:
                 print(f"CLIENTS={ids}", flush=True)
+            # A source client that reconnects on its long-term PSK gets the role
+            # activated; drive capture as soon as that happens.
+            for client in clients or []:
+                cid = getattr(client, "client_id", None)
+                if cid is None:
+                    continue
+                roles = list(getattr(client, "active_role_ids", []) or [])
+                if reported_roles.get(cid) != roles:
+                    reported_roles[cid] = roles
+                    print(f"ROLES {cid}={roles}", flush=True)
+                if cid not in sourced and "source@v1" in roles:
+                    sourced.add(cid)
+                    _drive_source(client, loop)
             if pair_client and not paired and pair_client in ids:
                 paired = True
                 print("PAIRING_START", flush=True)
