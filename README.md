@@ -181,11 +181,24 @@ last argument. Setting it moves attenuation out of this process: the audio path 
 gain and the script owns the level, so it is never applied twice. That one runs without a
 shell and is split at startup, because it takes a value from the network on every change.
 
+`--hardware-volume` drives the sound card's own volume control instead of attenuating in
+software, behind the `hardware-volume` feature (Linux/ALSA). Software attenuation throws away
+bits — a 16-bit stream at 30% has lost its bottom two before it reaches the DAC — and it shows
+a number a knob on the front panel does not move. It picks `Digital`, `Master` or `PCM` in that
+order, which is where I2S DAC HATs, generic cards and the Raspberry Pi's headphone output
+respectively put theirs, and reads the card's current level at startup so the first
+`client/state` reports what is actually set. A card with no gain stage falls back to software
+volume with a warning rather than refusing to start.
+
+Exactly one thing owns the level at a time: the `--hook-set-volume` script, the card's mixer,
+or this process's gain, in that order of precedence. Applying it in two places would attenuate
+twice.
+
 One limit worth knowing: **`--interface` binds the listening socket only.** It does not yet
 restrict which interface mDNS advertises on, because the advertisement API takes no
 interface.
 
-Still to come: hardware volume via ALSA/PulseAudio, and MPRIS.
+Still to come: MPRIS, and PulseAudio as a hardware-volume backend alongside ALSA.
 
 ## Quick start
 

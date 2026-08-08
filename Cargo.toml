@@ -20,6 +20,9 @@ discovery = ["dep:mdns-sd"]
 # The `sendspin` command-line player. Off by default, and for the same reason `discovery` is:
 # a device embedding this crate should not link an argument parser or a logger to get a player.
 cli = ["dep:clap", "dep:env_logger", "dep:shlex", "discovery"]
+# Drive the system mixer instead of attenuating in software. Linux/ALSA only, and separate
+# from `cli` so a daemon on a card with no mixer does not carry the binding.
+hardware-volume = ["dep:alsa"]
 
 [dependencies]
 # Async runtime
@@ -70,6 +73,7 @@ env_logger = { version = "0.11", optional = true }
 shlex = { version = "2.0.1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+alsa = { version = "0.11", optional = true }
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]

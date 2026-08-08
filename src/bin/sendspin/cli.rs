@@ -130,6 +130,15 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub audio_format: Option<String>,
 
+    /// Drive the sound card's own volume control instead of attenuating in software.
+    ///
+    /// Software attenuation throws away bits, and it shows a number that a knob on the front
+    /// panel does not move. Takes an ALSA card name (`default`, `hw:0`); pass it bare to use
+    /// the card the output device is on. Ignored when `--hook-set-volume` is set, since that
+    /// already moves the level out of this process.
+    #[arg(long, num_args = 0..=1, default_missing_value = "default")]
+    pub hardware_volume: Option<String>,
+
     /// Command to run when an audio stream starts.
     ///
     /// Run through a shell, so it can be written as typed, and given the connection's details

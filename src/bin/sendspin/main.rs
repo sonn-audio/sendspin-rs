@@ -11,6 +11,8 @@ mod audio;
 mod cli;
 mod daemon;
 mod hooks;
+#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+mod mixer;
 
 use clap::Parser;
 

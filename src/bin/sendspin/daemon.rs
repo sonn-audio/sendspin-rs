@@ -37,6 +37,9 @@ struct Device {
     device: Option<cpal::Device>,
     /// The operator's external scripts.
     hooks: Hooks,
+    /// The card's own volume control, when `--hardware-volume` named one and it opened.
+    #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+    mixer: Option<Arc<crate::mixer::Mixer>>,
     /// The single format offered to the server, when `--audio-format` pinned one.
     ///
     /// Pinning narrows `client/hello` to one entry rather than reordering a list, because a
@@ -78,6 +81,10 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     if hooks.volume_is_external() {
         log::info!("Volume is the --hook-set-volume script's; the audio path stays at unity");
     }
+    // Underscore-prefixed because without the `hardware-volume` feature there is no field to
+    // put it in; `open_mixer` still runs, to report the flag as unavailable rather than
+    // ignoring it.
+    let _mixer = open_mixer(&args, hooks.volume_is_external())?;
     if let Some(format) = format.as_ref() {
         log::info!(
             "Offering only {}:{}:{}:{}",
@@ -157,6 +164,8 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         device,
         format,
         hooks,
+        #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+        mixer: _mixer,
     };
 
     match args.url.clone() {
@@ -181,6 +190,48 @@ fn template(device: &Device) -> ProtocolClientBuilder {
             None => Encryption::Disabled,
         })
         .build()
+}
+
+/// Open the card's mixer when `--hardware-volume` asked for one.
+///
+/// A card with no gain stage is common — plenty of DACs have none — so a mixer that will not
+/// open is reported and stepped over rather than fatal: software attenuation still works, and
+/// refusing to start would be the wrong trade for a device that can still play.
+#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+fn open_mixer(
+    args: &DaemonArgs,
+    volume_is_external: bool,
+) -> Result<Option<Arc<crate::mixer::Mixer>>, String> {
+    let Some(card) = args.hardware_volume.as_deref() else {
+        return Ok(None);
+    };
+    if volume_is_external {
+        log::warn!("--hardware-volume is ignored: --hook-set-volume already owns the level");
+        return Ok(None);
+    }
+    match crate::mixer::Mixer::open(card) {
+        Ok(mixer) => {
+            log::info!("Hardware volume: {} on {}", mixer.element(), mixer.card());
+            Ok(Some(Arc::new(mixer)))
+        }
+        Err(e) => {
+            log::warn!("Falling back to software volume: {e}");
+            Ok(None)
+        }
+    }
+}
+
+/// Without the feature, the flag is accepted and reported as unavailable rather than rejected:
+/// a systemd unit shared across builds should not fail to start on the one built without it.
+#[cfg(not(all(feature = "hardware-volume", target_os = "linux")))]
+fn open_mixer(args: &DaemonArgs, _volume_is_external: bool) -> Result<Option<()>, String> {
+    if args.hardware_volume.is_some() {
+        log::warn!(
+            "--hardware-volume needs the `hardware-volume` feature on Linux; using software \
+             volume instead"
+        );
+    }
+    Ok(None)
 }
 
 /// What this client tells a server it can decode.
@@ -344,6 +395,7 @@ async fn play(
     context: HookContext,
 ) -> bool {
     let hooks = &device.hooks;
+    let external_volume = volume_is_elsewhere(device);
     let output_device = device.device.clone();
     let static_delay = device.static_delay;
     // Whether a stream is live, so the stop hook fires once and only after a start did.
@@ -357,10 +409,28 @@ async fn play(
     let mut output_unavailable = false;
     let mut played_anything = false;
     // Held outside the player: a volume command can arrive before a stream does, and the
-    // setting has to survive until there is something to apply it to.
-    let mut volume = 100u8;
-    let mut muted = false;
+    // setting has to survive until there is something to apply it to. Seeded from the card
+    // where there is one, so a daemon on a card sitting at 30% reports 30 rather than
+    // announcing 100 and then being wrong until someone changes it.
+    let (mut volume, mut muted) = starting_volume(device);
     let mut delay = static_delay;
+
+    // Reported up front for the same reason: `server/activate` has happened, and a server that
+    // is never told the level shows whatever it assumed.
+    let initial = ClientState {
+        available: None,
+        state: None,
+        player: Some(PlayerState {
+            volume: Some(volume),
+            muted: Some(muted),
+            static_delay_ms: Some(delay),
+            ..PlayerState::default()
+        }),
+        source: None,
+    };
+    if let Err(e) = sender.send_message(Message::ClientState(initial)).await {
+        log::warn!("Could not report the initial player state: {e}");
+    }
 
     loop {
         tokio::select! {
@@ -444,12 +514,7 @@ async fn play(
                             player_command.command,
                             PlayerCommandType::Volume | PlayerCommandType::Mute
                         ) {
-                            if hooks.volume_is_external() {
-                                hooks.set_volume(volume, muted).await;
-                            } else if let Some(player) = &player {
-                                player.set_volume(volume);
-                                player.set_mute(muted);
-                            }
+                            apply_volume(device, player.as_ref(), volume, muted).await;
                         }
 
                         // A command is only obeyed if the server can see it was: the spec has
@@ -504,10 +569,10 @@ async fn play(
                             fmt.clone(),
                             Arc::clone(&clock_sync),
                             SyncedPlayerConfig {
-                                // Unity when a script owns the level, or the attenuation
-                                // would land twice.
-                                volume: if hooks.volume_is_external() { 100 } else { volume },
-                                muted: !hooks.volume_is_external() && muted,
+                                // Unity whenever something else owns the level — a script or
+                                // the card's own mixer — or the attenuation would land twice.
+                                volume: if external_volume { 100 } else { volume },
+                                muted: !external_volume && muted,
                                 device: output_device.clone(),
                                 ..SyncedPlayerConfig::new()
                             },
@@ -544,6 +609,66 @@ async fn play(
         hooks.on_stream_stop(&context);
     }
     played_anything
+}
+
+/// The level to start from: the card's, where a mixer is driving it, and full otherwise.
+fn starting_volume(device: &Device) -> (u8, bool) {
+    #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+    if let Some(mixer) = &device.mixer {
+        match mixer.read() {
+            Ok((volume, muted)) => {
+                log::info!("Hardware volume starts at {volume}% (muted: {muted})");
+                return (volume, muted);
+            }
+            // Not fatal: the level is still settable, this only means the initial report is a
+            // guess rather than a reading.
+            Err(e) => log::warn!("Could not read the hardware volume: {e}"),
+        }
+    }
+    let _ = device;
+    (100, false)
+}
+
+/// Whether something other than this process's own gain owns the level.
+fn volume_is_elsewhere(device: &Device) -> bool {
+    if device.hooks.volume_is_external() {
+        return true;
+    }
+    #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+    if device.mixer.is_some() {
+        return true;
+    }
+    false
+}
+
+/// Put `volume` and `muted` wherever this daemon's level actually lives.
+///
+/// Exactly one of the three owns it, which is the point: a script, the sound card, or this
+/// process's own gain. Applying it in two places attenuates twice, and the second one is
+/// inaudible in the wrong direction.
+async fn apply_volume(device: &Device, player: Option<&SyncedPlayer>, volume: u8, muted: bool) {
+    if device.hooks.volume_is_external() {
+        device.hooks.set_volume(volume, muted).await;
+        return;
+    }
+
+    #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+    if let Some(mixer) = device.mixer.clone() {
+        // On a blocking thread: ALSA's mixer calls are synchronous, and one that stalls on a
+        // USB card being re-plugged must not stall the runtime the audio path shares.
+        let result = tokio::task::spawn_blocking(move || mixer.set(volume, muted)).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("Could not set the hardware volume: {e}"),
+            Err(e) => log::warn!("The hardware volume task failed: {e}"),
+        }
+        return;
+    }
+
+    if let Some(player) = player {
+        player.set_volume(volume);
+        player.set_mute(muted);
+    }
 }
 
 /// Build the decoder a `stream/start` calls for, or say why this stream cannot be played.
