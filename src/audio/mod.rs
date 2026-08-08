@@ -9,6 +9,8 @@ pub mod encode;
 pub mod gain;
 /// Buffer pool for reusing audio sample buffers
 pub mod pool;
+/// Capture helper for the source role: encode and stamp in server time.
+pub mod source_capture;
 /// Sync correction planner for drop/insert cadence
 pub mod sync_correction;
 /// Synced playback helper using output timestamps
@@ -18,6 +20,7 @@ pub mod types;
 
 pub use gain::GainControl;
 pub use pool::BufferPool;
+pub use source_capture::SourceCapture;
 pub use sync_correction::{CorrectionPlanner, CorrectionSchedule};
 pub use synced_player::{ProcessCallback, SyncedPlayer, SyncedPlayerConfig};
 pub use types::{AudioBuffer, AudioFormat, Codec};

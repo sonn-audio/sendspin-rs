@@ -237,8 +237,7 @@ async fn run_source_client(
     identity: Identity,
     suite: CipherSuite,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use base64::Engine;
-    use sendspin::audio::encode::create_encoder;
+    use sendspin::audio::SourceCapture;
     use sendspin::protocol::messages::{
         ClientStreamSource, GoodbyeReason, Message, SourceCommandType, SourceFeatures,
         SourceSignal, SourceState, SourceV1Support,
@@ -251,12 +250,12 @@ async fn run_source_client(
     /// 20 ms of audio fed to the encoder per tick.
     const FRAMES_PER_TICK: usize = (SAMPLE_RATE as usize) / 50;
 
-    let mut encoder = create_encoder(&args.codec, SAMPLE_RATE, BIT_DEPTH, CHANNELS)?;
-    let codec_header = encoder
-        .codec_header()
-        .map(|header| base64::engine::general_purpose::STANDARD.encode(header));
-    let lookahead_us = encoder.lookahead_us();
-    println!("codec     : {} (lookahead {lookahead_us} us)", args.codec);
+    // The capture helper owns the timeline: anchor once, advance by sample count, and
+    // subtract the codec's lookahead. Doing that here instead would be duplicating the one
+    // piece of arithmetic a source most needs the library to get right.
+    let mut capture = SourceCapture::new(&args.codec, SAMPLE_RATE, BIT_DEPTH, CHANNELS)?;
+    let codec_header = capture.codec_header();
+    println!("codec     : {}", args.codec);
 
     let store = build_pairing_store(args)?;
 
@@ -336,8 +335,6 @@ async fn run_source_client(
     let mut phase = 0.0f32;
     let mut chunks_sent = 0usize;
     let mut bytes_sent = 0usize;
-    let mut samples_sent = 0usize;
-    let mut anchor: Option<i64> = None;
     let mut skipped_unsynced = 0usize;
     let mut saw_start = false;
     let mut saw_stop = false;
@@ -389,20 +386,10 @@ async fn run_source_client(
                         println!("  <-- server/command stop");
                         // Flush before the end marker: a codec with a fixed frame size is
                         // still holding the tail, and dropping it loses real audio.
-                        if let Some(anchor_us) = anchor {
-                            for frame in encoder.flush()? {
-                                let offset_us =
-                                    samples_sent as i64 * 1_000_000 / i64::from(SAMPLE_RATE);
-                                bytes_sent += frame.len();
-                                sender
-                                    .send_source_audio(
-                                        anchor_us + offset_us - lookahead_us,
-                                        &frame,
-                                    )
-                                    .await?;
-                                samples_sent += encoder.frame_samples();
-                                chunks_sent += 1;
-                            }
+                        for (timestamp_us, frame) in capture.finish()? {
+                            bytes_sent += frame.len();
+                            sender.send_source_audio(timestamp_us, &frame).await?;
+                            chunks_sent += 1;
                         }
                         sender.send_client_stream_end().await?;
                         sender
@@ -428,20 +415,10 @@ async fn run_source_client(
                     skipped_unsynced += 1;
                     continue;
                 };
-                // The first tick anchors the stream; every frame afterwards is stamped from
-                // its own sample position rather than from the wall clock, so a late tick
-                // shifts nothing. A codec that buffers ahead of its output is corrected by
-                // its own lookahead.
-                let anchor_us = *anchor.get_or_insert(server_us);
                 let pcm = tone_chunk(&mut phase, SAMPLE_RATE, CHANNELS, FRAMES_PER_TICK);
-                for frame in encoder.process(&pcm)? {
-                    let offset_us =
-                        samples_sent as i64 * 1_000_000 / i64::from(SAMPLE_RATE);
+                for (timestamp_us, frame) in capture.feed(&pcm, server_us)? {
                     bytes_sent += frame.len();
-                    sender
-                        .send_source_audio(anchor_us + offset_us - lookahead_us, &frame)
-                        .await?;
-                    samples_sent += encoder.frame_samples();
+                    sender.send_source_audio(timestamp_us, &frame).await?;
                     chunks_sent += 1;
                 }
             }

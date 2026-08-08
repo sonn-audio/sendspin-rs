@@ -208,3 +208,98 @@ fn pcm_round_trips_through_the_decoder_that_reads_it() {
         i32::from(i16::from_le_bytes([pcm[0], pcm[1]])) << 16
     );
 }
+
+// =============================================================================
+// Capture timing
+// =============================================================================
+
+use sendspin::audio::SourceCapture;
+
+/// Only the first feed anchors the stream; later ones are stamped from sample position.
+///
+/// This is the difference between a timeline that survives a late thread and one that folds
+/// every scheduling hiccup into the audio.
+#[test]
+fn a_late_feed_does_not_shift_the_timeline() {
+    let mut capture = SourceCapture::new("pcm", RATE, 16, CHANNELS).unwrap();
+    // The PCM encoder chunks at 25 ms, so 50 ms is two whole chunks.
+    let two_chunks = RATE as usize / 20;
+
+    let first = capture.feed(&tone(two_chunks), 1_000_000).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].0, 1_000_000);
+    assert_eq!(first[1].0, 1_025_000);
+
+    // The caller is 500 ms late, and says so. The stamps must ignore it.
+    let second = capture.feed(&tone(two_chunks), 1_500_000).unwrap();
+    assert_eq!(
+        second[0].0, 1_050_000,
+        "stamped from sample position, not from now"
+    );
+}
+
+#[test]
+fn the_first_chunk_carries_the_anchor_it_was_given() {
+    let mut capture = SourceCapture::new("pcm", RATE, 16, CHANNELS).unwrap();
+    let frames = capture.feed(&tone(RATE as usize / 40), 42_000_000).unwrap();
+    assert_eq!(frames[0].0, 42_000_000);
+}
+
+/// Opus stamps earlier than its anchor by exactly its lookahead, because the encoder
+/// consumed those samples before it emitted anything.
+#[test]
+fn opus_capture_subtracts_its_lookahead() {
+    let mut capture = SourceCapture::new("opus", RATE, 16, CHANNELS).unwrap();
+    let frames = capture.feed(&tone(960), 10_000_000).unwrap();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, 10_000_000 - 6_500);
+}
+
+#[test]
+fn flac_capture_announces_a_header_and_pcm_does_not() {
+    let flac = SourceCapture::new("flac", RATE, 16, CHANNELS).unwrap();
+    let header = flac.codec_header().expect("FLAC announces STREAMINFO");
+    // Standard base64, which is what the spec's codec_header carries — not the base64url
+    // the PSK fields use, so the alphabets must not be confused.
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(&header)
+        .expect("codec_header must be standard base64");
+    assert_eq!(&decoded[..4], b"fLaC");
+    assert_eq!(decoded.len(), 42);
+
+    assert!(SourceCapture::new("pcm", RATE, 16, CHANNELS)
+        .unwrap()
+        .codec_header()
+        .is_none());
+}
+
+/// A reset re-anchors: carrying the old timeline into a new stream would stamp it with the
+/// previous stream's clock.
+#[test]
+fn a_reset_starts_a_fresh_timeline() {
+    let mut capture = SourceCapture::new("pcm", RATE, 16, CHANNELS).unwrap();
+    capture.feed(&tone(RATE as usize / 10), 1_000_000).unwrap();
+    capture.reset();
+
+    let frames = capture.feed(&tone(RATE as usize / 40), 9_000_000).unwrap();
+    assert_eq!(frames[0].0, 9_000_000, "the new anchor, not the old one");
+}
+
+#[test]
+fn finishing_a_stream_that_never_started_yields_nothing() {
+    let mut capture = SourceCapture::new("pcm", RATE, 16, CHANNELS).unwrap();
+    assert!(capture.finish().unwrap().is_empty());
+}
+
+/// The stamps advance by exactly one chunk each, with no rounding drift over many chunks.
+#[test]
+fn stamps_advance_without_accumulating_rounding_error() {
+    let mut capture = SourceCapture::new("opus", RATE, 16, CHANNELS).unwrap();
+    let frames = capture.feed(&tone(960 * 50), 0).unwrap();
+    assert_eq!(frames.len(), 50);
+    for (index, (timestamp_us, _)) in frames.iter().enumerate() {
+        // 960 samples at 48 kHz is exactly 20000 us, so every stamp is exact.
+        assert_eq!(*timestamp_us, index as i64 * 20_000 - 6_500);
+    }
+}

@@ -3,7 +3,7 @@
 // ABOUTME: Only partly spec-compliant: a real client would also persist the last-played server across restarts
 
 use clap::Parser;
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use sendspin::protocol::discovery::ClientAdvertisement;
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{Message, PlaybackState};
 use sendspin::ProtocolClientBuilder;
@@ -49,17 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = ConnectionManager::new(listener);
 
     // Advertise _sendspin._tcp.local. so servers can discover and dial in.
-    let daemon = ServiceDaemon::new()?;
-    let service = ServiceInfo::new(
-        "_sendspin._tcp.local.",
-        &args.name,
-        "sendspin-metadata-listener.local.",
-        "",
-        port,
-        &[("path", "/sendspin"), ("name", args.name.as_str())][..],
-    )?
-    .enable_addr_auto();
-    daemon.register(service)?;
+    // Withdrawn on drop, so a listener that exits stops being advertised. A stale record
+    // is worse than none: a server dials it, fails, and retries.
+    let _advertisement = ClientAdvertisement::new(&args.name, &args.name, port)?;
 
     println!("Listening on :{port}, advertising _sendspin._tcp.local. — waiting for server...");
 

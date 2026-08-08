@@ -14,6 +14,9 @@ native-tls = [
     "dep:tokio-native-tls",
     "dep:native-tls",
 ]
+# mDNS advertisement, so a server can discover a listening client. Off by default: an
+# appliance whose address is configured has no use for an mDNS daemon and should not link one.
+discovery = ["dep:mdns-sd"]
 
 [dependencies]
 # Async runtime
@@ -51,6 +54,7 @@ snow = "0.10.0"
 sha2 = "0.11.0"
 base64 = "0.22"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+mdns-sd = { version = "0.20", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -71,7 +75,10 @@ tokio-test = "0.4"
 base64 = "0.22"
 env_logger = "0.11"
 clap = { version = "4.6", features = ["derive"] }
-mdns-sd = "0.20"
+
+[[example]]
+name = "server_initiated_metadata"
+required-features = ["discovery"]
 
 [profile.release]
 opt-level = 3

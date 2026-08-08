@@ -5,6 +5,9 @@
 pub mod client;
 /// Builder for easy construction of the client
 pub mod client_builder;
+/// mDNS advertisement so a server can discover a listening client
+#[cfg(feature = "discovery")]
+pub mod discovery;
 /// Inbound WebSocket acceptor for server-initiated connections
 pub mod listener;
 /// Managed connection lifecycle: multi-server arbitration and auto-goodbye
