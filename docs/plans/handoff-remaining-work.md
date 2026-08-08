@@ -3,7 +3,7 @@
 > Fork-internal. Written at the end of a long session so the next one does not re-derive any
 > of this. Read the "Traps" section before writing code.
 
-State as of `cc34978` on `claude/sendspin-rust-python-parity-m6ktw9` (34 commits ahead of
+State as of `848e770` on `claude/sendspin-rust-python-parity-m6ktw9` (35 commits ahead of
 `main`). CI-equivalent green throughout: `cargo test --workspace --all-features`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace`,
@@ -18,18 +18,12 @@ State as of `cc34978` on `claude/sendspin-rust-python-parity-m6ktw9` (34 commits
 | Role activation | `active_roles: ["player@v1"]` with unpaired access granted |
 | In-band re-handshake + hello restart | session swap, then `server/hello` → `client/hello` → `server/activate` |
 | Pairing PSK flow, end to end | server logs `PAIRING_OK`; client persists a bound record |
-| `source@v1` | reduced to the spec/reference shape — **not yet interop-tested** |
+| `source@v1`, end to end | role activates on the long-term PSK; 576000 bytes sent = 576000 decoded, both suites |
 | Playback sync bounds | ±0.5 ms steady state, ±0.5% speed, asserted by tests |
 
 ## Left to do
 
-**1. Interop-test `source@v1`.** The shape is right on paper and has never talked to a
-server. `aiosendspin` gained the role on 2026-08-07 (#322), so this is now possible and was
-not before. Shortest path: teach the harness to activate the role and send
-`server/command {command: start}`, then check the server accepts `client_stream/start` and the
-audio chunks. Given how the source role turned out, do not count it done until it has spoken.
-
-**2. `management/*` — seven messages.** `server/unpair`, `management/list-records`,
+**1. `management/*` — seven messages.** `server/unpair`, `management/list-records`,
 `management/add-record`, `management/remove-record`, `management/get-pairing-config`,
 `management/set-pairing-config`, `management/result`. Mechanical on top of the `PairingStore`
 that already exists. Reference: `aiosendspin/client/management.py` (six handlers) and
@@ -38,7 +32,7 @@ a shared-PSK record must **not** be removed by `server/unpair` (only by
 `management/remove-record`), and `server/unpair` on a `trust_level: none` connection is ignored
 rather than obeyed.
 
-**3. CPace, and the two PIN pairing methods.** The real work.
+**2. CPace, and the two PIN pairing methods.** The real work.
 
 - The suite is `CPACE-X25519-SHA512`, `draft-irtf-cfrg-cpace` **revision 21**, with the
   draft's optional explicit mutual key confirmation.
@@ -56,7 +50,7 @@ rather than obeyed.
 
 Every one of these cost real time in the last session.
 
-**The interop harness is the only thing that finds protocol bugs.** Six defects came out of
+**The interop harness is the only thing that finds protocol bugs.** Seven defects came out of
 it or out of a fresh clone; every one lived in code that passed its own unit tests. See
 `scripts/interop/README.md` for setup and the full list. `aiosendspin` needs **Python 3.12+**
 (PEP 695 generics) and its server extras `pillow numpy av` even when no audio is involved —
@@ -91,6 +85,19 @@ directions, and a client that wants to work reads both:
 - The pairing `server/activate` arrives *after* that restart. The helper that runs the restart
   must hand it back, not consume it.
 
+**`source@v1` is pairing-gated, and that shapes how you test it.** A server filters the role
+out of `active_roles` on a Sentinel-keyed or legacy connection, so it can only be exercised
+after pairing has moved the client onto a long-term PSK — and not on the pairing connection
+itself, which the spec keeps mutually exclusive with playback and which activates with empty
+`active_roles`. Both the harness and `aiosendspin`'s own end-to-end test therefore pair,
+disconnect, and reconnect. Two more preconditions the server enforces quietly: it ignores
+chunks until the initial `client/state` has arrived, and it flags a `client_stream/start`
+that no `server/command {command: start}` asked for.
+
+**A role a client *can* fill is not a role it *has*.** `server/activate` decides, and
+`client/state` reports only what it granted. This is what `ClientState::retain_active_roles`
+is for; anything new that reports per-role state has to go through it.
+
 **Do not hand-roll crypto, and do not let a key generator degrade.** Two corrections in one
 session: a hand-written X25519 montgomery ladder (replaced with `x25519-dalek`), and a
 `random_psk` that fell back to hashing a pointer address when the CSPRNG was unreachable —
@@ -117,6 +124,13 @@ Both deliberate, both stated in the README so they do not read as oversights:
   listening decision on hardware, not one the spec text settles.
 - Encryption is opt-in. It is the compliant default and should flip — with the transition-mode
   fields above removed in the same change — once pairing is complete enough to rely on.
+- A mid-connection `server/activate` that *adds* a role is not acted on. The router reads
+  those activations only for pairing; it does not update `active_roles` or send the newly
+  active role its full state, which the spec asks for ("When a role becomes active in
+  `active_roles`, send its full state"). Not reachable on the source path — pairing ends the
+  connection's playback activity, so a source arrives with its roles already settled — but it
+  is a gap for any server that re-activates in place. Noticed while fixing the inactive-role
+  state defect; deliberately left alone rather than widened into that change.
 - No benchmark exists, so the README's CPU and memory figures are labelled design targets.
   `aiosendspin` has `scripts/benchmark_clients.py` and a sync harness
   (`test_audible_sync_matrix`, `test_audible_sync_fuzz`) worth mirroring if the
