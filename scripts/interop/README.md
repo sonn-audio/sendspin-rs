@@ -39,6 +39,41 @@ what matters: decrypting an application message means both sides derived the sam
 keys from the same prologue and the same PSK, which is everything the handshake had to get
 right.
 
+## The other direction: a real client against the Rust server
+
+Everything else here drives the reference implementation's *server* and asks whether this
+crate's client can talk to it. `reference_client.py` inverts that: it drives the reference
+implementation's *client* against the Rust server, which is the only way to find out whether
+the server half reads the spec the same way.
+
+```bash
+cargo run --features server --example server -- --bind 127.0.0.1:8927 --seed 3
+PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_client.py \
+    ws://127.0.0.1:8927/sendspin
+SUITE=aes PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_client.py \
+    ws://127.0.0.1:8927/sendspin
+```
+
+A pass prints `CLIENT_INTEROP_OK`. The assertion behind it is `is_time_synchronized()`:
+reaching it means both sides derived the same transport keys from the same prologue, framed
+identically, agreed on the hello sequence, and exchanged enough clock samples for the filter
+to settle. Both cipher suites pass.
+
+The server activates no roles, deliberately — it has none to serve yet — so the client is
+told the truth rather than granted `player@v1` and then left waiting for audio.
+
+Two defects came out of the first run, neither of which a loopback test would have reached
+because nothing in this crate had ever *parsed* these:
+
+1. **`server/hello` went out with no envelope.** It is the one message whose payload shape
+   depends on the transport rather than on its `type`, so it is not a `Message` variant and
+   does not carry the tag for free. The client reported a missing discriminator.
+2. **`client/hello` required `client_id` and `version`.** A spec-conformant client sends
+   neither under encryption: the identity came from `client/init` and the Noise handshake
+   authenticated it, which is a far stronger claim than a self-declared field. This crate
+   still sends them — a known transition-mode divergence — but requiring them on receive
+   turns away every client that reads the current spec. Both are optional now.
+
 ## Driving a real pairing
 
 `PAIR_WITH=<client_id>:<pairing_psk>` makes the harness pair with that client as soon as it

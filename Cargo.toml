@@ -23,6 +23,9 @@ cli = ["dep:clap", "dep:env_logger", "dep:shlex", "discovery"]
 # Drive the system mixer instead of attenuating in software. Linux/ALSA only, and separate
 # from `cli` so a daemon on a card with no mixer does not carry the binding.
 hardware-volume = ["dep:alsa"]
+# The server side of the protocol. Off by default, and for the same reason as the rest: an
+# embedded player has no use for a server and should not link one.
+server = []
 
 [dependencies]
 # Async runtime
@@ -97,6 +100,10 @@ clap = { version = "4.6", features = ["derive"] }
 name = "sendspin"
 path = "src/bin/sendspin/main.rs"
 required-features = ["cli"]
+
+[[example]]
+name = "server"
+required-features = ["server"]
 
 [[example]]
 name = "server_initiated_metadata"
