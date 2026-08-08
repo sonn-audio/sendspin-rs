@@ -3,13 +3,17 @@
 > Fork-internal. Written at the end of a long session so the next one does not re-derive any
 > of this. Read the "Traps" section before writing code.
 
-State as of `719bdd8` on `claude/sendspin-rust-python-parity-m6ktw9` (42 commits ahead of
+State as of `0a5c86c` on `claude/sendspin-rust-python-parity-m6ktw9` (43 commits ahead of
 `main`). **The client is done**: all 36 wire message types the two implementations name
 between them are spoken and driven, and the load-bearing ones have been validated against
 `aiosendspin` rather than only against their own tests. CI-equivalent green throughout: `cargo test --workspace --all-features`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace`,
-`cargo fmt --all --check`.
+`cargo fmt --all --check`. 529 tests.
+
+The README's status section was rewritten in the same commit: it still claimed pairing,
+the trust store and `management/*` were unimplemented, which would have been the first thing
+a reviewer read.
 
 ## Done, and validated against the reference server
 
@@ -25,31 +29,13 @@ between them are spoken and driven, and the load-bearing ones have been validate
 | Source encoders | pcm/flac/opus decoded by the reference server's ffmpeg, byte counts exact |
 | CPace | draft-21 vectors: generator, both shares, ISK, tags, low-order table both ways |
 | PIN bindings | sid, PIN, commitment and wrapped PSK byte-exact against `aiosendspin` |
-| Both PIN flows | driven from the router; static PIN completes against the reference server |
+| Both PIN flows | driven from the router; both complete against the reference server, both suites |
+| Dynamic PIN, end to end | `DYNAMIC_PIN_PAIRING_OK`; PIN carried out of the client via `--pin-file` |
 | Playback sync bounds | ±0.5 ms steady state, ±0.5% speed, asserted by tests |
 
 ## Left to do
 
-### 1. Interop-run the dynamic PIN flow
-
-The static flow has spoken to `aiosendspin` (`PAIR_PIN=<client_id>:<pin>`, see
-`scripts/interop/README.md`). The dynamic one has not, and the reason is a plumbing problem
-rather than a protocol one: in that flow the PIN travels the *other* way. The client derives
-it and shows it; the operator types it into the server. So a harness run has to carry a value
-out of the Rust process and into the Python one.
-
-The cheapest honest route: give the example a `--pin-file <path>`, wire it to
-`EncryptionSettings::emit_pin` so the derived PIN is written there, and give the server's
-`PinProvider` a poll-until-present loop on the same path. Both ends already exist —
-`emit_pin` is a callback on the settings, and `PairingAttempt(method=DYNAMIC_PIN,
-pin_provider=...)` takes an awaitable.
-
-Worth doing even though the derivation is already byte-exact against the reference: what is
-untested is the *sequencing* — `server/pair-init` arriving where this client expects it, the
-commitment surviving the round trip, and the server's three-step verification order accepting
-what the client sends. Six defects this session lived in code that passed its own tests.
-
-### 2. Open the PR
+### 1. Open the PR
 
 `main` and the fork's `main` are byte-identical, so the branch sits on current upstream.
 Upstream PR #94 is a release-plz bot PR bumping 0.3.6 → 0.4.0; when someone merges it, this
@@ -58,7 +44,12 @@ branch will conflict on `Cargo.toml` and `CHANGELOG.md`. Trivial, but see it com
 Note that `docs/tracking` is deliberately *not* on the code branch, so these notes cannot
 ride along into an upstream PR by accident.
 
-### 3. The server
+Upstream `Sendspin/sendspin-rs` is not in the session's GitHub access, so a PR against it
+cannot be opened from a session — the git proxy serves public repos anonymously for *reads*
+(`git fetch https://github.com/Sendspin/sendspin-rs refs/pull/<n>/head:pr<n>`), which is not
+the same thing. Either the PR goes to `sonn-audio/sendspin-rs` or it is opened by hand.
+
+### 2. The server
 
 Now in scope by decision. Measured against `aiosendspin` at `4c2d7c9`: the server is 14962
 lines, and more is reusable than that number suggests.
@@ -103,8 +94,14 @@ embedded player should not link the server. Put it behind a `server` feature fro
 
 Every one of these cost real time in the last session.
 
-**The interop harness is the only thing that finds protocol bugs.** Seven defects came out of
-it or out of a fresh clone; every one lived in code that passed its own unit tests. See
+**The interop harness is the only thing that finds protocol bugs.** Eight defects came out of
+it or out of a fresh clone; every one lived in code that passed its own unit tests. The eighth
+is the sharpest illustration yet: `commit_B` / `nonce_A` / `nonce_B` were serialized
+snake-cased, and because all three are optional or absent-tolerant on the wire, *nothing
+failed to parse anywhere*. Loopback agreed with itself; the reference server saw a
+`client/pair-init` carrying no commitment. Five earlier interop runs missed it because the
+static PIN flow uses none of the three. When a field is optional, a round-trip test proves
+only that one implementation is self-consistent about what it calls it. See
 `scripts/interop/README.md` for setup and the full list. `aiosendspin` needs **Python 3.12+**
 (PEP 695 generics) and its server extras `pillow numpy av` even when no audio is involved —
 the artwork role imports PIL at module load. On 3.11 you get a `SyntaxError` in `pairing.py`
@@ -123,6 +120,13 @@ directions, and a client that wants to work reads both:
 - Pairing method in `server/activate`: the spec says `pairing: {method, pin_length, languages}`,
   the reference still sends bare `selected_pair_method`. Both are accepted on receive,
   preferring the spec's. A client reading only the newer one declines every pairing.
+- Dynamic PIN `pin_length`: the spec puts it in that same `pairing` object and does not list
+  it on `server/pair-init`; the reference sends it on `server/pair-init` and omits the
+  `pairing` object entirely. Both are read, preferring the activation's — a stated length must
+  not be reopened late — and a length arriving on `server/pair-init` is held to the same
+  `min_pin_length` floor, or deferring it would be the way around the check. `PinPairing`
+  therefore starts with `PinLength { negotiated: Option<u8>, minimum: u8 }` rather than a
+  resolved number.
 - Where they *agree* and this crate differs, this crate is wrong. That was the source role.
 
 **Ordering hazards in the encrypted transport**, all load-bearing:
@@ -152,7 +156,9 @@ that no `server/command {command: start}` asked for.
 is for; anything new that reports per-role state has to go through it.
 
 **PIN pairing is gated on a gesture the crate cannot perform.** Static PIN gates every
-attempt; dynamic PIN gates an escalated method or a PIN under six digits. The gesture is a
+attempt; dynamic PIN gates an escalated method or a PIN under six digits — so the ordinary
+six-digit dynamic case is *not* gated, which is why its interop run opens no window at all and
+only the static one fakes the operator. The gesture is a
 button, a reset pinhole, a power-cycle pattern — things only the host application observes —
 so `PairingWindow` on `Connection` is a handle the crate holds and never raises by itself. The
 interop harness opens it directly, which is the one thing there that is faked. Likewise
