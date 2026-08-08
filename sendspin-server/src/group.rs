@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, Notify};
 
-use sendspin_proto::messages::{GroupUpdate, Message, PlaybackState, StreamEnd, StreamStart};
+use sendspin_proto::messages::{
+    GroupUpdate, Message, PlaybackState, ServerState, StreamEnd, StreamStart,
+};
 
 use crate::stream::{PlayerStream, DEFAULT_SEND_AHEAD_US};
 use crate::ServerConfig;
@@ -134,6 +136,13 @@ impl Group {
     /// member to restart a stream they are already playing.
     pub fn join(self: &Arc<Self>) -> Membership {
         let rx = self.tx.subscribe();
+        // Pulled at join rather than replayed from a cached broadcast: a joiner needs what is
+        // playing *now*, and the source is the only thing that knows.
+        let metadata = self
+            .config
+            .metadata
+            .as_ref()
+            .and_then(|source| source.current());
         let (catch_up, update) = {
             let mut inner = self.inner.lock().expect("group lock");
             inner.members += 1;
@@ -152,7 +161,28 @@ impl Group {
             rx,
             catch_up,
             update,
+            metadata,
         }
+    }
+
+    /// Tell every member what is playing, if this server knows.
+    ///
+    /// Sent on each stream start rather than on a timer: metadata that changes is a new track,
+    /// and a new track is a new stream.
+    fn broadcast_metadata(&self) {
+        let Some(source) = self.config.metadata.as_ref() else {
+            return;
+        };
+        let Some(metadata) = source.current() else {
+            return;
+        };
+        self.broadcast(Outgoing::Json(Box::new(Message::ServerState(
+            ServerState {
+                metadata: Some(metadata),
+                controller: None,
+                color: None,
+            },
+        ))));
     }
 
     /// Put one frame on every member's feed.
@@ -195,6 +225,7 @@ pub struct Membership {
     rx: broadcast::Receiver<Arc<Outgoing>>,
     catch_up: Option<StreamStart>,
     update: GroupUpdate,
+    metadata: Option<sendspin_proto::messages::MetadataState>,
 }
 
 impl Membership {
@@ -206,6 +237,14 @@ impl Membership {
     /// The `group/update` describing the group this member just joined.
     pub fn group_update(&self) -> GroupUpdate {
         self.update.clone()
+    }
+
+    /// What is playing, for a member that activated `metadata@v1`.
+    ///
+    /// Handed to the joiner alone, like the `stream/start`: broadcasting it would re-send every
+    /// existing member metadata they already have.
+    pub fn metadata(&mut self) -> Option<sendspin_proto::messages::MetadataState> {
+        self.metadata.take()
     }
 
     /// The group this member belongs to.
@@ -274,6 +313,7 @@ async fn stream_once(group: &Arc<Group>, source: &dyn crate::AudioSource) {
     group.set_playback(PlaybackState::Playing);
     group.broadcast(Outgoing::Json(Box::new(Message::StreamStart(announce))));
     group.broadcast_group_update();
+    group.broadcast_metadata();
     log::info!(
         "group {} streaming: {} {}Hz {}ch {}bit to {} member(s)",
         group.id,
@@ -375,6 +415,27 @@ mod tests {
         }
     }
 
+    struct FixedTrack;
+
+    impl crate::MetadataSource for FixedTrack {
+        #[allow(deprecated)]
+        fn current(&self) -> Option<sendspin_proto::messages::MetadataState> {
+            Some(sendspin_proto::messages::MetadataState {
+                timestamp: 0,
+                title: Some("Test Tone".to_string()),
+                artist: None,
+                album_artist: None,
+                album: None,
+                artwork_url: None,
+                year: None,
+                track: None,
+                progress: None,
+                repeat: None,
+                shuffle: None,
+            })
+        }
+    }
+
     fn config(limit: usize) -> Arc<ServerConfig> {
         let identity = Identity::generate().expect("identity");
         Arc::new(
@@ -461,6 +522,33 @@ mod tests {
             group.chunks_sent() > 0,
             "a joined member was never sent audio"
         );
+    }
+
+    /// A joiner is told what is playing at the moment it arrives, not at the moment the track
+    /// started: a display connected mid-song still has to show the song.
+    #[tokio::test]
+    async fn a_joiner_is_told_what_is_playing() {
+        let identity = Identity::generate().expect("identity");
+        let config = Arc::new(
+            ServerConfig::new(identity, "Test".to_string())
+                .with_audio(Arc::new(CountingSource::new(100)))
+                .with_metadata(Arc::new(FixedTrack)),
+        );
+        let group = Group::spawn(config, "g1".to_string(), None);
+        let mut member = group.join();
+        assert_eq!(
+            member.metadata().and_then(|m| m.title),
+            Some("Test Tone".to_string())
+        );
+    }
+
+    /// A server with no metadata source hands out none, rather than an empty track that a
+    /// client would render as a blank now-playing screen.
+    #[tokio::test]
+    async fn a_server_without_metadata_offers_none() {
+        let group = Group::spawn(config(5), "g1".to_string(), None);
+        let mut member = group.join();
+        assert!(member.metadata().is_none());
     }
 
     /// Leaving is by drop, so every way a connection can end takes its member with it.

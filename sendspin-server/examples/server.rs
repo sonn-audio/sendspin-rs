@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use parking_lot::Mutex;
-use sendspin_proto::messages::StreamPlayerConfig;
+use sendspin_proto::messages::{MetadataState, StreamPlayerConfig};
 use sendspin_proto::noise::Identity;
-use sendspin_server::{AudioSource, SendspinServer, ServerConfig};
+use sendspin_server::{AudioSource, MetadataSource, SendspinServer, ServerConfig};
 
 /// A 440 Hz tone, for a server that has to play *something* to be worth pointing a client at.
 ///
@@ -29,6 +29,30 @@ struct Tone {
     /// Frames left to produce, or `None` for a tone that never ends.
     remaining: Mutex<Option<u64>>,
     phase: Mutex<f32>,
+}
+
+/// The track the example claims to be playing.
+struct FixedTrack;
+
+impl MetadataSource for FixedTrack {
+    // `repeat` and `shuffle` are deprecated in favour of the controller state but still part of
+    // the struct, so they have to be named to construct it.
+    #[allow(deprecated)]
+    fn current(&self) -> Option<MetadataState> {
+        Some(MetadataState {
+            timestamp: 0,
+            title: Some("Test Tone".to_string()),
+            artist: Some("sendspin-server".to_string()),
+            album_artist: None,
+            album: Some("Interop".to_string()),
+            artwork_url: None,
+            year: None,
+            track: None,
+            progress: None,
+            repeat: None,
+            shuffle: None,
+        })
+    }
 }
 
 impl AudioSource for Tone {
@@ -119,6 +143,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
         println!("TONE_SECONDS={}", args.tone_secs);
     }
+    // A fixed track, so a client that activated `metadata@v1` has something to display and the
+    // interop harness has something to assert on. A real server reads this from whatever its
+    // music comes from.
+    config = config.with_metadata(Arc::new(FixedTrack));
+
     let server = SendspinServer::bind(&args.bind, config).await?;
 
     println!("SERVER_ID={}", server.server_id());

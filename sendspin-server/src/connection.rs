@@ -21,7 +21,7 @@ use crate::handshake::ServerHandshake;
 use crate::ServerConfig;
 use sendspin_proto::error::Error;
 use sendspin_proto::messages::{
-    Activity, Message, ServerActivate, ServerHelloEncrypted, ServerTime,
+    Activity, Message, ServerActivate, ServerHelloEncrypted, ServerState, ServerTime,
 };
 use sendspin_proto::noise::constants::MSG_TYPE_JSON_BODY;
 use sendspin_proto::noise::keys::Psk;
@@ -121,11 +121,13 @@ pub async fn serve(
     // Only what this server actually implements, and only what the client offered. Activating
     // a role is a promise to serve it.
     let active_roles = if unpaired_ok {
-        crate::roles::negotiate(&hello.supported_roles)
+        crate::roles::negotiate(&hello.supported_roles, &crate::roles::servable(&config))
     } else {
         Vec::new()
     };
-    let will_play = config.audio.is_some() && active_roles.iter().any(|r| r == "player@v1");
+    // No `audio.is_some()` here any more: `servable` already refused to offer `player@v1`
+    // without a source, so a granted player role is by construction one this server can feed.
+    let will_play = active_roles.iter().any(|r| r == "player@v1");
     send_json(
         &mut ws,
         &mut done.session,
@@ -169,6 +171,24 @@ pub async fn serve(
         if let Some(start) = member.catch_up() {
             log::info!("{client_id} joined a stream already in progress");
             send_json(&mut ws, &mut done.session, &Message::StreamStart(start)).await?;
+        }
+    }
+
+    // Metadata is its own role, so it is sent to a client that activated it whether or not that
+    // client also plays: a display in the hallway wants to know what is on without receiving a
+    // single sample.
+    if active_roles.iter().any(|r| r == "metadata@v1") {
+        if let Some(metadata) = config.metadata.as_ref().and_then(|source| source.current()) {
+            send_json(
+                &mut ws,
+                &mut done.session,
+                &Message::ServerState(ServerState {
+                    metadata: Some(metadata),
+                    controller: None,
+                    color: None,
+                }),
+            )
+            .await?;
         }
     }
 
@@ -238,7 +258,36 @@ pub async fn serve(
                 send_json(&mut ws, &mut done.session, &reply).await?;
                 time_syncs += 1;
             }
-            Message::ClientState(_) => {}
+            Message::ClientState(state) => {
+                // `available: false` is a client saying its output is in use by something else
+                // — an HDMI input, a local app. Continuing to send it audio would be sending
+                // into a void, and worse, it would keep the group awake on behalf of a listener
+                // that is not listening. Dropping the membership stops the audio without
+                // dropping the connection: the client keeps its clock sync and its roles, and
+                // says so when it is free again.
+                match state.is_available() {
+                    Some(false) if membership.is_some() => {
+                        log::info!("{client_id} reports it is busy; pausing its audio");
+                        membership = None;
+                    }
+                    Some(true) if membership.is_none() && will_play => {
+                        log::info!("{client_id} reports it is free again; resuming its audio");
+                        let mut member = group.join();
+                        send_json(
+                            &mut ws,
+                            &mut done.session,
+                            &Message::GroupUpdate(member.group_update()),
+                        )
+                        .await?;
+                        if let Some(start) = member.catch_up() {
+                            send_json(&mut ws, &mut done.session, &Message::StreamStart(start))
+                                .await?;
+                        }
+                        membership = Some(member);
+                    }
+                    _ => {}
+                }
+            }
             Message::ClientGoodbye(goodbye) => {
                 log::info!("{client_id} said goodbye: {:?}", goodbye.reason);
                 break;

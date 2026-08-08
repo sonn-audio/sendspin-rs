@@ -57,6 +57,16 @@ pub trait AudioSource: Send + Sync {
     fn next_chunk(&self, frames: usize) -> Option<Vec<u8>>;
 }
 
+/// What the server says is playing, for clients that display it.
+///
+/// Pulled rather than pushed for the same reason as the audio: what a server knows about the
+/// current track comes from wherever its music does, and this crate should not care. `None`
+/// means nothing is playing, which is different from a track with no title.
+pub trait MetadataSource: Send + Sync {
+    /// The track playing now.
+    fn current(&self) -> Option<sendspin_proto::messages::MetadataState>;
+}
+
 pub mod connection;
 pub mod group;
 pub mod handshake;
@@ -79,6 +89,11 @@ pub struct ServerConfig {
     /// `None` serves connections without ever starting a stream, which is what the interop
     /// check for the handshake wants. A real server has a pipeline behind this.
     pub audio: Option<Arc<dyn AudioSource>>,
+    /// What is playing, for clients that activated `metadata@v1`.
+    ///
+    /// `None` means the role is not offered at all, rather than offered and left empty: see
+    /// [`roles::servable`].
+    pub metadata: Option<Arc<dyn MetadataSource>>,
     /// The timebase the clock replies are stamped from.
     ///
     /// Must be monotonic and not NTP-conditioned: a clock that steps backwards puts a step
@@ -93,6 +108,7 @@ impl ServerConfig {
             identity,
             name,
             audio: None,
+            metadata: None,
             clock: Arc::new(DefaultClock::new()),
         }
     }
@@ -101,6 +117,16 @@ impl ServerConfig {
     #[must_use]
     pub fn with_audio(mut self, source: Arc<dyn AudioSource>) -> Self {
         self.audio = Some(source);
+        self
+    }
+
+    /// The same config, telling clients what is playing.
+    ///
+    /// Setting this is what makes `metadata@v1` servable, and so what makes the server willing
+    /// to activate it.
+    #[must_use]
+    pub fn with_metadata(mut self, source: Arc<dyn MetadataSource>) -> Self {
+        self.metadata = Some(source);
         self
     }
 

@@ -18,6 +18,13 @@ assumed backwards); `server/hello` → `client/hello` → `server/activate`; `cl
 answered so a client's clock filter converges; role negotiation; and **synchronized group
 playback** — `player@v1` clients share one timeline, receive byte-identical chunks, and a
 client joining mid-track is seated in the stream already playing rather than given its own.
+`metadata@v1` is served too, and `client/state` is honoured: a client reporting `available:
+false` — its output taken by an HDMI input or a local app — stops being sent audio without
+losing its connection, its clock sync or its roles, and resumes when it says it is free.
+
+A role is only activated when this server can actually keep the promise. `metadata@v1` is not
+granted by a server started without a metadata source, because a client told it has the role
+and then sent nothing cannot tell that apart from a server that crashed.
 
 Validated against `aiosendspin`'s own client rather than only against this project's — see
 [`scripts/interop`](../scripts/interop). A real reference client connects, handshakes, reaches
@@ -30,14 +37,14 @@ its own stream or a shared one. `two_clients.py` starts a second client a second
 compares both by playback timestamp — 155 shared chunks, byte-identical, the late joiner
 entering exactly 1s into the existing timeline.
 
-**Not yet:** pairing, management, transcoding, resampling, playback control, and every role
-but `player@v1`. Limits worth stating plainly rather than discovering:
+**Not yet:** pairing, management, transcoding, resampling, playback control, and the
+`controller`, `artwork`, `visualizer`, `color` and `source` roles. Limits worth stating plainly rather than discovering:
 
 - **One group, and nothing can ask to be regrouped.** Every client lands in the same group.
   Moving a client between groups is a `controller@v1` request, and that role is not served yet.
-- **No playback control.** `client/command` is parsed and ignored; `server/command`,
-  `server/state` and `stream/clear` are never sent. A stream starts when someone joins and
-  ends when the source runs out — nothing can pause, seek or set a volume.
+- **No playback control.** `client/command` is parsed and ignored; `server/command` and
+  `stream/clear` are never sent. A stream starts when someone joins and ends when the source
+  runs out — nothing can pause, seek or set a volume.
 - **PCM only.** The client's advertised formats are not honoured yet; a client that cannot
   decode PCM 16-bit will not get something it can.
 - **No pairing**, so every connection is keyed by the Sentinel PSK. A client whose
