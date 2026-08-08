@@ -20,7 +20,7 @@ use sendspin::noise::pin::{self, AD_CLIENT, AD_SERVER};
 use sendspin::noise::pin_flow::{
     open_wrapped_psk, PinPairing, PinStep, ServerPairAuth, ServerPairConfirm, ServerPairInit,
 };
-use sendspin::noise::{CipherSuite, InMemoryPairingStore};
+use sendspin::noise::{CipherSuite, InMemoryPairingStore, PairingStore};
 use sendspin::protocol::messages::{Message, PairMethod};
 
 const HASH: [u8; 32] = [0x5A; 32];
@@ -421,5 +421,57 @@ fn the_static_flow_omits_the_dynamic_fields() {
     assert_eq!(
         json,
         r#"{"type":"client/pair-init","payload":{"pairing_index":3}}"#
+    );
+}
+
+// =============================================================================
+// The operator gesture
+// =============================================================================
+
+/// The window admits one attempt and is never raised by the crate itself.
+///
+/// Opening it is a deliberate local action — a button, a pinhole, a power-cycle pattern —
+/// and it is what stops a stranger on the network from pairing with a device nobody is
+/// standing next to. Only the host application can observe such a thing.
+#[test]
+fn the_pairing_window_starts_closed_and_is_opened_by_the_caller() {
+    use sendspin::protocol::client::PairingWindow;
+
+    // A fresh connection has no window open: the default has to be the safe one, because a
+    // client that boots into "will pair with anyone" is a client that pairs with anyone.
+    let window = PairingWindow::default();
+    assert!(!window.is_open());
+
+    window.open();
+    assert!(window.is_open());
+
+    // And a caller enforcing the spec's five-minute lifetime can withdraw it again.
+    window.close();
+    assert!(!window.is_open());
+}
+
+/// The failure counter escalates the dynamic method and survives in the config.
+#[test]
+fn ten_failures_escalate_the_dynamic_method() {
+    use sendspin::noise::pin::{dynamic_pin_needs_gesture, ESCALATION_THRESHOLD};
+    use sendspin::noise::PairingConfig;
+
+    // A comfortable PIN length, so escalation is the only thing that can gate it.
+    assert!(!dynamic_pin_needs_gesture(ESCALATION_THRESHOLD - 1, 8));
+    assert!(dynamic_pin_needs_gesture(ESCALATION_THRESHOLD, 8));
+
+    let store = InMemoryPairingStore::new().unwrap();
+    let config = store.pairing_config().unwrap();
+    assert_eq!(config.dynamic_pin_failures, 0, "a fresh client has none");
+
+    store
+        .set_pairing_config(PairingConfig {
+            dynamic_pin_failures: ESCALATION_THRESHOLD,
+            ..config
+        })
+        .unwrap();
+    assert_eq!(
+        store.pairing_config().unwrap().dynamic_pin_failures,
+        ESCALATION_THRESHOLD
     );
 }

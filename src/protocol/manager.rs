@@ -516,6 +516,7 @@ fn arbitrate(
 
     let Connection {
         messages,
+        pairing_window: _,
         audio,
         artwork,
         visualizer,

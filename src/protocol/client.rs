@@ -130,6 +130,7 @@ where
     let EncryptionSettings {
         identity,
         suite,
+        emit_pin: _,
         store,
     } = settings;
     let psks = crate::noise::trust_store::handshake_candidates(store.as_ref())?;
@@ -259,15 +260,31 @@ async fn send_goodbye(
         .map_err(|_| Error::WebSocket("connection closed".to_string()))?
 }
 
+/// What a pairing activation started.
+///
+/// The two methods have different shapes: the Pairing PSK flow finishes inside the
+/// activation and leaves only a record to persist, while a PIN flow spans four more
+/// messages and leaves an attempt the router has to keep feeding.
+pub(crate) enum PairingOutcome {
+    /// The PSK flow is done; persist this on `server/pair-finalize`.
+    Record(Box<PairingRecord>),
+    /// A PIN attempt is under way.
+    PinAttempt(Box<crate::noise::pin_flow::PinPairing>),
+}
+
 /// React to a `server/activate` that asks to pair.
 ///
-/// Returns the record to persist once the server acknowledges, or `None` when there was
-/// nothing to do or the attempt was declined.
+/// `pairing_index` is how many pairing activations have arrived since the last Noise
+/// handshake. It goes into the PAKE's session id and onto the wire, and the server treats a
+/// value higher than its own count as a protocol error — so it is counted here rather than
+/// guessed at.
 async fn handle_pairing_activation(
     activate: &super::messages::ServerActivate,
     context: &SecurityContext,
     out_tx: &UnboundedSender<WriteCommand>,
-) -> Option<PairingRecord> {
+    handshake_hash: [u8; 32],
+    pairing_index: u32,
+) -> Option<PairingOutcome> {
     use super::messages::Activity;
     if !activate.activities.contains(&Activity::Pairing) {
         return None;
@@ -304,24 +321,235 @@ async fn handle_pairing_activation(
                 log::error!("Could not send client/pair-finalize: {e}");
                 return None;
             }
-            Some(record)
+            Some(PairingOutcome::Record(Box::new(record)))
         }
         PairingAction::PinFlow(method) => {
-            // The flow itself is implemented and tested in `noise::pin_flow`, but driving it
-            // needs what this router does not yet carry: the Noise handshake hash the PAKE
-            // binds to, a pairing-index counter, and a multi-message attempt held across
-            // several inbound messages. Until that lands, declining by the spec's own route
-            // is the honest answer — it leaves the connection open so the server can offer
-            // another method, rather than starting an exchange this side cannot finish.
-            log::warn!("{method:?} is implemented but not yet driven from the router");
-            let _ = send_abort(out_tx, PairAbortReason::MethodNotSupported).await;
-            None
+            start_pin_attempt(
+                method,
+                activate,
+                context,
+                out_tx,
+                handshake_hash,
+                pairing_index,
+            )
+            .await
         }
         PairingAction::Abort(reason) => {
             log::warn!("Declining pairing: {reason:?}");
             let _ = send_abort(out_tx, reason).await;
             None
         }
+    }
+}
+
+/// Open a PIN pairing attempt, or decline it before anything is committed.
+///
+/// Two checks happen here rather than inside the flow, because both are reasons not to start
+/// at all: a `pin_length` below this client's own minimum is a weakening it agreed to refuse,
+/// and a gesture-gated attempt has nothing to send until an operator opens a window.
+async fn start_pin_attempt(
+    method: super::messages::PairMethod,
+    activate: &super::messages::ServerActivate,
+    context: &SecurityContext,
+    out_tx: &UnboundedSender<WriteCommand>,
+    handshake_hash: [u8; 32],
+    pairing_index: u32,
+) -> Option<PairingOutcome> {
+    use crate::noise::pin;
+    use crate::noise::pin_flow::{ClientPairPending, PinPairing};
+
+    let config = match context.store.pairing_config() {
+        Ok(config) => config,
+        Err(e) => {
+            log::error!("Could not read the pairing config: {e}");
+            return None;
+        }
+    };
+
+    // Static PIN is a fixed eight digits; only the dynamic flow negotiates a length.
+    let pin_length = if method == super::messages::PairMethod::DynamicPin {
+        let offered = activate
+            .pairing
+            .as_ref()
+            .and_then(|p| p.pin_length)
+            .unwrap_or(config.dynamic_pin_min_length);
+        if !pin::pin_length_acceptable(offered, config.dynamic_pin_min_length) {
+            log::warn!(
+                "Declining a {offered}-digit PIN: this client requires at least {}",
+                config.dynamic_pin_min_length
+            );
+            let _ = send_abort(out_tx, PairAbortReason::PinLengthUnacceptable).await;
+            return None;
+        }
+        offered
+    } else {
+        pin::STATIC_PIN_DIGITS as u8
+    };
+
+    // The gesture is the operator's, and this crate cannot perform one. Saying so is what
+    // `client/pair-pending` is for: it tells the server a human is being waited on rather
+    // than leaving it to time out against a silent client.
+    let gated = match method {
+        super::messages::PairMethod::StaticPin => true,
+        _ => pin::dynamic_pin_needs_gesture(config.dynamic_pin_failures, pin_length),
+    };
+    if gated && !context.pairing_window_open.load(Ordering::Acquire) {
+        log::info!("{method:?} pairing is gesture-gated and no window is open");
+        let pending = Message::ClientPairPending(ClientPairPending { pairing_index });
+        if let Ok(json) = serde_json::to_string(&pending) {
+            let _ = send_and_flush(out_tx, Outbound::Json(json)).await;
+        }
+        return None;
+    }
+
+    let (attempt, init) = match PinPairing::start(
+        method,
+        context.suite,
+        handshake_hash,
+        pairing_index,
+        pin_length,
+        &context.server_id,
+        config.static_pin.as_deref(),
+    ) {
+        Ok(started) => started,
+        Err(e) => {
+            log::warn!("Could not start {method:?} pairing: {e}");
+            let _ = send_abort(out_tx, PairAbortReason::MethodNotSupported).await;
+            return None;
+        }
+    };
+
+    // The window admits exactly one attempt and closes on use.
+    context.pairing_window_open.store(false, Ordering::Release);
+    log::info!("Starting {method:?} pairing with {}", context.server_id);
+    match serde_json::to_string(&Message::ClientPairInit(init)) {
+        Ok(json) => {
+            if let Err(e) = send_and_flush(out_tx, Outbound::Json(json)).await {
+                log::error!("Could not send client/pair-init: {e}");
+                return None;
+            }
+            Some(PairingOutcome::PinAttempt(Box::new(attempt)))
+        }
+        Err(e) => {
+            log::error!("Could not encode client/pair-init: {e}");
+            None
+        }
+    }
+}
+
+/// Act on one step of a PIN attempt.
+///
+/// Returns `Break` when the connection must end. Two of the five outcomes do: a protocol
+/// error, which closes the socket without saying anything, and a `concurrent_attempt` abort.
+/// Everything else leaves the connection up, because a failed attempt is not a failed
+/// connection — the server may offer another method or activate for playback instead.
+async fn drive_pin_step(
+    step: crate::noise::pin_flow::PinStep,
+    attempt: &mut Option<crate::noise::pin_flow::PinPairing>,
+    pending_pairing: &mut Option<PairingRecord>,
+    context: &SecurityContext,
+    out_tx: &UnboundedSender<WriteCommand>,
+) -> std::ops::ControlFlow<()> {
+    use crate::noise::pin_flow::PinStep;
+    use std::ops::ControlFlow;
+
+    match step {
+        PinStep::Send(message) => {
+            match serde_json::to_string(&*message) {
+                Ok(json) => {
+                    if let Err(e) = send_and_flush(out_tx, Outbound::Json(json)).await {
+                        log::error!("Could not send a pairing message: {e}");
+                        return ControlFlow::Break(());
+                    }
+                }
+                Err(e) => {
+                    log::error!("Could not encode a pairing message: {e}");
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        PinStep::EmitPin(pin) => {
+            // The operator reads this off the device and types it into the server, which is
+            // what binds the pairing to the device in front of them. A host application with
+            // a display or a speaker should surface it; logging is the fallback, and it is
+            // deliberately the only place a live PIN is written down.
+            log::info!("Pairing PIN: {pin}");
+            if let Some(emit) = &context.emit_pin {
+                emit(&pin);
+            }
+            ControlFlow::Continue(())
+        }
+        PinStep::Finalize {
+            confirm,
+            finalize,
+            record,
+        } => {
+            // Back to back, with no reply awaited between them: the confirmation is what
+            // lets the server open the wrapped PSK, and it has already proved it can.
+            for message in [
+                Message::ClientPairConfirm(*confirm),
+                Message::ClientPairFinalize(*finalize),
+            ] {
+                match serde_json::to_string(&message) {
+                    Ok(json) => {
+                        if let Err(e) = send_and_flush(out_tx, Outbound::Json(json)).await {
+                            log::error!("Could not send a pairing message: {e}");
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Could not encode a pairing message: {e}");
+                        return ControlFlow::Break(());
+                    }
+                }
+            }
+            *pending_pairing = Some(*record);
+            *attempt = None;
+            ControlFlow::Continue(())
+        }
+        PinStep::Abort(reason) => {
+            log::warn!("PIN pairing aborted: {reason:?}");
+            let _ = send_abort(out_tx, reason).await;
+            *attempt = None;
+            if reason.closes_connection() {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+        PinStep::ProtocolError(reason) => {
+            // No application-level message, and nothing persisted: the spec is explicit that
+            // a condition no conformant peer produces ends the connection silently.
+            log::error!("Pairing protocol error: {reason}");
+            *attempt = None;
+            ControlFlow::Break(())
+        }
+    }
+}
+
+/// Persist the dynamic-PIN failure counter after an attempt's own verification.
+///
+/// It resets on success rather than merely stopping — ten failures spread across a year of
+/// successful pairings should not escalate the method.
+fn record_pin_outcome(context: &SecurityContext, failed: bool) {
+    let store = context.store.as_ref();
+    let Ok(config) = store.pairing_config() else {
+        return;
+    };
+    let updated = if failed {
+        config.dynamic_pin_failures.saturating_add(1)
+    } else {
+        0
+    };
+    if updated == config.dynamic_pin_failures {
+        return;
+    }
+    if let Err(e) = store.set_pairing_config(crate::noise::PairingConfig {
+        dynamic_pin_failures: updated,
+        ..config
+    }) {
+        log::error!("Could not persist the PIN failure counter: {e}");
     }
 }
 
@@ -610,7 +838,18 @@ pub struct EncryptionSettings {
     /// are easy to get wrong: see
     /// [`handshake_candidates`](crate::noise::trust_store::handshake_candidates).
     pub store: Arc<dyn PairingStore>,
+    /// How this device shows a dynamic PIN to the operator.
+    ///
+    /// The dynamic flow derives a PIN and the operator has to read it off *this device* —
+    /// that is what binds the pairing to the box in front of them. A display, a speaker, a
+    /// row of LEDs: only the host application knows which, so the crate asks rather than
+    /// assumes. `None` logs it and nothing else, which is enough to develop against and not
+    /// enough to ship a device on.
+    pub emit_pin: Option<PinEmitter>,
 }
+
+/// A callback that shows a dynamic PIN to the operator.
+pub type PinEmitter = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl std::fmt::Debug for EncryptionSettings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -632,6 +871,7 @@ impl EncryptionSettings {
             identity,
             suite: CipherSuite::default(),
             store: Arc::new(InMemoryPairingStore::new()?),
+            emit_pin: None,
         })
     }
 
@@ -641,6 +881,7 @@ impl EncryptionSettings {
             identity,
             suite: CipherSuite::default(),
             store,
+            emit_pin: None,
         }
     }
 }
@@ -666,6 +907,14 @@ pub(crate) struct SecurityContext {
     /// `management/remove-record` naming that same record revokes the requester. Like the
     /// category, it moves with a re-handshake.
     psk_id: Arc<Mutex<String>>,
+    /// How to show a dynamic PIN to the operator.
+    emit_pin: Option<PinEmitter>,
+    /// Whether an operator has opened a pairing window.
+    ///
+    /// The window admits exactly one attempt and closes on use. Opening it is an operator
+    /// gesture — a button, a pinhole, a power-cycle pattern — which only the host application
+    /// can perform, so this crate can hold the flag but never raise it by itself.
+    pairing_window_open: Arc<AtomicBool>,
     /// Whether `management` is in the connection's current activity set.
     ///
     /// Management commands are scoped to it: one arriving without it is answered
@@ -674,11 +923,72 @@ pub(crate) struct SecurityContext {
     management: Arc<Mutex<bool>>,
 }
 
+/// The operator gesture that admits one PIN pairing attempt.
+///
+/// PIN pairing is gated on a deliberate local action — a button, a reset pinhole, a
+/// power-cycle pattern — because it is what stops a stranger on the network from pairing
+/// with a device nobody is standing next to. Only the host application can observe such a
+/// gesture, so the crate holds the window and never opens it by itself.
+///
+/// The window admits **exactly one** attempt and closes when that attempt starts. It also
+/// wants a lifetime: the spec recommends five minutes, and enforcing it is the caller's,
+/// because only the caller knows when the gesture happened.
+///
+/// ```no_run
+/// # fn f(conn: sendspin::protocol::client::Connection) {
+/// if let Some(window) = &conn.pairing_window {
+///     window.open();   // the operator just pressed the button
+/// }
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct PairingWindow(Arc<AtomicBool>);
+
+impl Default for PairingWindow {
+    /// Closed, which is the only safe default: a client that boots into "will pair with
+    /// anyone" pairs with anyone.
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+}
+
+impl PairingWindow {
+    /// Admit one pairing attempt.
+    pub fn open(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Withdraw the window without an attempt having used it.
+    ///
+    /// For an operator cancellation, or a lifetime the caller is enforcing.
+    pub fn close(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+
+    /// Whether a window is currently open.
+    pub fn is_open(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for PairingWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PairingWindow")
+            .field(&self.is_open())
+            .finish()
+    }
+}
+
 /// Connection components returned by [`ProtocolClient::split()`].
 /// Use the fields you need; ignore the rest.
 pub struct Connection {
     /// Protocol messages from the server
     pub messages: UnboundedReceiver<Message>,
+    /// Opens the pairing window that gates a PIN attempt.
+    ///
+    /// `None` on an unencrypted connection, which cannot pair at all. See
+    /// [`PairingWindow`] for what opening one means.
+    pub pairing_window: Option<PairingWindow>,
     /// Audio chunks from the server
     pub audio: UnboundedReceiver<AudioChunk>,
     /// Artwork chunks from the server
@@ -1420,6 +1730,8 @@ pub struct ProtocolClient {
     stream_state: Arc<StreamState>,
     /// Shared with the router; see [`WsSender::handshake_gate`].
     handshake_gate: Arc<AtomicBool>,
+    /// The operator gesture that admits one PIN pairing attempt.
+    pairing_window: Option<PairingWindow>,
     /// Background task guard, aborts tasks on drop
     guard: ConnectionGuard,
 }
@@ -1537,6 +1849,7 @@ impl ProtocolClient {
                 let identity = settings.identity.clone();
                 let suite = settings.suite;
                 let store = Arc::clone(&settings.store);
+                let emit_pin = settings.emit_pin.clone();
                 let result = run_noise_handshake(&mut ws_stream, settings).await?;
                 log::info!(
                     "Noise handshake complete: server_id={}, psk={:?}",
@@ -1554,6 +1867,8 @@ impl ProtocolClient {
                     psk_category: Arc::new(Mutex::new(result.psk_category)),
                     psk_id: Arc::new(Mutex::new(result.psk_id.clone())),
                     management: Arc::new(Mutex::new(false)),
+                    emit_pin,
+                    pairing_window_open: Arc::new(AtomicBool::new(false)),
                 });
                 Transport::encrypted(result.session)?
             }
@@ -1804,6 +2119,9 @@ impl ProtocolClient {
             server_hello,
             stream_state: Arc::clone(&stream_state),
             handshake_gate: Arc::clone(&handshake_gate),
+            pairing_window: security
+                .as_ref()
+                .map(|s| PairingWindow(Arc::clone(&s.pairing_window_open))),
             guard: ConnectionGuard {
                 sender: WsSender {
                     tx: out_tx,
@@ -1845,6 +2163,12 @@ impl ProtocolClient {
         // client/pair-finalize and the server acknowledging it. Held rather than stored,
         // because persisting early leaves a record for a pairing the server never completed.
         let mut pending_pairing: Option<PairingRecord> = None;
+        // A PIN attempt spans four inbound messages, so unlike the PSK flow it cannot live
+        // inside one match arm.
+        let mut pin_attempt: Option<crate::noise::pin_flow::PinPairing> = None;
+        // Pairing activations since the last Noise handshake. Both `client/pair-pending` and
+        // `client/pair-init` carry it, and a re-handshake resets it.
+        let mut pairing_index: u32 = 0;
 
         while let Some(msg) = read.next().await {
             let ws_msg = match msg {
@@ -2006,11 +2330,27 @@ impl ProtocolClient {
                                             break;
                                         }
                                         note_management_activity(context, activate);
-                                        if let Some(record) =
-                                            handle_pairing_activation(activate, context, &out_tx)
-                                                .await
+                                        pairing_index += 1;
+                                        let hash = transport_router
+                                            .lock()
+                                            .handshake_hash()
+                                            .unwrap_or([0u8; 32]);
+                                        match handle_pairing_activation(
+                                            activate,
+                                            context,
+                                            &out_tx,
+                                            hash,
+                                            pairing_index,
+                                        )
+                                        .await
                                         {
-                                            pending_pairing = Some(record);
+                                            Some(PairingOutcome::Record(record)) => {
+                                                pending_pairing = Some(*record);
+                                            }
+                                            Some(PairingOutcome::PinAttempt(attempt)) => {
+                                                pin_attempt = Some(*attempt);
+                                            }
+                                            None => {}
                                         }
                                     }
                                     Message::ServerUnpair(_) => {
@@ -2032,6 +2372,79 @@ impl ProtocolClient {
                                             );
                                             let _ = send_goodbye(&out_tx, GoodbyeReason::Unpaired)
                                                 .await;
+                                            break;
+                                        }
+                                    }
+                                    Message::ServerPairInit(init) => {
+                                        let step = match pin_attempt.as_mut() {
+                                            Some(attempt) => attempt.on_server_pair_init(init),
+                                            None => {
+                                                log::warn!("server/pair-init with no attempt");
+                                                break;
+                                            }
+                                        };
+                                        if drive_pin_step(
+                                            step,
+                                            &mut pin_attempt,
+                                            &mut pending_pairing,
+                                            context,
+                                            &out_tx,
+                                        )
+                                        .await
+                                        .is_break()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Message::ServerPairAuth(auth) => {
+                                        let step = match pin_attempt.as_mut() {
+                                            Some(attempt) => attempt.on_server_pair_auth(auth),
+                                            None => {
+                                                log::warn!("server/pair-auth with no attempt");
+                                                break;
+                                            }
+                                        };
+                                        if drive_pin_step(
+                                            step,
+                                            &mut pin_attempt,
+                                            &mut pending_pairing,
+                                            context,
+                                            &out_tx,
+                                        )
+                                        .await
+                                        .is_break()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Message::ServerPairConfirm(confirm) => {
+                                        let step = match pin_attempt.as_mut() {
+                                            Some(attempt) => attempt.on_server_pair_confirm(
+                                                confirm,
+                                                context.store.as_ref(),
+                                            ),
+                                            None => {
+                                                log::warn!("server/pair-confirm with no attempt");
+                                                break;
+                                            }
+                                        };
+                                        // Only this side's own failed verification moves the
+                                        // escalation counter, and only the dynamic method has
+                                        // one — so the attempt is asked rather than inferred.
+                                        let failed = pin_attempt
+                                            .as_ref()
+                                            .is_some_and(|a| a.counts_as_failure(&step));
+                                        record_pin_outcome(context, failed);
+                                        if drive_pin_step(
+                                            step,
+                                            &mut pin_attempt,
+                                            &mut pending_pairing,
+                                            context,
+                                            &out_tx,
+                                        )
+                                        .await
+                                        .is_break()
+                                        {
                                             break;
                                         }
                                     }
@@ -2094,11 +2507,27 @@ impl ProtocolClient {
                                         note_management_activity(context, &activate);
                                         // Still gated: client/pair-finalize is part of this
                                         // exchange, and nothing else may interleave with it.
-                                        if let Some(record) =
-                                            handle_pairing_activation(&activate, context, &out_tx)
-                                                .await
+                                        pairing_index += 1;
+                                        let hash = transport_router
+                                            .lock()
+                                            .handshake_hash()
+                                            .unwrap_or([0u8; 32]);
+                                        match handle_pairing_activation(
+                                            &activate,
+                                            context,
+                                            &out_tx,
+                                            hash,
+                                            pairing_index,
+                                        )
+                                        .await
                                         {
-                                            pending_pairing = Some(record);
+                                            Some(PairingOutcome::Record(record)) => {
+                                                pending_pairing = Some(*record);
+                                            }
+                                            Some(PairingOutcome::PinAttempt(attempt)) => {
+                                                pin_attempt = Some(*attempt);
+                                            }
+                                            None => {}
                                         }
                                         handshake_gate.store(false, Ordering::Release);
                                         continue;
@@ -2194,6 +2623,7 @@ impl ProtocolClient {
             });
         Connection {
             messages: self.message_rx,
+            pairing_window: self.pairing_window.clone(),
             audio: self.audio_rx,
             artwork: self.artwork_rx,
             visualizer: self.visualizer_rx,
