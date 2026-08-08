@@ -424,6 +424,7 @@ fn build_pairing_store(args: &Args) -> Result<Arc<dyn PairingStore>, Box<dyn std
         Some(psk) => PairingConfig {
             pairing_psk: Some(psk),
             unpaired_access: true,
+            record_mode_psk_id: None,
         },
         None => PairingConfig::generate()?,
     };

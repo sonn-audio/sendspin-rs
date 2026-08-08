@@ -237,6 +237,28 @@ async fn send_and_flush(
         .map_err(|_| Error::WebSocket("connection closed".to_string()))?
 }
 
+/// Enqueue `client/goodbye` from the router and wait for it to reach the wire.
+///
+/// The router uses this where the spec makes the client end the connection — a revoked
+/// pairing, or a server claiming authority the handshake does not support. Flushing rather
+/// than firing and forgetting matters: the reason is the last thing the server learns, and a
+/// dropped one turns a deliberate close into an apparent crash.
+async fn send_goodbye(
+    out_tx: &UnboundedSender<WriteCommand>,
+    reason: GoodbyeReason,
+) -> Result<(), Error> {
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    out_tx
+        .send(WriteCommand::Goodbye {
+            reason,
+            ack: ack_tx,
+        })
+        .map_err(|_| Error::WebSocket("connection closed".to_string()))?;
+    ack_rx
+        .await
+        .map_err(|_| Error::WebSocket("connection closed".to_string()))?
+}
+
 /// React to a `server/activate` that asks to pair.
 ///
 /// Returns the record to persist once the server acknowledges, or `None` when there was
@@ -331,6 +353,7 @@ async fn handle_rehandshake(
     send_and_flush(out_tx, Outbound::Json(reply)).await?;
     transport.lock().swap_session(result.session)?;
     *context.psk_category.lock() = result.psk_category;
+    context.psk_id.lock().clone_from(&result.psk_id);
     context.store.mark_record_used(&result.psk_id)?;
     log::info!(
         "Re-handshake complete: session now keyed by {:?} ({})",
@@ -401,6 +424,89 @@ where
 struct TypedPayload<T> {
     r#type: String,
     payload: T,
+}
+
+/// Record whether this activation puts the connection in a management session.
+///
+/// The client also has to check that the session is keyed by a Sendspin PSK: a server that
+/// claims `management` while the connection is not paired is asking for authority it does not
+/// have, and the spec answers that by closing with `client/goodbye` reason `unauthorized`.
+/// Recording `false` here is the softer half of that — every management command then draws
+/// `permission_denied` — and [`management_claim_is_unauthorized`] reports the harder half.
+fn note_management_activity(context: &SecurityContext, activate: &super::messages::ServerActivate) {
+    use super::messages::Activity;
+    let claimed = activate.activities.contains(&Activity::Management);
+    let paired = *context.psk_category.lock() == crate::noise::PskCategory::LongTerm;
+    *context.management.lock() = claimed && paired;
+}
+
+/// Whether an activation claims `management` on a connection that is not paired.
+fn management_claim_is_unauthorized(
+    context: &SecurityContext,
+    activate: &super::messages::ServerActivate,
+) -> bool {
+    use super::messages::Activity;
+    activate.activities.contains(&Activity::Management)
+        && *context.psk_category.lock() != crate::noise::PskCategory::LongTerm
+}
+
+/// Answer one `management/*` request against the store.
+///
+/// Outside a management session every command is `permission_denied` — including on an
+/// unencrypted connection, which has no pairing to authorize anything.
+fn answer_management(
+    context: Option<&SecurityContext>,
+    message: &Message,
+) -> Result<
+    Option<(
+        crate::noise::ManagementResult,
+        crate::noise::ManagementEffect,
+    )>,
+    Error,
+> {
+    use crate::noise::management as mgmt;
+    use crate::noise::ManagementResultCode as Code;
+
+    let in_session = context.is_some_and(|ctx| *ctx.management.lock());
+    if !in_session {
+        let denied = matches!(
+            message,
+            Message::ManagementListRecords(_)
+                | Message::ManagementAddRecord(_)
+                | Message::ManagementRemoveRecord(_)
+                | Message::ManagementGetPairingConfig(_)
+                | Message::ManagementSetPairingConfig(_)
+                | Message::ManagementOpenPairingWindow(_)
+        );
+        return Ok(denied.then(|| {
+            (
+                crate::noise::ManagementResult::code(Code::PermissionDenied),
+                crate::noise::ManagementEffect::None,
+            )
+        }));
+    }
+    // `in_session` is only ever true with a context.
+    let context = context.expect("management session implies a security context");
+    let store = context.store.as_ref();
+
+    // `include_static` marks the two reads a server uses to plan ahead; they carry the
+    // capacity and per-kind costs, the rest carry only `free`.
+    let (mut answer, include_static) = match message {
+        Message::ManagementListRecords(_) => (mgmt::handle_list_records(store)?, true),
+        Message::ManagementGetPairingConfig(_) => (mgmt::handle_get_pairing_config(store)?, true),
+        Message::ManagementAddRecord(payload) => (mgmt::handle_add_record(store, payload)?, false),
+        Message::ManagementRemoveRecord(payload) => (
+            mgmt::handle_remove_record(store, payload, Some(&context.psk_id.lock()))?,
+            false,
+        ),
+        Message::ManagementSetPairingConfig(payload) => {
+            (mgmt::handle_set_pairing_config(store, payload)?, false)
+        }
+        Message::ManagementOpenPairingWindow(_) => (mgmt::handle_open_pairing_window(), false),
+        _ => return Ok(None),
+    };
+    mgmt::with_storage(&mut answer.0, store, include_static)?;
+    Ok(Some(answer))
 }
 
 /// Map an activation onto the legacy `connection_reason`, so a connection reached over
@@ -542,6 +648,19 @@ pub(crate) struct SecurityContext {
     /// for — and the pairing check reads it at the moment an activation arrives, not at
     /// connect time.
     psk_category: Arc<Mutex<crate::noise::PskCategory>>,
+    /// The `psk_id` that keyed the live session.
+    ///
+    /// Management needs it for two decisions that turn on *whose* record is being touched:
+    /// `server/unpair` revokes the record that authenticated this connection, and a
+    /// `management/remove-record` naming that same record revokes the requester. Like the
+    /// category, it moves with a re-handshake.
+    psk_id: Arc<Mutex<String>>,
+    /// Whether `management` is in the connection's current activity set.
+    ///
+    /// Management commands are scoped to it: one arriving without it is answered
+    /// `permission_denied` rather than obeyed. A server can add or drop the activity mid
+    /// connection, so this tracks every activation rather than only the first.
+    management: Arc<Mutex<bool>>,
 }
 
 /// Connection components returned by [`ProtocolClient::split()`].
@@ -1422,6 +1541,8 @@ impl ProtocolClient {
                     server_id: result.server_id.clone(),
                     store,
                     psk_category: Arc::new(Mutex::new(result.psk_category)),
+                    psk_id: Arc::new(Mutex::new(result.psk_id.clone())),
+                    management: Arc::new(Mutex::new(false)),
                 });
                 Transport::encrypted(result.session)?
             }
@@ -1533,6 +1654,9 @@ impl ProtocolClient {
                             activate.activities,
                             activate.active_roles
                         );
+                        if let Some(context) = &security {
+                            note_management_activity(context, &activate);
+                        }
                         // Bridge onto the shape the rest of the client already reads. The
                         // rank ladder is the same for both spellings, so arbitration is
                         // unaffected by which one a server used.
@@ -1813,14 +1937,91 @@ impl ProtocolClient {
                                     st.server_transmitted,
                                     t4,
                                 );
+                            } else if let Some(answer) =
+                                answer_management(security.as_ref(), &msg).transpose()
+                            {
+                                // Every management/* request draws exactly one
+                                // management/result, in order — which is what lets the
+                                // server match reply to request with no identifier field.
+                                match answer {
+                                    Ok((result, effect)) => {
+                                        let reply = Message::ManagementResult(result);
+                                        match serde_json::to_string(&reply) {
+                                            Ok(json) => {
+                                                if let Err(e) =
+                                                    send_and_flush(&out_tx, Outbound::Json(json))
+                                                        .await
+                                                {
+                                                    log::error!("management/result: {e}");
+                                                    break;
+                                                }
+                                            }
+                                            Err(e) => {
+                                                log::error!("management/result encode: {e}");
+                                                break;
+                                            }
+                                        }
+                                        // The reply is on the wire before the session ends,
+                                        // so the server learns the outcome of the very
+                                        // request that revoked it.
+                                        if effect
+                                            == crate::noise::ManagementEffect::GoodbyeUnauthorized
+                                        {
+                                            log::info!("Management session revoked its own record");
+                                            let _ =
+                                                send_goodbye(&out_tx, GoodbyeReason::Unauthorized)
+                                                    .await;
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::error!("management request failed: {e}");
+                                        break;
+                                    }
+                                }
                             } else if let Some(context) = security.as_ref() {
                                 match &msg {
                                     Message::ServerActivate(activate) => {
+                                        // A server claiming management authority it was never
+                                        // granted is not a request to decline — it is a peer
+                                        // asserting a trust level the handshake contradicts.
+                                        if management_claim_is_unauthorized(context, activate) {
+                                            log::warn!(
+                                                "Server claimed management on an unpaired session"
+                                            );
+                                            let _ =
+                                                send_goodbye(&out_tx, GoodbyeReason::Unauthorized)
+                                                    .await;
+                                            break;
+                                        }
+                                        note_management_activity(context, activate);
                                         if let Some(record) =
                                             handle_pairing_activation(activate, context, &out_tx)
                                                 .await
                                         {
                                             pending_pairing = Some(record);
+                                        }
+                                    }
+                                    Message::ServerUnpair(_) => {
+                                        // Ignored mid-pairing: a `trust_level: none` session
+                                        // has no record to revoke.
+                                        if *context.psk_category.lock()
+                                            == crate::noise::PskCategory::LongTerm
+                                        {
+                                            let psk_id = context.psk_id.lock().clone();
+                                            if let Err(e) = crate::noise::management::handle_unpair(
+                                                context.store.as_ref(),
+                                                &psk_id,
+                                            ) {
+                                                log::error!("server/unpair: {e}");
+                                            }
+                                            log::info!(
+                                                "Unpaired by {}: record {psk_id}",
+                                                context.server_id
+                                            );
+                                            let _ = send_goodbye(&out_tx, GoodbyeReason::Unpaired)
+                                                .await;
+                                            break;
                                         }
                                     }
                                     Message::ServerPairFinalize(_) => {
@@ -1879,6 +2080,7 @@ impl ProtocolClient {
                                                 break;
                                             }
                                         };
+                                        note_management_activity(context, &activate);
                                         // Still gated: client/pair-finalize is part of this
                                         // exchange, and nothing else may interleave with it.
                                         if let Some(record) =

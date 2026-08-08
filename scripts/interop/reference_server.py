@@ -16,9 +16,14 @@ import sys
 
 from aiohttp import web
 
+from aiosendspin.models.management import (
+    ManagementSetPairingConfigPayload,
+    SetUnpairedAccessConfig,
+)
 from aiosendspin.models.types import PairMethod
 from aiosendspin.noise import Identity, InMemoryServerPairingStore
 from aiosendspin.noise.pairing import PairingAttempt
+from aiosendspin.noise.trust_store import PskCategory
 from aiosendspin.server.roles.source import (
     SourceSignalChangedEvent,
     SourceStreamEndedEvent,
@@ -33,6 +38,78 @@ SERVER_PRIVATE = bytes(range(32))
 # Seconds of capture to accept before asking the source to stop, so the run also
 # exercises server/command(stop) -> client_stream/end rather than only the start path.
 SOURCE_STOP_AFTER = float(os.environ.get("SOURCE_STOP_AFTER", "3"))
+
+
+def _is_paired(server: object, client_id: str) -> bool:
+    """Whether this client's live connection is keyed by a long-term PSK."""
+    try:
+        connection = server._connection_for(client_id)  # noqa: SLF001
+    except (KeyError, AttributeError):
+        return False
+    psk = getattr(connection, "_noise_psk", None)
+    return psk is not None and psk.category is PskCategory.LONG_TERM
+
+
+async def _drive_management(server: object, client_id: str) -> None:
+    """Run a real management session against a paired client, and report every answer.
+
+    Management is gated on a long-term PSK at both ends, so this only runs after pairing.
+    The sequence walks the whole surface: read the records and the config, provision a
+    record, patch the config, then remove what it added — so a client that answers `ok` to
+    everything but never actually writes is caught by the read that follows.
+    """
+    try:
+        connection = server.enable_management(client_id)  # type: ignore[attr-defined]
+    except (RuntimeError, KeyError) as exc:
+        print(f"MGMT_ENABLE_FAILED={type(exc).__name__}: {exc}", flush=True)
+        return
+    print(f"MGMT_ENABLED={client_id}", flush=True)
+
+    result, records, storage = await connection.list_records()
+    print(f"MGMT_LIST result={result.value} records={len(records)} storage={storage}", flush=True)
+    for record in records:
+        print(f"  record psk_id={record.psk_id} server_id={record.server_id} used={record.used}")
+
+    # A key this server does not otherwise use, so the add is unambiguous.
+    provisioned = bytes(range(32, 64))
+    result = await connection.add_record(psk=provisioned, server_id=None)
+    print(f"MGMT_ADD result={result.value}", flush=True)
+
+    # Re-adding the same key must collide rather than silently replace.
+    repeat = await connection.add_record(psk=provisioned, server_id=None)
+    print(f"MGMT_ADD_AGAIN result={repeat.value} (expect already_exists)", flush=True)
+
+    result, data, storage = await connection.get_pairing_config()
+    print(
+        f"MGMT_GET_CONFIG result={result.value} pairing_psk={data.pairing_psk} "
+        f"static_pin={data.static_pin} dynamic_pin={data.dynamic_pin} "
+        f"unpaired_access={data.unpaired_access} storage={storage}",
+        flush=True,
+    )
+
+    result = await connection.set_pairing_config(
+        ManagementSetPairingConfigPayload(
+            unpaired_access=SetUnpairedAccessConfig(enabled=True)
+        )
+    )
+    print(f"MGMT_SET_CONFIG result={result.value}", flush=True)
+
+    _, data, _ = await connection.get_pairing_config()
+    applied = data.unpaired_access is not None and data.unpaired_access.enabled
+    print(f"MGMT_PATCH_APPLIED={applied}", flush=True)
+
+    result, records, _ = await connection.list_records()
+    added = [r for r in records if r.server_id is None]
+    print(f"MGMT_LIST_AFTER_ADD records={len(records)} shared={len(added)}", flush=True)
+
+    if added:
+        result = await connection.remove_record(psk_id=added[0].psk_id)
+        print(f"MGMT_REMOVE result={result.value}", flush=True)
+
+    missing = await connection.remove_record(psk_id="not-a-real-psk-id")
+    print(f"MGMT_REMOVE_MISSING result={missing.value} (expect not_found)", flush=True)
+
+    print("MGMT_INTEROP_OK", flush=True)
 
 
 async def _drain_source(handle: object, stats: dict[str, int]) -> None:
@@ -141,7 +218,10 @@ async def main() -> None:
 
     paired = False
     sourced: set[str] = set()
+    managed: set[str] = set()
     reported_roles: dict[str, list[str]] = {}
+    # DRIVE_MANAGEMENT=1 runs a management session once a client is on a long-term PSK.
+    drive_management = os.environ.get("DRIVE_MANAGEMENT") == "1"
     try:
         while True:
             await asyncio.sleep(1)
@@ -162,6 +242,11 @@ async def main() -> None:
                 if cid not in sourced and "source@v1" in roles:
                     sourced.add(cid)
                     _drive_source(client, loop)
+                # Management needs a long-term PSK, which only exists after pairing — so
+                # this fires on the *reconnect*, not on the connection that paired.
+                if drive_management and cid not in managed and _is_paired(server, cid):
+                    managed.add(cid)
+                    loop.create_task(_drive_management(server, cid))
             if pair_client and not paired and pair_client in ids:
                 paired = True
                 print("PAIRING_START", flush=True)

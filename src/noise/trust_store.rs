@@ -25,6 +25,8 @@ pub struct PairingRecord {
     psk: [u8; KEY_LEN],
     /// The server this record is bound to, for stored-pubkey records.
     server_id: Option<String>,
+    /// Whether a server has ever authenticated a session with this record.
+    used: bool,
 }
 
 impl PairingRecord {
@@ -34,6 +36,7 @@ impl PairingRecord {
             psk_id: b64_encode(&super::keys::psk_id_bytes(&psk)),
             psk,
             server_id: Some(server_id),
+            used: false,
         }
     }
 
@@ -43,6 +46,7 @@ impl PairingRecord {
             psk_id: b64_encode(&super::keys::psk_id_bytes(&psk)),
             psk,
             server_id: None,
+            used: false,
         }
     }
 
@@ -54,6 +58,21 @@ impl PairingRecord {
     /// The server this record is bound to, if any.
     pub fn server_id(&self) -> Option<&str> {
         self.server_id.as_deref()
+    }
+
+    /// Whether a server has authenticated a session with this record's PSK.
+    ///
+    /// Reported by `management/list-records`, which is how an operator tells a record that
+    /// has done its job from one that was provisioned and never used.
+    pub fn used(&self) -> bool {
+        self.used
+    }
+
+    /// The same record, marked as having authenticated a session.
+    #[must_use]
+    pub fn into_used(mut self) -> Self {
+        self.used = true;
+        self
     }
 
     /// The record as a handshake PSK candidate.
@@ -81,6 +100,13 @@ pub struct PairingConfig {
     pub pairing_psk: Option<[u8; KEY_LEN]>,
     /// Whether the client admits a server with no pairing record.
     pub unpaired_access: bool,
+    /// The shared-PSK record pairing falls back to when record storage is full.
+    ///
+    /// The spec requires this to name a *shared-PSK* record and to be pre-provisioned with a
+    /// device-specific key — a fixed default shared across devices would let anyone holding
+    /// one device's firmware pair with every other. `None` says this client has no fallback,
+    /// so a pairing that cannot allocate a record fails rather than degrading.
+    pub record_mode_psk_id: Option<String>,
 }
 
 impl PairingConfig {
@@ -96,6 +122,7 @@ impl PairingConfig {
         Ok(Self {
             pairing_psk: Some(random_psk()?),
             unpaired_access: false,
+            record_mode_psk_id: None,
         })
     }
 
@@ -104,8 +131,26 @@ impl PairingConfig {
         Self {
             pairing_psk: None,
             unpaired_access: false,
+            record_mode_psk_id: None,
         }
     }
+}
+
+/// A bounded client's record-storage accounting.
+///
+/// All four numbers share one client-chosen unit — bytes, slots, whatever the device counts
+/// in — and a server treats it as opaque, using only ratios. A client whose storage is
+/// unbounded or of unknown size reports nothing and lets `storage_exhausted` speak instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageReport {
+    /// Total pool size.
+    pub capacity: u64,
+    /// Currently free space.
+    pub free: u64,
+    /// What one stored-pubkey record consumes.
+    pub cost_individual: u64,
+    /// What one shared-PSK record consumes.
+    pub cost_shared: u64,
 }
 
 /// Where a client keeps its pairing records and pairing configuration.
@@ -141,6 +186,31 @@ pub trait PairingStore: Send + Sync {
     /// returning `false` is how it says so.
     fn can_store_record(&self) -> Result<bool, Error> {
         Ok(true)
+    }
+
+    /// Record-storage accounting, or `None` when storage is unbounded or of unknown size.
+    ///
+    /// Reported on every `management/result` except `permission_denied`, so a server can show
+    /// remaining capacity and predict which operations will succeed. `storage_exhausted`
+    /// stays authoritative either way — this is a hint, not a contract.
+    fn storage_accounting(&self) -> Result<Option<StorageReport>, Error> {
+        Ok(None)
+    }
+
+    /// The record identified by `psk_id`, if it is held.
+    fn record_by_psk_id(&self, psk_id: &str) -> Result<Option<PairingRecord>, Error> {
+        Ok(self
+            .records()?
+            .into_iter()
+            .find(|record| record.psk_id() == psk_id))
+    }
+
+    /// Whether `psk_id` may be removed.
+    ///
+    /// A record the record mode points at is the storage-exhaustion fallback, and removing it
+    /// would leave that reference dangling — the spec rejects the removal instead.
+    fn can_remove_record(&self, psk_id: &str) -> Result<bool, Error> {
+        Ok(self.pairing_config()?.record_mode_psk_id.as_deref() != Some(psk_id))
     }
 }
 
@@ -236,6 +306,14 @@ impl PairingStore for InMemoryPairingStore {
         Ok(())
     }
 
+    fn mark_record_used(&self, psk_id: &str) -> Result<(), Error> {
+        let mut inner = self.inner.lock();
+        if let Some(record) = inner.records.remove(psk_id) {
+            inner.records.insert(psk_id.to_string(), record.into_used());
+        }
+        Ok(())
+    }
+
     fn pairing_config(&self) -> Result<PairingConfig, Error> {
         Ok(self.inner.lock().config.clone())
     }
@@ -307,6 +385,7 @@ mod tests {
         let store = InMemoryPairingStore::with_config(PairingConfig {
             pairing_psk: Some(key),
             unpaired_access: false,
+            record_mode_psk_id: None,
         });
         let candidates = handshake_candidates(&store).unwrap();
         let pairing = candidates
@@ -396,6 +475,7 @@ mod tests {
         let config = PairingConfig {
             pairing_psk: Some([0xABu8; KEY_LEN]),
             unpaired_access: true,
+            record_mode_psk_id: None,
         };
         let rendered = format!("{:?}", PairingConfigRedacted(&config));
         assert!(rendered.contains("pairing_psk_enabled: true"));

@@ -92,11 +92,43 @@ pub enum Message {
     #[serde(rename = "client_stream/end")]
     ClientStreamEnd(ClientStreamEnd),
 
-    /// Server asks the source for a different input stream format
     // === Group messages ===
     /// Group update notification
     #[serde(rename = "group/update")]
     GroupUpdate(GroupUpdate),
+
+    // === Management ===
+    /// A paired server drops its own pairing record and ends the connection.
+    #[serde(rename = "server/unpair")]
+    ServerUnpair(crate::noise::management::ServerUnpair),
+
+    /// Read the client's pairing records.
+    #[serde(rename = "management/list-records")]
+    ManagementListRecords(crate::noise::management::ManagementListRecords),
+
+    /// Provision a pairing record directly.
+    #[serde(rename = "management/add-record")]
+    ManagementAddRecord(crate::noise::management::ManagementAddRecord),
+
+    /// Drop a pairing record.
+    #[serde(rename = "management/remove-record")]
+    ManagementRemoveRecord(crate::noise::management::ManagementRemoveRecord),
+
+    /// Read the client's pairing configuration.
+    #[serde(rename = "management/get-pairing-config")]
+    ManagementGetPairingConfig(crate::noise::management::ManagementGetPairingConfig),
+
+    /// Patch the client's pairing configuration.
+    #[serde(rename = "management/set-pairing-config")]
+    ManagementSetPairingConfig(crate::noise::management::ManagementSetPairingConfig),
+
+    /// Open a pairing window in place of the operator gesture.
+    #[serde(rename = "management/open-pairing-window")]
+    ManagementOpenPairingWindow(crate::noise::management::ManagementOpenPairingWindow),
+
+    /// The client's single reply to any `management/*` request.
+    #[serde(rename = "management/result")]
+    ManagementResult(crate::noise::management::ManagementResult),
 
     // === Connection lifecycle ===
     /// Client goodbye message

@@ -76,6 +76,26 @@ the reference unpacks them. The run also covers `server/command` in both directi
 `SOURCE_STOP_AFTER=<seconds>` (default 3) sets how much capture the server accepts before
 asking the source to stop.
 
+## Driving `management/*`
+
+`DRIVE_MANAGEMENT=1` on the server opens a management session as soon as a client is on a
+long-term PSK — so it fires on the reconnect, not on the connection that paired, which is
+what the gating requires. Any paired client answers; `--source` already pairs and reconnects,
+so it doubles as the management client:
+
+```bash
+DRIVE_MANAGEMENT=1 PAIR_WITH=<client_id>:<pairing_psk> \
+    PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_server.py 8950
+cargo run --example noise_interop -- --source --seed 9 --listen-secs 25 \
+    --server ws://127.0.0.1:8950/sendspin
+```
+
+The sequence walks the whole surface and ends with `MGMT_INTEROP_OK`. It deliberately checks
+the negative outcomes too — a second `add-record` with the same key must answer
+`already_exists`, and a `remove-record` naming nothing must answer `not_found` — because a
+client that returns `ok` to everything passes a happy-path script and fails a real operator.
+The config patch is read back rather than trusted (`MGMT_PATCH_APPLIED`), for the same reason.
+
 ## What it covers, and what it found
 
 Covered today: both cipher suites, the Sentinel-PSK path, the transition from cleartext text
@@ -87,6 +107,11 @@ long-term record bound to the server's id.
 
 `source@v1` streams end to end on both suites: the role activates on the long-term PSK, and
 150 chunks (576000 bytes) sent arrive as 576000 bytes decoded on the server.
+
+`management/*` runs end to end against a real management session: records listed with their
+binding and `used` flag, a record added and re-added, the pairing config read, patched and
+read back, a record removed, and both negative outcomes (`already_exists`, `not_found`)
+observed rather than assumed.
 
 Six defects came out of pointing it at the reference server, none of which a loopback test
 would have surfaced:

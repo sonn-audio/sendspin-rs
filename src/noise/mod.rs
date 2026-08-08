@@ -41,6 +41,8 @@ pub mod constants;
 pub mod handshake;
 /// Identities, pre-shared keys, and `psk_id` derivation.
 pub mod keys;
+/// The `management/*` commands a paired server issues against the pairing store.
+pub mod management;
 /// The cleartext handshake messages.
 pub mod models;
 /// The Pairing PSK flow.
@@ -56,13 +58,18 @@ pub mod wire;
 
 pub use handshake::{ClientHandshake, HandshakeResult, HandshakeStep};
 pub use keys::{Identity, Psk, PskCategory};
+pub use management::{
+    ManagementEffect, ManagementResult, ManagementResultCode, ManagementResultData,
+};
 pub use models::{ClientInit, NoiseHandshake, ServerInit};
 pub use pairing::{
     ClientPairFinalize, PairAbort, PairAbortReason, PairingAction, ServerPairFinalize,
 };
 pub use rehandshake::{run_rehandshake_client, RehandshakeResult};
 pub use session::{CipherSuite, NoiseSession};
-pub use trust_store::{InMemoryPairingStore, PairingConfig, PairingRecord, PairingStore};
+pub use trust_store::{
+    InMemoryPairingStore, PairingConfig, PairingRecord, PairingStore, StorageReport,
+};
 pub use wire::{Frame, Reassembler};
 
 #[cfg(test)]
