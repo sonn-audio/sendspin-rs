@@ -156,12 +156,24 @@ so a pairing survives a restart — which is the only way one means anything. Be
 than from `--id`; `--no-encryption` falls back to the legacy cleartext transport for a server
 that has not implemented Noise, and cannot pair.
 
+`sendspin audio-devices list` prints the output devices; `--audio-device` takes an index from
+that list or a name (exact id or description first, then a prefix, so `--audio-device HDA`
+works). `--audio-format codec:sample_rate:bit_depth:channels` pins the stream: it becomes the
+*only* format offered, so the server sends that rather than merely preferring it, and it is
+checked against the device at startup. A device that does not exist or cannot play the format
+is an error there and then, with the list of what was available — not silence once a server
+starts sending.
+
+One thing to know before a first run: with no pairing and no `--allow-unpaired`, a server
+activates no roles and nothing plays. That is the conservative reading of the protocol — an
+unpaired session is authenticated by nothing — so it is the operator's call, made once and
+saved. The daemon says so at startup rather than looking broken.
+
 One limit worth knowing: **`--interface` binds the listening socket only.** It does not yet
 restrict which interface mDNS advertises on, because the advertisement API takes no
 interface.
 
-Still to come, in the order they are being built: audio device selection with
-`--audio-device` and `--audio-format`, then hooks, hardware volume and MPRIS.
+Still to come, in the order they are being built: hooks, hardware volume and MPRIS.
 
 ## Quick start
 

@@ -30,7 +30,19 @@ pub enum Command {
     ///
     /// By default this listens for incoming server connections and advertises itself over
     /// mDNS. Pass `--url` to dial a specific server instead.
-    Daemon(DaemonArgs),
+    Daemon(Box<DaemonArgs>),
+
+    /// Audio device utilities.
+    AudioDevices {
+        #[command(subcommand)]
+        command: AudioDevicesCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AudioDevicesCommand {
+    /// List the output devices this machine can play through, and exit.
+    List,
 }
 
 #[derive(Parser, Debug)]
@@ -65,6 +77,15 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub settings_dir: Option<std::path::PathBuf>,
 
+    /// Let a server that has not paired with this client use it for playback.
+    ///
+    /// Off by default, which is what the protocol's conservative reading asks for: an unpaired
+    /// session is authenticated by nothing and is open to a man in the middle. Until this is
+    /// set, or a pairing completes, a server activates no roles and nothing plays. Persisted in
+    /// the settings directory, so it is set once rather than on every start.
+    #[arg(long)]
+    pub allow_unpaired: bool,
+
     /// Speak the legacy cleartext transport instead of the spec's encrypted one.
     ///
     /// Only for a server that has not implemented the Noise layer. It cannot pair, so it
@@ -92,6 +113,22 @@ pub struct DaemonArgs {
     /// Product name reported in `client/hello`. Defaults to the detected platform.
     #[arg(long)]
     pub product_name: Option<String>,
+
+    /// Audio output device: an index from `audio-devices list`, or a name.
+    ///
+    /// A name matches an exact device id or description first, then any that starts with it —
+    /// so `--audio-device HDA` picks the first HDA card without spelling out its full ALSA
+    /// name. Omit to use the platform default.
+    #[arg(long)]
+    pub audio_device: Option<String>,
+
+    /// Pin the stream format as `codec:sample_rate:bit_depth:channels`, e.g. `flac:48000:24:2`.
+    ///
+    /// This is the only format offered to the server, so it decides what gets sent rather than
+    /// merely preferring it. Checked against the output device at startup: a device that
+    /// cannot play it is an error here, not silence later.
+    #[arg(long)]
+    pub audio_format: Option<String>,
 
     /// IP address of the network interface to bind the listener to.
     ///
@@ -188,7 +225,8 @@ mod tests {
 
     fn args_from(argv: &[&str]) -> DaemonArgs {
         match Cli::parse_from(argv).command {
-            Command::Daemon(args) => args,
+            Command::Daemon(args) => *args,
+            other => panic!("expected a daemon invocation, got {other:?}"),
         }
     }
 

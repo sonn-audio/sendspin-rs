@@ -1,0 +1,278 @@
+// ABOUTME: Picking an output device and pinning a stream format, plus the parsing and the
+// ABOUTME: up-front checks that turn a typo into a startup error rather than silence.
+
+//! Audio device selection.
+//!
+//! Two flags, and both fail early on purpose. A daemon that accepts `--audio-device 7` on a
+//! machine with three cards and then plays nothing has told the operator nothing; the failure
+//! belongs at startup, next to the thing that caused it, with the list of what was available.
+
+use cpal::traits::{DeviceTrait, HostTrait};
+use sendspin::protocol::messages::AudioFormatSpec;
+
+/// One output device, as an operator sees it.
+pub struct DeviceInfo {
+    /// Position in the printed list. The `--audio-device 0` form names this.
+    pub index: usize,
+    pub id: String,
+    pub description: Option<String>,
+    pub device: cpal::Device,
+}
+
+/// Every device that can play audio, in the order `audio-devices list` prints them.
+///
+/// Devices with no output configuration are skipped rather than listed and rejected later:
+/// they are inputs, and offering one as a playback target is an invitation to a typo.
+pub fn output_devices() -> Result<Vec<DeviceInfo>, String> {
+    let mut found = Vec::new();
+    for host_id in cpal::available_hosts() {
+        let host = cpal::host_from_id(host_id)
+            .map_err(|e| format!("could not open the {host_id:?} audio host: {e}"))?;
+        let devices = host
+            .devices()
+            .map_err(|e| format!("could not enumerate audio devices: {e}"))?;
+        for device in devices {
+            let has_output = device
+                .supported_output_configs()
+                .map(|configs| configs.count() > 0)
+                .unwrap_or(false);
+            if !has_output {
+                continue;
+            }
+            found.push(DeviceInfo {
+                index: found.len(),
+                id: device
+                    .id()
+                    .map_or_else(|_| "<unknown>".to_string(), |id| id.to_string()),
+                description: device.description().ok().map(|d| d.to_string()),
+                device,
+            });
+        }
+    }
+    Ok(found)
+}
+
+/// Print the devices, the way `sendspin audio-devices list` reports them.
+pub fn list_devices() -> Result<(), String> {
+    let devices = output_devices()?;
+    if devices.is_empty() {
+        println!("No audio output devices found.");
+        return Ok(());
+    }
+    println!("Audio output devices:\n");
+    for device in &devices {
+        match &device.description {
+            Some(description) => {
+                println!("  [{}] {}\n      {description}", device.index, device.id)
+            }
+            None => println!("  [{}] {}", device.index, device.id),
+        }
+    }
+    println!("\nSelect one with --audio-device <index>, or by name:");
+    println!("  sendspin daemon --audio-device {}", devices[0].index);
+    println!("  sendspin daemon --audio-device {:?}", devices[0].id);
+    Ok(())
+}
+
+/// Resolve `query` to a device, or say what was available instead.
+///
+/// Matched in decreasing specificity — index, exact id, exact description, then a
+/// case-insensitive prefix — so `--audio-device 1` cannot be stolen by a card whose name
+/// happens to start with a digit, and a full id always beats a partial one.
+pub fn find_device(query: &str) -> Result<cpal::Device, String> {
+    let devices = output_devices()?;
+
+    if let Ok(index) = query.parse::<usize>() {
+        return devices
+            .into_iter()
+            .find(|d| d.index == index)
+            .map(|d| d.device)
+            .ok_or_else(|| {
+                format!("no audio device with index {index}; run `audio-devices list`")
+            });
+    }
+
+    let lowered = query.to_lowercase();
+    let matched = devices
+        .iter()
+        .position(|d| d.id == query)
+        .or_else(|| {
+            devices
+                .iter()
+                .position(|d| d.description.as_deref() == Some(query))
+        })
+        .or_else(|| {
+            devices.iter().position(|d| {
+                d.id.to_lowercase().starts_with(&lowered)
+                    || d.description
+                        .as_deref()
+                        .is_some_and(|desc| desc.to_lowercase().starts_with(&lowered))
+            })
+        });
+
+    match matched {
+        Some(index) => Ok(devices
+            .into_iter()
+            .nth(index)
+            .expect("index just found")
+            .device),
+        None => {
+            let available: Vec<String> = devices.iter().map(|d| d.id.clone()).collect();
+            Err(format!(
+                "no audio device matching {query:?}. Available: {}",
+                if available.is_empty() {
+                    "none".to_string()
+                } else {
+                    available.join(", ")
+                }
+            ))
+        }
+    }
+}
+
+/// Parse `codec:sample_rate:bit_depth:channels`, e.g. `flac:48000:24:2`.
+///
+/// All four parts are required. A partial spelling would have to invent the rest, and a
+/// silently invented sample rate is the kind of thing that plays at the wrong speed rather
+/// than failing.
+pub fn parse_format(spec: &str) -> Result<AudioFormatSpec, String> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let [codec, sample_rate, bit_depth, channels] = parts.as_slice() else {
+        return Err(format!(
+            "--audio-format must be codec:sample_rate:bit_depth:channels, e.g. flac:48000:24:2 \
+             (got {spec:?})"
+        ));
+    };
+
+    if !matches!(*codec, "pcm" | "flac" | "opus") {
+        return Err(format!(
+            "codec {codec:?} is not one this client can decode (pcm, flac or opus)"
+        ));
+    }
+    let sample_rate: u32 = sample_rate
+        .parse()
+        .map_err(|_| format!("sample rate {sample_rate:?} is not a number"))?;
+    let bit_depth: u8 = bit_depth
+        .parse()
+        .map_err(|_| format!("bit depth {bit_depth:?} is not a number"))?;
+    let channels: u8 = channels
+        .parse()
+        .map_err(|_| format!("channel count {channels:?} is not a number"))?;
+
+    // Checked here rather than left to the decoder, so the message names the flag.
+    if !matches!(bit_depth, 16 | 24) {
+        return Err(format!("bit depth {bit_depth} is not 16 or 24"));
+    }
+    if channels == 0 {
+        return Err("channel count must be at least 1".to_string());
+    }
+    if sample_rate == 0 {
+        return Err("sample rate must be greater than zero".to_string());
+    }
+    // Opus is defined at 48 kHz, and a client that asks a server for anything else gets a
+    // stream its own decoder will refuse.
+    if *codec == "opus" && sample_rate != 48_000 {
+        return Err(format!(
+            "Opus is defined at 48000 Hz; {sample_rate} Hz cannot be decoded"
+        ));
+    }
+
+    Ok(AudioFormatSpec {
+        codec: (*codec).to_string(),
+        channels,
+        sample_rate,
+        bit_depth,
+    })
+}
+
+/// Check that a device can actually play this format, before a server is asked to send it.
+///
+/// The device is asked about the sample rate and the channel count only: the bit depth on the
+/// wire is the codec's business, and the player converts to whatever sample type the device
+/// wants. Verifying up front is the point — the alternative is a server encoding happily into
+/// a stream that cannot be opened.
+pub fn verify_device_supports(
+    device: &cpal::Device,
+    format: &AudioFormatSpec,
+) -> Result<(), String> {
+    let configs = device
+        .supported_output_configs()
+        .map_err(|e| format!("could not read the device's output configurations: {e}"))?;
+
+    let mut seen = Vec::new();
+    for config in configs {
+        let min = config.min_sample_rate();
+        let max = config.max_sample_rate();
+        seen.push(format!("{}ch {min}-{max}Hz", config.channels()));
+        if u32::from(config.channels()) == u32::from(format.channels)
+            && (min..=max).contains(&format.sample_rate)
+        {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "the selected device cannot play {}ch at {}Hz. It supports: {}",
+        format.channels,
+        format.sample_rate,
+        if seen.is_empty() {
+            "nothing".to_string()
+        } else {
+            seen.join("; ")
+        }
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_format_spec_parses_into_what_the_hello_advertises() {
+        let format = parse_format("flac:48000:24:2").unwrap();
+        assert_eq!(format.codec, "flac");
+        assert_eq!(format.sample_rate, 48_000);
+        assert_eq!(format.bit_depth, 24);
+        assert_eq!(format.channels, 2);
+    }
+
+    /// Every part is required. Inventing a missing sample rate would play at the wrong speed
+    /// rather than fail, which is the worse of the two outcomes.
+    #[test]
+    fn a_partial_format_spec_is_refused_rather_than_completed() {
+        for bad in [
+            "pcm",
+            "pcm:48000",
+            "pcm:48000:16",
+            "pcm:48000:16:2:extra",
+            "",
+        ] {
+            assert!(parse_format(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_format_this_client_could_not_decode_is_refused_at_the_flag() {
+        // A codec with no decoder here: the server would encode it and nothing would play.
+        assert!(parse_format("mp3:48000:16:2").is_err());
+        // Bit depths the decoders do not implement.
+        assert!(parse_format("pcm:48000:32:2").is_err());
+        assert!(parse_format("pcm:48000:8:2").is_err());
+        // Degenerate values that would reach cpal as a zero-sized stream.
+        assert!(parse_format("pcm:48000:16:0").is_err());
+        assert!(parse_format("pcm:0:16:2").is_err());
+        // Opus exists only at 48 kHz, so asking for anything else asks for an undecodable
+        // stream — better refused at the flag than at the first chunk.
+        assert!(parse_format("opus:44100:16:2").is_err());
+        assert!(parse_format("opus:48000:16:2").is_ok());
+    }
+
+    #[test]
+    fn non_numeric_parts_name_the_part_that_was_wrong() {
+        let error = parse_format("pcm:forty-eight:16:2").unwrap_err();
+        assert!(error.contains("sample rate"), "{error}");
+        let error = parse_format("pcm:48000:sixteen:2").unwrap_err();
+        assert!(error.contains("bit depth"), "{error}");
+        let error = parse_format("pcm:48000:16:stereo").unwrap_err();
+        assert!(error.contains("channel count"), "{error}");
+    }
+}

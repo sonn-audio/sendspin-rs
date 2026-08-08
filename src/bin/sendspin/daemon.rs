@@ -12,7 +12,7 @@ use std::sync::Arc;
 use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::noise::file_store::{load_or_create_identity, FilePairingStore};
-use sendspin::noise::trust_store::PairingStore;
+use sendspin::noise::trust_store::{PairingConfig, PairingStore};
 use sendspin::protocol::client::{AudioChunk, Encryption, EncryptionSettings, WsSender};
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{
@@ -32,6 +32,14 @@ struct Device {
     /// encrypted transport needs both and neither is any use alone.
     encryption: Option<EncryptionSettings>,
     static_delay: u16,
+    /// The chosen output device, or `None` for the platform default.
+    device: Option<cpal::Device>,
+    /// The single format offered to the server, when `--audio-format` pinned one.
+    ///
+    /// Pinning narrows `client/hello` to one entry rather than reordering a list, because a
+    /// server picks from what it is offered: an operator who names a format wants that format,
+    /// not a preference the server may overrule.
+    format: Option<sendspin::protocol::messages::AudioFormatSpec>,
 }
 
 /// Run the daemon until the process is stopped.
@@ -42,6 +50,32 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         .product_name
         .clone()
         .unwrap_or_else(default_product_name);
+
+    // Resolved before anything connects: a device that does not exist or a format it cannot
+    // play is a startup error next to the flag that caused it, not silence once a server
+    // starts sending.
+    let device = args
+        .audio_device
+        .as_deref()
+        .map(crate::audio::find_device)
+        .transpose()?;
+    let format = args
+        .audio_format
+        .as_deref()
+        .map(crate::audio::parse_format)
+        .transpose()?;
+    if let (Some(device), Some(format)) = (device.as_ref(), format.as_ref()) {
+        crate::audio::verify_device_supports(device, format)?;
+    }
+    if let Some(format) = format.as_ref() {
+        log::info!(
+            "Offering only {}:{}:{}:{}",
+            format.codec,
+            format.sample_rate,
+            format.bit_depth,
+            format.channels
+        );
+    }
 
     // The encrypted transport decides the `client_id` rather than taking one: it is the public
     // half of the stored keypair. Only transition mode leaves the name to the operator.
@@ -71,6 +105,24 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         let store = FilePairingStore::open(dir.join("pairing.json"))?;
         let records = store.records()?.len();
         log::info!("Settings: {} ({records} pairing record(s))", dir.display());
+
+        // Written through rather than applied per run, so the choice is the operator's once
+        // and not a flag they have to remember on every restart.
+        let config = store.pairing_config()?;
+        if args.allow_unpaired && !config.unpaired_access {
+            store.set_pairing_config(PairingConfig {
+                unpaired_access: true,
+                ..config
+            })?;
+            log::info!("Unpaired access enabled and saved");
+        } else if !store.pairing_config()?.unpaired_access && records == 0 {
+            // Worth saying plainly: with no pairing and no unpaired access, a server activates
+            // no roles at all, and a silent player looks like a broken one.
+            log::warn!(
+                "No pairing yet and unpaired access is off, so no server will activate a \
+                 role. Pair this client, or pass --allow-unpaired."
+            );
+        }
         let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::new(store));
         // The dynamic PIN has to reach the operator through this device, and only the host
         // application knows how. A daemon with no display or speaker has the log and nothing
@@ -91,6 +143,8 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         manufacturer: args.manufacturer.clone(),
         encryption,
         static_delay,
+        device,
+        format,
     };
 
     match args.url.clone() {
@@ -105,6 +159,7 @@ fn template(device: &Device) -> ProtocolClientBuilder {
     ProtocolClientBuilder::builder()
         .client_id(device.client_id.clone())
         .name(device.name.clone())
+        .player_v1_support(player_support(device.format.as_ref()))
         .product_name(Some(device.product_name.clone()))
         // Passed unconditionally rather than behind an `if`: each setter moves the builder to
         // a new type, so a conditional one would need both branches to agree on it.
@@ -114,6 +169,51 @@ fn template(device: &Device) -> ProtocolClientBuilder {
             None => Encryption::Disabled,
         })
         .build()
+}
+
+/// What this client tells a server it can decode.
+///
+/// With no `--audio-format` this is the full set the decoders implement, in the order this
+/// client would rather have them: Opus for bandwidth, then PCM. With one, it is that alone.
+fn player_support(
+    pinned: Option<&sendspin::protocol::messages::AudioFormatSpec>,
+) -> sendspin::protocol::messages::PlayerV1Support {
+    use sendspin::protocol::messages::{AudioFormatSpec, PlayerV1Support};
+
+    let supported_formats = match pinned {
+        Some(format) => vec![format.clone()],
+        None => vec![
+            AudioFormatSpec {
+                codec: "opus".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+            AudioFormatSpec {
+                codec: "flac".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 24,
+            },
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 24,
+            },
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+        ],
+    };
+    PlayerV1Support {
+        supported_formats,
+        buffer_capacity: 50 * 1024 * 1024,
+        supported_commands: vec!["volume".to_string(), "mute".to_string()],
+    }
 }
 
 /// Dial a named server and play whatever it sends, until it goes away.
@@ -139,6 +239,7 @@ async fn run_outbound(
         conn.clock_sync,
         conn.sender,
         device.static_delay,
+        device.device.clone(),
     )
     .await;
     log::info!("Server closed the connection");
@@ -188,6 +289,7 @@ async fn run_inbound(args: &DaemonArgs, device: &Device) -> Result<(), Box<dyn s
             conn.clock_sync,
             conn.sender,
             device.static_delay,
+            device.device.clone(),
         )
         .await;
         // A server this client actually played for wins a later discovery tie, which is what
@@ -211,6 +313,7 @@ async fn play(
     clock_sync: Arc<parking_lot::Mutex<sendspin::sync::ClockSync>>,
     sender: WsSender,
     static_delay: u16,
+    output_device: Option<cpal::Device>,
 ) -> bool {
     let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut format: Option<AudioFormat> = None;
@@ -339,7 +442,12 @@ async fn play(
                         match SyncedPlayer::new(
                             fmt.clone(),
                             Arc::clone(&clock_sync),
-                            SyncedPlayerConfig { volume, muted, ..SyncedPlayerConfig::new() },
+                            SyncedPlayerConfig {
+                                volume,
+                                muted,
+                                device: output_device.clone(),
+                                ..SyncedPlayerConfig::new()
+                            },
                         ) {
                             Ok(built) => {
                                 built.set_static_delay(delay);
