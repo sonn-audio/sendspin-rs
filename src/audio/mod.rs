@@ -3,6 +3,8 @@
 
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
+/// Audio encoders for the source role.
+pub mod encode;
 /// Lock-free volume/mute control
 pub mod gain;
 /// Buffer pool for reusing audio sample buffers

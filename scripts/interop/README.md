@@ -66,6 +66,19 @@ cargo run --example noise_interop -- --source --seed 9 --listen-secs 20 \
     --server ws://127.0.0.1:8941/sendspin
 ```
 
+`--codec pcm|flac|opus` picks what the source encodes. All three are validated against the
+reference server's own decoders, which are ffmpeg's rather than this crate's — so a frame
+that only `sendspin-rs` can read fails here:
+
+| codec | sent | decoded on the server |
+| --- | --- | --- |
+| `pcm` | 576000 B | 576000 B |
+| `flac` | 54062 B | 595200 B |
+| `opus` | 24320 B | 583680 B |
+
+The Opus figures are worth reading twice: 152 packets of 960 samples is 145920 sample frames,
+and 583680 bytes at 4 bytes per frame is the same number. Nothing was dropped or padded.
+
 A pass prints `SOURCE INTEROP OK` on the client and `SOURCE_INTEROP_OK` on the server, with
 matching byte counts on both sides — the client's `chunks sent` against the server's
 `SOURCE_DRAINED`. That equality is the point: the server only reaches a non-zero byte count

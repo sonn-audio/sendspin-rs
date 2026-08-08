@@ -52,6 +52,13 @@ struct Args {
     #[arg(long)]
     seed: Option<u8>,
 
+    /// Codec the source streams: `pcm`, `flac` or `opus`.
+    ///
+    /// The server transcodes centrally, so this is the source's choice alone — which makes
+    /// it the one knob that decides whether the encoders are exercised at all.
+    #[arg(long, default_value = "pcm")]
+    codec: String,
+
     /// Drive the `source@v1` role: pair, reconnect on the long-term PSK, then stream
     /// captured audio up to the server when it asks for it.
     ///
@@ -230,6 +237,8 @@ async fn run_source_client(
     identity: Identity,
     suite: CipherSuite,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+    use sendspin::audio::encode::create_encoder;
     use sendspin::protocol::messages::{
         ClientStreamSource, GoodbyeReason, Message, SourceCommandType, SourceFeatures,
         SourceSignal, SourceState, SourceV1Support,
@@ -239,8 +248,15 @@ async fn run_source_client(
     const SAMPLE_RATE: u32 = 48_000;
     const CHANNELS: u8 = 2;
     const BIT_DEPTH: u8 = 16;
-    /// 20 ms of audio per chunk.
-    const FRAMES_PER_CHUNK: usize = (SAMPLE_RATE as usize) / 50;
+    /// 20 ms of audio fed to the encoder per tick.
+    const FRAMES_PER_TICK: usize = (SAMPLE_RATE as usize) / 50;
+
+    let mut encoder = create_encoder(&args.codec, SAMPLE_RATE, BIT_DEPTH, CHANNELS)?;
+    let codec_header = encoder
+        .codec_header()
+        .map(|header| base64::engine::general_purpose::STANDARD.encode(header));
+    let lookahead_us = encoder.lookahead_us();
+    println!("codec     : {} (lookahead {lookahead_us} us)", args.codec);
 
     let store = build_pairing_store(args)?;
 
@@ -320,6 +336,8 @@ async fn run_source_client(
     let mut phase = 0.0f32;
     let mut chunks_sent = 0usize;
     let mut bytes_sent = 0usize;
+    let mut samples_sent = 0usize;
+    let mut anchor: Option<i64> = None;
     let mut skipped_unsynced = 0usize;
     let mut saw_start = false;
     let mut saw_stop = false;
@@ -348,23 +366,44 @@ async fn run_source_client(
                         println!("  <-- server/command start");
                         sender
                             .send_client_stream_start(ClientStreamSource {
-                                codec: "pcm".to_string(),
+                                codec: args.codec.clone(),
                                 channels: CHANNELS,
                                 sample_rate: SAMPLE_RATE,
                                 bit_depth: BIT_DEPTH,
-                                // PCM needs no header; FLAC would carry STREAMINFO here.
-                                codec_header: None,
+                                // FLAC carries STREAMINFO here; PCM and Opus need none.
+                                codec_header: codec_header.clone(),
                             })
                             .await?;
                         sender
                             .send_source_state(SourceState { signal: Some(SourceSignal::Present) })
                             .await?;
-                        println!("  --> client_stream/start (pcm 48000/16/2)");
+                        println!(
+                            "  --> client_stream/start ({} 48000/16/2, header {})",
+                            args.codec,
+                            codec_header.as_ref().map_or(0, String::len)
+                        );
                         streaming = true;
                     }
                     SourceCommandType::Stop if streaming => {
                         saw_stop = true;
                         println!("  <-- server/command stop");
+                        // Flush before the end marker: a codec with a fixed frame size is
+                        // still holding the tail, and dropping it loses real audio.
+                        if let Some(anchor_us) = anchor {
+                            for frame in encoder.flush()? {
+                                let offset_us =
+                                    samples_sent as i64 * 1_000_000 / i64::from(SAMPLE_RATE);
+                                bytes_sent += frame.len();
+                                sender
+                                    .send_source_audio(
+                                        anchor_us + offset_us - lookahead_us,
+                                        &frame,
+                                    )
+                                    .await?;
+                                samples_sent += encoder.frame_samples();
+                                chunks_sent += 1;
+                            }
+                        }
                         sender.send_client_stream_end().await?;
                         sender
                             .send_source_state(SourceState { signal: Some(SourceSignal::Absent) })
@@ -389,10 +428,22 @@ async fn run_source_client(
                     skipped_unsynced += 1;
                     continue;
                 };
-                let chunk = tone_chunk(&mut phase, SAMPLE_RATE, CHANNELS, FRAMES_PER_CHUNK);
-                bytes_sent += chunk.len();
-                sender.send_source_audio(server_us, &chunk).await?;
-                chunks_sent += 1;
+                // The first tick anchors the stream; every frame afterwards is stamped from
+                // its own sample position rather than from the wall clock, so a late tick
+                // shifts nothing. A codec that buffers ahead of its output is corrected by
+                // its own lookahead.
+                let anchor_us = *anchor.get_or_insert(server_us);
+                let pcm = tone_chunk(&mut phase, SAMPLE_RATE, CHANNELS, FRAMES_PER_TICK);
+                for frame in encoder.process(&pcm)? {
+                    let offset_us =
+                        samples_sent as i64 * 1_000_000 / i64::from(SAMPLE_RATE);
+                    bytes_sent += frame.len();
+                    sender
+                        .send_source_audio(anchor_us + offset_us - lookahead_us, &frame)
+                        .await?;
+                    samples_sent += encoder.frame_samples();
+                    chunks_sent += 1;
+                }
             }
         }
     }
