@@ -49,6 +49,8 @@ pub mod management;
 pub mod models;
 /// The Pairing PSK flow.
 pub mod pairing;
+/// The Sendspin bindings around CPace: session id, PIN derivation, PSK wrapping.
+pub mod pin;
 /// The in-band re-handshake.
 pub mod rehandshake;
 /// The KKpsk2 session: handshake and transport.

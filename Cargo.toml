@@ -58,6 +58,8 @@ mdns-sd = { version = "0.20", optional = true }
 crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
 hmac = "0.13"
 subtle = "2"
+chacha20poly1305 = "0.11"
+aes-gcm = "0.11"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
