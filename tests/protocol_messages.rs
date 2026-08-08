@@ -16,9 +16,9 @@ use sendspin::protocol::messages::{
 #[test]
 fn test_client_hello_serialization() {
     let hello = ClientHello {
-        client_id: "test-client-123".to_string(),
+        client_id: Some("test-client-123".to_string()),
         name: "Test Player".to_string(),
-        version: 1,
+        version: Some(1),
         supported_roles: vec!["player@v1".to_string()],
         trust_level: TrustLevel::default(),
         supported_pair_methods: None,
@@ -584,9 +584,9 @@ fn test_stream_start_deserialization() {
 #[test]
 fn test_visualizer_negotiation_serialization() {
     let hello = ClientHello {
-        client_id: "visualizer-client".to_string(),
+        client_id: Some("visualizer-client".to_string()),
         name: "Visualizer".to_string(),
-        version: 1,
+        version: Some(1),
         supported_roles: vec!["visualizer@v1".to_string()],
         trust_level: TrustLevel::default(),
         supported_pair_methods: None,
@@ -1553,9 +1553,9 @@ fn hello_declares_trust_and_unpaired_access_by_default() {
     // Both statements are true of this library, and a server that reads neither field
     // sees the same hello it always did.
     let hello = ClientHello {
-        client_id: "c1".to_string(),
+        client_id: Some("c1".to_string()),
         name: "Test".to_string(),
-        version: 1,
+        version: Some(1),
         supported_roles: vec!["player@v1".to_string()],
         trust_level: TrustLevel::default(),
         supported_pair_methods: None,

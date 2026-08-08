@@ -34,9 +34,9 @@ fn the_support_object_advertises_only_line_sense() {
 #[test]
 fn the_support_object_rides_under_its_versioned_key() {
     let hello = ClientHello {
-        client_id: "c1".to_string(),
+        client_id: Some("c1".to_string()),
         name: "Line In".to_string(),
-        version: 1,
+        version: Some(1),
         supported_roles: vec!["source@v1".to_string()],
         trust_level: TrustLevel::None,
         supported_pair_methods: None,

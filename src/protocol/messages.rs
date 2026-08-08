@@ -172,12 +172,23 @@ pub enum Message {
 /// Client hello message
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientHello {
-    /// Unique client identifier
-    pub client_id: String,
+    /// Unique client identifier, on a connection that has no better source for one.
+    ///
+    /// Optional because under the encrypted transport it is not sent at all: the identity
+    /// came from `client/init` and was authenticated by the Noise handshake, which is a far
+    /// stronger claim than a client naming itself in a field. This crate still sends it — see
+    /// the transition-mode note in the README — but anything *reading* a hello has to accept
+    /// its absence, or it turns away every spec-conformant client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     /// Human-readable client name
     pub name: String,
-    /// Protocol version number
-    pub version: u32,
+    /// Protocol version number, where a client still sends one.
+    ///
+    /// Optional for the same reason as `client_id`: the encrypted handshake settles the
+    /// version in `client/init` before a hello exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
     /// List of supported roles with versions (e.g., "player@v1", "controller@v1")
     pub supported_roles: Vec<String>,
     /// Trust this client extends to this server. `none` on an unpaired connection.

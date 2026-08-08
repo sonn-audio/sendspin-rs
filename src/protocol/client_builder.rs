@@ -365,9 +365,9 @@ impl ProtocolClientBuilder {
 
     fn into_parts(self) -> (ClientHello, ClientState, Arc<dyn Clock>) {
         let hello = ClientHello {
-            client_id: self.client_id,
+            client_id: Some(self.client_id),
             name: self.name,
-            version: 1,
+            version: Some(1),
             supported_roles: self.supported_roles,
             trust_level: self.trust_level,
             supported_pair_methods: self.supported_pair_methods,
