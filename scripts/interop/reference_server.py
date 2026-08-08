@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import math
 import os
+import struct
 import sys
 
 from aiohttp import web
@@ -24,6 +26,7 @@ from aiosendspin.models.types import PairMethod
 from aiosendspin.noise import Identity, InMemoryServerPairingStore
 from aiosendspin.noise.pairing import PairingAttempt
 from aiosendspin.noise.trust_store import PskCategory
+from aiosendspin.server.audio import AudioFormat
 from aiosendspin.server.roles.source import (
     SourceSignalChangedEvent,
     SourceStreamEndedEvent,
@@ -38,6 +41,12 @@ SERVER_PRIVATE = bytes(range(32))
 # Seconds of capture to accept before asking the source to stop, so the run also
 # exercises server/command(stop) -> client_stream/end rather than only the start path.
 SOURCE_STOP_AFTER = float(os.environ.get("SOURCE_STOP_AFTER", "3"))
+
+# The tone pushed to a player client, and its shape. Seconds rather than chunks because the
+# client reports what it decoded in frames, and both sides have to name the same number.
+PLAYER_SECONDS = float(os.environ.get("PLAYER_SECONDS", "3"))
+SAMPLE_RATE = 48_000
+CHANNELS = 2
 
 
 # How long to wait for the client to publish its derived dynamic PIN before giving up. The
@@ -139,6 +148,62 @@ async def _drive_management(server: object, client_id: str) -> None:
     print(f"MGMT_REMOVE_MISSING result={missing.value} (expect not_found)", flush=True)
 
     print("MGMT_INTEROP_OK", flush=True)
+
+
+async def _drive_player(client: object, loop: asyncio.AbstractEventLoop) -> None:
+    """Stream a known tone to a player client, and report exactly what was pushed.
+
+    The mirror of `_drive_source`: there the reference decodes what Rust encodes, here it
+    encodes what Rust has to decode. Which is the half that matters for a player — the
+    server picks the codec from the client's advertised formats and re-encodes with ffmpeg,
+    so a decoder that only agrees with this crate's own encoder fails right here.
+
+    The PCM pushed is generated rather than read from a file so both sides can state the
+    same expected frame count without shipping a fixture.
+    """
+    group = client.group  # type: ignore[attr-defined]
+    fmt = AudioFormat(sample_rate=SAMPLE_RATE, bit_depth=16, channels=CHANNELS)
+    frames_per_chunk = SAMPLE_RATE // 50  # 20 ms
+    chunks = int(PLAYER_SECONDS * 50)
+
+    stream = group.start_stream()
+    print(
+        f"PLAYER_STREAM_START chunks={chunks} frames_per_chunk={frames_per_chunk} "
+        f"{SAMPLE_RATE}Hz 16bit {CHANNELS}ch",
+        flush=True,
+    )
+    phase = 0.0
+    pushed_frames = 0
+    try:
+        for _ in range(chunks):
+            pcm, phase = _tone(phase, frames_per_chunk)
+            stream.prepare_audio(pcm, fmt)
+            await stream.commit_audio()
+            pushed_frames += frames_per_chunk
+            await stream.sleep_to_limit_buffer(max_buffer_us=1_000_000)
+    finally:
+        stream.stop()
+
+    print(
+        f"PLAYER_PUSHED frames={pushed_frames} bytes={pushed_frames * CHANNELS * 2}",
+        flush=True,
+    )
+    print("PLAYER_INTEROP_OK", flush=True)
+
+
+def _tone(phase: float, frames: int) -> tuple[bytes, float]:
+    """One chunk of a 440 Hz tone: interleaved little-endian 16-bit, and the new phase.
+
+    The same waveform the Rust source harness sends, so a run in either direction is
+    listening to the same thing.
+    """
+    step = 2.0 * math.pi * 440.0 / SAMPLE_RATE
+    out = bytearray()
+    for _ in range(frames):
+        sample = int(math.sin(phase) * 0.2 * 32767)
+        out += struct.pack("<h", sample) * CHANNELS
+        phase += step
+    return bytes(out), phase
 
 
 async def _drain_source(handle: object, stats: dict[str, int]) -> None:
@@ -267,6 +332,9 @@ async def main() -> None:
 
     paired = False
     sourced: set[str] = set()
+    played: set[str] = set()
+    # DRIVE_PLAYER=1 streams a tone to any client that has player@v1 activated.
+    drive_player = os.environ.get("DRIVE_PLAYER") == "1"
     managed: set[str] = set()
     reported_roles: dict[str, list[str]] = {}
     # DRIVE_MANAGEMENT=1 runs a management session once a client is on a long-term PSK.
@@ -291,6 +359,9 @@ async def main() -> None:
                 if cid not in sourced and "source@v1" in roles:
                     sourced.add(cid)
                     _drive_source(client, loop)
+                if drive_player and cid not in played and "player@v1" in roles:
+                    played.add(cid)
+                    loop.create_task(_drive_player(client, loop))
                 # Management needs a long-term PSK, which only exists after pairing — so
                 # this fires on the *reconnect*, not on the connection that paired.
                 if drive_management and cid not in managed and _is_paired(server, cid):

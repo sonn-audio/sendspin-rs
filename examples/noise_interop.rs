@@ -14,6 +14,7 @@
 //! cargo run --example noise_interop -- --full   # whole client, not just the handshake
 //! ```
 
+use base64::prelude::{Engine as _, BASE64_STANDARD};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use sendspin::noise::trust_store::{
@@ -74,6 +75,21 @@ struct Args {
     #[arg(long, default_value = "pcm")]
     codec: String,
 
+    /// Drive the `player@v1` role: take the stream the server pushes and decode it.
+    ///
+    /// The mirror of `--source`. What it proves that a loopback test cannot is that this
+    /// crate's decoders read what the reference's ffmpeg *encoders* write — the codec header,
+    /// the frame boundaries and the chunk timestamps included.
+    #[arg(long)]
+    player: bool,
+
+    /// Advertise only this codec to the server, so it has to encode in it.
+    ///
+    /// A player advertises what it can decode and the server picks; naming one is the only
+    /// way to make a run exercise a particular decoder rather than whatever was preferred.
+    #[arg(long)]
+    player_codec: Option<String>,
+
     /// Drive the `source@v1` role: pair, reconnect on the long-term PSK, then stream
     /// captured audio up to the server when it asks for it.
     ///
@@ -99,6 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("client_id : {}", identity.client_id());
     println!("suite     : {}", suite.as_wire_str());
 
+    if args.player {
+        return run_player_client(&args, identity, suite).await;
+    }
     if args.source {
         return run_source_client(&args, identity, suite).await;
     }
@@ -236,6 +255,236 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("INTEROP OK: {decrypted_count} encrypted message(s) decrypted from the reference server");
     } else {
         println!("handshake succeeded but no application message was decrypted");
+    }
+    Ok(())
+}
+
+/// Drive `player@v1` against the reference server.
+///
+/// The mirror image of the source check, and the more load-bearing direction: a player has to
+/// decode what someone else's encoder wrote. The reference re-encodes through ffmpeg, so a
+/// decoder that only agrees with this crate's own encoder — the thing a loopback test proves —
+/// fails here. Nothing is played: there is no sound card in a harness, and the audio device is
+/// not what is under test. What is under test is that every chunk decodes, that the frame
+/// count matches what the server says it pushed, and that the timestamps land in the future
+/// on the synchronized clock, which is what playback scheduling depends on.
+async fn run_player_client(
+    args: &Args,
+    identity: Identity,
+    suite: CipherSuite,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
+    use sendspin::protocol::messages::{AudioFormatSpec, Message, PlayerV1Support};
+    use sendspin::ProtocolClientBuilder;
+
+    let store = build_pairing_store(args)?;
+    clear_pin_file(args)?;
+
+    // A server picks from what the client advertises, so naming one codec is the only way to
+    // make a run exercise a particular decoder.
+    let formats = match args.player_codec.as_deref() {
+        Some(codec) => vec![AudioFormatSpec {
+            codec: codec.to_string(),
+            channels: 2,
+            sample_rate: 48_000,
+            bit_depth: 16,
+        }],
+        None => vec![
+            AudioFormatSpec {
+                codec: "opus".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+            AudioFormatSpec {
+                codec: "pcm".to_string(),
+                channels: 2,
+                sample_rate: 48_000,
+                bit_depth: 16,
+            },
+        ],
+    };
+    println!(
+        "codecs    : {}",
+        formats
+            .iter()
+            .map(|f| f.codec.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let client = ProtocolClientBuilder::builder()
+        .client_id(identity.client_id())
+        .name("Rust Interop Player".to_string())
+        .encryption(Encryption::Enabled(encryption_settings(
+            args, &identity, &store, suite,
+        )))
+        .player_v1_support(PlayerV1Support {
+            supported_formats: formats,
+            buffer_capacity: 50 * 1024 * 1024,
+            supported_commands: vec!["volume".to_string(), "mute".to_string()],
+        })
+        .build()
+        .connect(&args.server)
+        .await?;
+
+    let active = client.server_hello().active_roles.clone();
+    println!("  roles     : {active:?}");
+    if !active.iter().any(|r| r == "player@v1") {
+        println!("\nFAILED: server did not activate player@v1");
+        println!("        (start the server with TRUST_UNPAIRED_CLIENT_ID=<client_id>)");
+        return Ok(());
+    }
+
+    let conn = client.split();
+    let mut messages = conn.messages;
+    let mut audio = conn.audio;
+    let clock_sync = conn.clock_sync;
+    let _guard = conn.guard;
+
+    let mut decoder: Option<Box<dyn Decoder>> = None;
+    let mut channels = 0u8;
+    let mut sample_rate = 0u32;
+    let mut codec_name = String::new();
+    let mut chunks = 0usize;
+    let mut encoded_bytes = 0usize;
+    let mut frames = 0usize;
+    let mut saw_start = false;
+    let mut saw_end = false;
+    let mut min_lead_us = i64::MAX;
+    let mut late_chunks = 0usize;
+    let mut decode_failures = 0usize;
+
+    println!("\nreceiving for up to {}s...", args.listen_secs);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(args.listen_secs);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            msg = messages.recv() => {
+                let Some(msg) = msg else {
+                    println!("  message stream ended");
+                    break;
+                };
+                match msg {
+                    Message::StreamStart(start) => {
+                        let Some(player) = start.player else { continue };
+                        saw_start = true;
+                        codec_name = player.codec.clone();
+                        channels = player.channels;
+                        sample_rate = player.sample_rate;
+                        println!(
+                            "  <-- stream/start {} {}Hz {}ch {}bit (header {} b64 chars)",
+                            player.codec,
+                            player.sample_rate,
+                            player.channels,
+                            player.bit_depth,
+                            player.codec_header.as_ref().map_or(0, String::len),
+                        );
+                        // The header is base64 in the message and raw bytes to the decoder;
+                        // FLAC carries `fLaC` plus STREAMINFO here and cannot start without it.
+                        let header = match player.codec_header.as_deref() {
+                            Some(b64) => Some(BASE64_STANDARD.decode(b64)?),
+                            None => None,
+                        };
+                        decoder = match player.codec.as_str() {
+                            "pcm" => Some(Box::new(PcmDecoder::with_endian(
+                                player.bit_depth,
+                                PcmEndian::Little,
+                            ))),
+                            "opus" => Some(Box::new(OpusDecoder::new(
+                                player.sample_rate,
+                                player.channels,
+                            )?)),
+                            "flac" => Some(Box::new(match header.as_deref() {
+                                Some(header) => FlacDecoder::with_header(header)?,
+                                None => FlacDecoder::new(),
+                            })),
+                            other => {
+                                println!("\nFAILED: server chose codec '{other}', which this client never advertised");
+                                return Ok(());
+                            }
+                        };
+                    }
+                    Message::StreamEnd(_) => {
+                        saw_end = true;
+                        println!("  <-- stream/end after {chunks} chunks");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            chunk = audio.recv() => {
+                let Some(chunk) = chunk else { break };
+                let Some(decoder) = decoder.as_ref() else {
+                    // Audio before stream/start would mean the server started sending
+                    // without announcing a format, which is worth seeing rather than
+                    // silently buffering.
+                    println!("  chunk arrived before stream/start");
+                    continue;
+                };
+                chunks += 1;
+                encoded_bytes += chunk.data.len();
+
+                // Lead time: how far ahead of the synchronized clock this chunk is meant to
+                // play. A player schedules on this, so a non-positive value is a chunk that
+                // could never have been played on time.
+                // Two statements, not one expression: the guard from the first lock is still
+                // alive while an argument is evaluated, and this mutex is not reentrant.
+                let now_local = clock_sync.lock().clock().now_micros();
+                if let Some(now_server) = clock_sync.lock().client_to_server_micros(now_local) {
+                    let lead = chunk.timestamp - now_server;
+                    min_lead_us = min_lead_us.min(lead);
+                    if lead <= 0 {
+                        late_chunks += 1;
+                    }
+                }
+
+                match decoder.decode(&chunk.data) {
+                    Ok(samples) => frames += samples.len() / channels.max(1) as usize,
+                    Err(e) => {
+                        decode_failures += 1;
+                        if decode_failures == 1 {
+                            println!("  DECODE FAILED on chunk {chunks}: {e}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let decoded_seconds = if sample_rate > 0 {
+        frames as f64 / f64::from(sample_rate)
+    } else {
+        0.0
+    };
+    println!("\ncodec chosen    : {codec_name}");
+    println!("stream/start    : {saw_start}");
+    println!("stream/end      : {saw_end}");
+    println!("chunks received : {chunks} ({encoded_bytes} encoded bytes)");
+    println!("frames decoded  : {frames} ({decoded_seconds:.3}s at {sample_rate}Hz)");
+    println!("decode failures : {decode_failures}");
+    if min_lead_us == i64::MAX {
+        println!("min lead time   : n/a (clock never synchronized)");
+    } else {
+        println!(
+            "min lead time   : {:.1}ms ({late_chunks} chunk(s) already due on arrival)",
+            min_lead_us as f64 / 1000.0
+        );
+    }
+
+    println!();
+    if saw_start && frames > 0 && decode_failures == 0 {
+        println!("PLAYER INTEROP OK: the reference's encoder was decoded end to end");
+        println!("  compare `frames decoded` against the server's PLAYER_PUSHED frames");
+    } else if decode_failures > 0 {
+        println!("FAILED: {decode_failures} chunk(s) would not decode");
+    } else if saw_start {
+        println!("FAILED: stream started but nothing decoded");
+    } else {
+        println!("FAILED: server never started a stream");
     }
     Ok(())
 }

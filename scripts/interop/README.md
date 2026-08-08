@@ -53,6 +53,48 @@ cargo run --example noise_interop -- --full --seed 9 --listen-secs 15 \
 `TRUST_UNPAIRED_CLIENT_ID=<client_id>` instead admits one unpaired client to playback, so a
 Sentinel-keyed connection gets roles activated rather than merely tolerated.
 
+## Driving `player@v1`
+
+`DRIVE_PLAYER=1` streams a tone to any client that has `player@v1` activated, and `--player`
+takes it and decodes it. This is the mirror of `--source`, and the more load-bearing
+direction: a player has to decode what *someone else's* encoder wrote. The reference encodes
+through ffmpeg, so a decoder that only agrees with this crate's own encoder — which is all a
+loopback test can show — fails right here.
+
+```bash
+DRIVE_PLAYER=1 TRUST_UNPAIRED_CLIENT_ID=<client_id> \
+    PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_server.py 9001
+cargo run --example noise_interop -- --player --seed 9 --player-codec pcm \
+    --listen-secs 12 --server ws://127.0.0.1:9001/sendspin
+```
+
+Nothing is played: there is no sound card in a harness, and the output device is not what is
+under test. What is under test is that every chunk decodes, that the frame count matches what
+the server says it pushed, and that the timestamps land in the *future* on the synchronized
+clock — which is what playback scheduling runs on, and the one thing a decode-only test would
+still miss.
+
+`--player-codec` picks what the client advertises, because the server chooses from that list;
+without it there is no way to make a run exercise a particular decoder. `PLAYER_SECONDS`
+(default 3) sets how much is pushed.
+
+| codec | pushed | chunks | encoded bytes | frames decoded |
+| --- | --- | --- | --- | --- |
+| `pcm` | 144000 frames | 120 | 576000 | 144000 |
+| `opus` | 144000 frames | 150 | 44566 | 144000 |
+| `flac` | 144000 frames | 31 | 39569 | 142848 |
+
+PCM and Opus decode to the frame. FLAC is 1152 frames short, and that is the server's
+choice rather than a decoding fault: 31 chunks of 4608 frames is 142848, so every byte that
+arrived decoded completely, and `PushStream.stop()` states plainly that it "reset transformers
+so any internal encoder state is discarded" — the partial block the encoder was still filling
+is dropped rather than flushed. It is the mirror image of the trap on the source side, where
+*this* client has to flush its encoder before `client_stream/end` or lose the same tail.
+
+A pass prints `PLAYER INTEROP OK` on the client and `PLAYER_INTEROP_OK` on the server; compare
+the client's `frames decoded` against the server's `PLAYER_PUSHED frames`. Lead times run
+around 410-435 ms with no chunk already due on arrival.
+
 ## Driving `source@v1`
 
 `--source` runs the flow a real source runs, because the role is pairing-gated: a server
@@ -176,6 +218,10 @@ observed rather than assumed.
 
 Static-PIN pairing completes end to end, so the CPace exchange, the confirmation ordering
 and the PSK wrapping have all spoken rather than only passing their own tests.
+
+`player@v1` runs end to end on all three codecs, which is the direction that matters most for
+this crate: the decoders read what the reference's ffmpeg encoders write, not merely what its
+own encoders write.
 
 Dynamic-PIN pairing completes end to end on both suites, which covers the sequencing the
 derivation tests could not: `server/pair-init` arriving where this client expects it, the
