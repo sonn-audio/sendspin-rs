@@ -306,6 +306,17 @@ async fn handle_pairing_activation(
             }
             Some(record)
         }
+        PairingAction::PinFlow(method) => {
+            // The flow itself is implemented and tested in `noise::pin_flow`, but driving it
+            // needs what this router does not yet carry: the Noise handshake hash the PAKE
+            // binds to, a pairing-index counter, and a multi-message attempt held across
+            // several inbound messages. Until that lands, declining by the spec's own route
+            // is the honest answer — it leaves the connection open so the server can offer
+            // another method, rather than starting an exchange this side cannot finish.
+            log::warn!("{method:?} is implemented but not yet driven from the router");
+            let _ = send_abort(out_tx, PairAbortReason::MethodNotSupported).await;
+            None
+        }
         PairingAction::Abort(reason) => {
             log::warn!("Declining pairing: {reason:?}");
             let _ = send_abort(out_tx, reason).await;

@@ -33,6 +33,42 @@ pub fn b64_decode(text: &str) -> Result<[u8; KEY_LEN], Error> {
         .map_err(|_| Error::Protocol("base64url value did not decode to 32 bytes".to_string()))
 }
 
+/// Encode a fixed-size value as base64url with no padding.
+///
+/// The generalisation of [`b64_encode`] for the pairing fields, which carry 32-byte nonces
+/// and shares as well as 64-byte confirmation tags.
+pub fn b64_encode_bytes<const N: usize>(bytes: &[u8; N]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Decode base64url into exactly `N` bytes.
+///
+/// The length is part of the check rather than a later assertion: a pairing field of the
+/// wrong width is a protocol error, and finding that out here keeps every caller from
+/// having to re-check it.
+pub fn b64_decode_bytes<const N: usize>(text: &str) -> Result<[u8; N], Error> {
+    let raw = URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|e| Error::Protocol(format!("invalid base64url: {e}")))?;
+    raw.try_into()
+        .map_err(|_| Error::Protocol(format!("base64url value did not decode to {N} bytes")))
+}
+
+/// Encode a variable-length value as base64url with no padding.
+///
+/// For the one pairing field whose length is not fixed by a key size: the 48-byte
+/// ciphertext-plus-tag of a wrapped PSK.
+pub fn b64_encode_slice(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Decode base64url into a variable-length value.
+pub fn b64_decode_slice(text: &str) -> Result<Vec<u8>, Error> {
+    URL_SAFE_NO_PAD
+        .decode(text)
+        .map_err(|e| Error::Protocol(format!("invalid base64url: {e}")))
+}
+
 /// Which kind of PSK matched a handshake, and therefore what the session may be used for.
 ///
 /// The three categories share one `psk_id` namespace precisely so a matched id maps to

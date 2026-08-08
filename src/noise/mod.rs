@@ -51,6 +51,8 @@ pub mod models;
 pub mod pairing;
 /// The Sendspin bindings around CPace: session id, PIN derivation, PSK wrapping.
 pub mod pin;
+/// The static and dynamic PIN pairing flows.
+pub mod pin_flow;
 /// The in-band re-handshake.
 pub mod rehandshake;
 /// The KKpsk2 session: handshake and transport.

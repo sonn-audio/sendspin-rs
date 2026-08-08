@@ -35,6 +35,35 @@ pub enum Message {
     #[serde(rename = "pair/abort")]
     PairAbort(crate::noise::pairing::PairAbort),
 
+    // === PIN pairing ===
+    /// The attempt is gesture-gated and no pairing window is open yet.
+    #[serde(rename = "client/pair-pending")]
+    ClientPairPending(crate::noise::pin_flow::ClientPairPending),
+
+    /// Starts a PIN pairing attempt, with the nonce commitment in the dynamic flow.
+    #[serde(rename = "client/pair-init")]
+    ClientPairInit(crate::noise::pin_flow::ClientPairInit),
+
+    /// The server's nonce contribution. Dynamic PIN only.
+    #[serde(rename = "server/pair-init")]
+    ServerPairInit(crate::noise::pin_flow::ServerPairInit),
+
+    /// The server's CPace public share.
+    #[serde(rename = "server/pair-auth")]
+    ServerPairAuth(crate::noise::pin_flow::ServerPairAuth),
+
+    /// The client's CPace public share.
+    #[serde(rename = "client/pair-auth")]
+    ClientPairAuth(crate::noise::pin_flow::ClientPairAuth),
+
+    /// The server's key-confirmation tag.
+    #[serde(rename = "server/pair-confirm")]
+    ServerPairConfirm(crate::noise::pin_flow::ServerPairConfirm),
+
+    /// The client's key-confirmation tag, and the commitment's opening.
+    #[serde(rename = "client/pair-confirm")]
+    ClientPairConfirm(crate::noise::pin_flow::ClientPairConfirm),
+
     /// Server hello handshake response
     #[serde(rename = "server/hello")]
     ServerHello(ServerHello),

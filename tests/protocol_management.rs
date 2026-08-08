@@ -21,6 +21,7 @@ fn store() -> Arc<dyn PairingStore> {
         pairing_psk: Some([7u8; 32]),
         unpaired_access: false,
         record_mode_psk_id: None,
+        ..PairingConfig::disabled()
     }))
 }
 
@@ -196,6 +197,7 @@ fn a_record_the_record_mode_points_at_cannot_be_removed() {
         pairing_psk: Some(key(7)),
         unpaired_access: false,
         record_mode_psk_id: Some(psk_id.clone()),
+        ..PairingConfig::disabled()
     }));
     store.add_record(shared).unwrap();
 
@@ -452,6 +454,7 @@ fn bounded() -> Arc<dyn PairingStore> {
             pairing_psk: Some(key(7)),
             unpaired_access: false,
             record_mode_psk_id: None,
+            ..PairingConfig::disabled()
         },
     )))
 }

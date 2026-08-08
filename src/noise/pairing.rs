@@ -93,6 +93,12 @@ pub enum PairingAction {
         /// The record to persist once the server acknowledges — not before.
         record: PairingRecord,
     },
+    /// Run a PIN pairing attempt for this method.
+    ///
+    /// The caller builds a [`PinPairing`](super::pin_flow::PinPairing) and drives it: this
+    /// planner decides *whether* the attempt may start, and the flow decides what happens
+    /// inside it.
+    PinFlow(PairMethod),
     /// Abort with this reason. `closes_connection` says whether to hang up afterwards.
     Abort(PairAbortReason),
 }
@@ -113,10 +119,24 @@ pub fn plan_pairing(
     server_id: &str,
     store: &dyn PairingStore,
 ) -> Result<PairingAction, Error> {
+    // The PIN flows key their PAKE off the connection rather than off a stored PSK, so they
+    // are the one case where a Sentinel-keyed connection is the *expected* state: pairing
+    // from scratch is exactly what they are for.
+    if matches!(method, PairMethod::StaticPin | PairMethod::DynamicPin) {
+        let config = store.pairing_config()?;
+        let offered = match method {
+            PairMethod::StaticPin => config.static_pin.is_some(),
+            _ => config.dynamic_pin_enabled,
+        };
+        return Ok(if offered {
+            PairingAction::PinFlow(method)
+        } else {
+            // Disabled since the hello advertised it. Declining by the spec's own route
+            // leaves the connection open, so the server may offer another method.
+            PairingAction::Abort(PairAbortReason::MethodNotSupported)
+        });
+    }
     if method != PairMethod::PairingPsk {
-        // The PIN flows need a PAKE this build does not implement yet. Declining by the
-        // spec's own route leaves the connection open, so the server may offer another
-        // method rather than being dropped.
         return Ok(PairingAction::Abort(PairAbortReason::MethodNotSupported));
     }
     if matched != PskCategory::Pairing {
@@ -216,20 +236,54 @@ mod tests {
         ));
     }
 
+    /// A PIN method the client offers routes into its flow, whatever keyed the connection.
+    ///
+    /// This is the one case where a Sentinel-keyed connection is the *expected* state: the
+    /// PIN flows key their PAKE off the connection rather than off a stored PSK, so pairing
+    /// from scratch is exactly what they are for.
     #[test]
-    fn the_pin_methods_are_declined_without_dropping_the_connection() {
+    fn an_offered_pin_method_routes_into_its_flow() {
         let store = InMemoryPairingStore::new().unwrap();
-        for method in [PairMethod::DynamicPin, PairMethod::StaticPin] {
-            let action = plan_pairing(method, PskCategory::Pairing, "s", &store).unwrap();
-            let PairingAction::Abort(reason) = action else {
-                panic!("expected an abort for {method:?}");
-            };
-            assert_eq!(reason, PairAbortReason::MethodNotSupported);
+        for matched in [PskCategory::Sentinel, PskCategory::Pairing] {
+            let action = plan_pairing(PairMethod::DynamicPin, matched, "s", &store).unwrap();
             assert!(
-                !reason.closes_connection(),
-                "declining a method must leave the connection open"
+                matches!(action, PairingAction::PinFlow(PairMethod::DynamicPin)),
+                "got {action:?} for {matched:?}"
             );
         }
+    }
+
+    /// A PIN method the client does not offer is declined, and the connection lives.
+    ///
+    /// The default configuration has no static PIN: it is factory-provisioned per device,
+    /// and there is nothing this crate could invent that would not be a shared default.
+    #[test]
+    fn an_unoffered_pin_method_is_declined_without_dropping_the_connection() {
+        let store = InMemoryPairingStore::new().unwrap();
+        let action =
+            plan_pairing(PairMethod::StaticPin, PskCategory::Pairing, "s", &store).unwrap();
+        let PairingAction::Abort(reason) = action else {
+            panic!("expected an abort, got {action:?}");
+        };
+        assert_eq!(reason, PairAbortReason::MethodNotSupported);
+        assert!(
+            !reason.closes_connection(),
+            "declining a method must leave the connection open"
+        );
+    }
+
+    #[test]
+    fn a_configured_static_pin_makes_the_method_offerable() {
+        let store = InMemoryPairingStore::with_config(PairingConfig {
+            static_pin: Some("12345678".to_string()),
+            ..PairingConfig::disabled()
+        });
+        let action =
+            plan_pairing(PairMethod::StaticPin, PskCategory::Sentinel, "s", &store).unwrap();
+        assert!(matches!(
+            action,
+            PairingAction::PinFlow(PairMethod::StaticPin)
+        ));
     }
 
     #[test]

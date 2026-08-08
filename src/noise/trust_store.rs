@@ -100,6 +100,22 @@ pub struct PairingConfig {
     pub pairing_psk: Option<[u8; KEY_LEN]>,
     /// Whether the client admits a server with no pairing record.
     pub unpaired_access: bool,
+    /// The configured static PIN: exactly eight decimal digits, or `None` when the method
+    /// is not offered.
+    ///
+    /// Per-device and randomly generated at the factory. A fixed default shared across
+    /// devices would let anyone pair with any of them, which is why this has no default
+    /// value and no way to acquire one by accident.
+    pub static_pin: Option<String>,
+    /// Whether the dynamic-PIN method is offered.
+    pub dynamic_pin_enabled: bool,
+    /// The shortest dynamic PIN this client accepts, in digits.
+    pub dynamic_pin_min_length: u8,
+    /// Consecutive dynamic-PIN verification failures, persisted across reboots.
+    ///
+    /// Not partitioned by server or source address: an attacker who can open connections
+    /// from anywhere would otherwise get a fresh budget per origin.
+    pub dynamic_pin_failures: u32,
     /// The shared-PSK record pairing falls back to when record storage is full.
     ///
     /// The spec requires this to name a *shared-PSK* record and to be pre-provisioned with a
@@ -122,6 +138,10 @@ impl PairingConfig {
         Ok(Self {
             pairing_psk: Some(random_psk()?),
             unpaired_access: false,
+            static_pin: None,
+            dynamic_pin_enabled: true,
+            dynamic_pin_min_length: 6,
+            dynamic_pin_failures: 0,
             record_mode_psk_id: None,
         })
     }
@@ -131,6 +151,10 @@ impl PairingConfig {
         Self {
             pairing_psk: None,
             unpaired_access: false,
+            static_pin: None,
+            dynamic_pin_enabled: false,
+            dynamic_pin_min_length: 6,
+            dynamic_pin_failures: 0,
             record_mode_psk_id: None,
         }
     }
@@ -386,6 +410,7 @@ mod tests {
             pairing_psk: Some(key),
             unpaired_access: false,
             record_mode_psk_id: None,
+            ..PairingConfig::disabled()
         });
         let candidates = handshake_candidates(&store).unwrap();
         let pairing = candidates
@@ -476,6 +501,7 @@ mod tests {
             pairing_psk: Some([0xABu8; KEY_LEN]),
             unpaired_access: true,
             record_mode_psk_id: None,
+            ..PairingConfig::disabled()
         };
         let rendered = format!("{:?}", PairingConfigRedacted(&config));
         assert!(rendered.contains("pairing_psk_enabled: true"));
