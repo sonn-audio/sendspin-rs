@@ -59,11 +59,18 @@ reaching it means both sides derived the same transport keys from the same prolo
 identically, agreed on the hello sequence, and exchanged enough clock samples for the filter
 to settle. Both cipher suites pass.
 
-The server activates no roles, deliberately — it has none to serve yet — so the client is
-told the truth rather than granted `player@v1` and then left waiting for audio.
+`--tone-secs N` on the server plays a 440 Hz tone to any client that activates `player@v1`,
+and `PLAY_SECONDS=N` on the client keeps the connection open long enough to count it. A
+three-second tone arrives as 150 chunks / 576000 bytes on both suites, paced over three
+seconds rather than dumped in one go.
 
-Two defects came out of the first run, neither of which a loopback test would have reached
-because nothing in this crate had ever *parsed* these:
+The client has to enable unpaired access for any of that: this server cannot pair yet, so
+every connection is Sentinel-keyed, and a client whose `unpaired_access` is off answers
+`goodbye(pairing_required)` to an activation carrying roles. The harness turns it on, which is
+the operator decision a real device makes once.
+
+Four defects came out of these runs. The first two are ones no loopback test would have
+reached, because nothing in this crate had ever *parsed* them:
 
 1. **`server/hello` went out with no envelope.** It is the one message whose payload shape
    depends on the transport rather than on its `type`, so it is not a `Message` variant and
@@ -73,6 +80,16 @@ because nothing in this crate had ever *parsed* these:
    authenticated it, which is a far stronger claim than a self-declared field. This crate
    still sends them — a known transition-mode divergence — but requiring them on receive
    turns away every client that reads the current spec. Both are optional now.
+3. **The server activated roles for a client that had said not to.** `unpaired_access` in
+   `client/hello` is the client stating whether it may be used without a pairing, and this
+   connection is keyed by the Sentinel PSK — the key every client holds, which authenticates
+   nobody. The reference client answered `goodbye(pairing_required)`, and it was right to.
+4. **The stream's timeline never advanced**, so three seconds of audio went out in one burst.
+   The position was recomputed as `start + micros(frames_sent)` with `start` *derived* from the
+   previous position and the frame count that had just changed, which cancels out exactly. The
+   server crate's own unit test pinned this and caught it the moment it was run; the interop
+   run showed the same thing from the outside, as a stream that finished in the second it
+   started.
 
 ## Driving a real pairing
 

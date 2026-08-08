@@ -19,16 +19,28 @@ Early, and honest about it.
 
 **Working:** the WebSocket upgrade; the encrypted `KKpsk2` handshake with this side as the
 Noise *initiator* (the spec is explicit about that, and it is the thing most likely to be
-assumed backwards); `server/hello` → `client/hello` → `server/activate`; and `client/time`
-answered so a client's clock filter converges.
+assumed backwards); `server/hello` → `client/hello` → `server/activate`; `client/time`
+answered so a client's clock filter converges; role negotiation; and `player@v1` fed with
+paced PCM on the server's own timeline.
 
 Validated against `aiosendspin`'s own client rather than only against this project's — see
-[`scripts/interop`](../scripts/interop). A real reference client connects, handshakes and
-reaches `is_time_synchronized()` on both cipher suites.
+[`scripts/interop`](../scripts/interop). A real reference client connects, handshakes, reaches
+`is_time_synchronized()`, and receives 150 chunks / 576000 bytes of a three-second tone on both
+cipher suites, paced over three seconds rather than dumped.
 
-**Not yet:** roles, audio, groups, pairing, management. The server activates no roles at all,
-which is a decision rather than an omission: a client granted `player@v1` and then never sent
-audio looks broken, while one told it has no active roles is being told the truth.
+**Not yet:** groups, pairing, management, transcoding, resampling, and every role but
+`player@v1`. Three limits worth stating plainly rather than discovering:
+
+- **One player at a time.** `AudioSource` is pulled per connection, so two clients would get
+  *different* audio — the opposite of what multi-room means. Real synchronized playback needs
+  the group model, where one timeline is shared and every player is handed the same chunks at
+  the same timestamps. That is the next substantial piece.
+- **PCM only.** The client's advertised formats are not honoured yet; a client that cannot
+  decode PCM 16-bit will not get something it can.
+- **No pairing**, so every connection is keyed by the Sentinel PSK. A client whose
+  `unpaired_access` is off is correctly given no roles at all — that field is the client
+  telling the server up front whether it may be used without a pairing, and the reference
+  client answers `goodbye(pairing_required)` if it is ignored.
 
 ## Running it
 

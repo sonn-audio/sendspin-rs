@@ -17,12 +17,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::handshake::ServerHandshake;
+use crate::stream::{PlayerStream, DEFAULT_SEND_AHEAD_US};
 use crate::ServerConfig;
 use sendspin::error::Error;
 use sendspin::noise::constants::MSG_TYPE_JSON_BODY;
 use sendspin::noise::keys::Psk;
 use sendspin::noise::wire::{frame, Reassembler};
-use sendspin::protocol::messages::{Message, ServerActivate, ServerHelloEncrypted, ServerTime};
+use sendspin::protocol::messages::{
+    Activity, Message, ServerActivate, ServerHelloEncrypted, ServerTime, StreamEnd,
+};
 
 /// What one connection learned about its client.
 pub struct ConnectionSummary {
@@ -34,6 +37,8 @@ pub struct ConnectionSummary {
     pub active_roles: Vec<String>,
     /// How many clock exchanges were answered before it ended.
     pub time_syncs: u64,
+    /// How many audio chunks were pushed to it.
+    pub chunks_sent: u64,
 }
 
 /// Serve one accepted TCP stream until the client goes away.
@@ -102,28 +107,135 @@ pub async fn serve(
         hello.supported_roles
     );
 
-    // No roles yet: this server can hold a connection open and keep a clock, and saying so
-    // honestly is better than activating a role it cannot serve. A client that is granted
-    // `player@v1` and then never sent audio looks broken in a way this does not.
-    let active_roles: Vec<String> = Vec::new();
+    // A client's `unpaired_access` is it telling the server up front whether it may be used
+    // without a pairing, and this connection is Sentinel-keyed — the key every client holds,
+    // which authenticates nobody. Activating roles anyway is asking for authority the client
+    // has already declined: the reference client answers `goodbye(pairing_required)`, and it
+    // is right to. Pairing is what lifts this, and it is not implemented here yet.
+    let unpaired_ok = hello.unpaired_access.enabled;
+    if !unpaired_ok {
+        log::info!("{client_id} does not admit unpaired access, so no roles are activated for it");
+    }
+
+    // Only what this server actually implements, and only what the client offered. Activating
+    // a role is a promise to serve it.
+    let active_roles = if unpaired_ok {
+        crate::roles::negotiate(&hello.supported_roles)
+    } else {
+        Vec::new()
+    };
+    let will_play = config.audio.is_some() && active_roles.iter().any(|r| r == "player@v1");
     send_json(
         &mut ws,
         &mut done.session,
         &Message::ServerActivate(ServerActivate {
-            // Empty rather than invented: `activities` names what is actually going on, and
-            // this server is neither playing, pairing nor managing. The reference server
-            // sends an empty list on an idle connection too.
-            activities: Vec::new(),
+            // `activities` names what is actually going on. Playback only when there is audio
+            // to play and someone activated to hear it; empty otherwise, which is what the
+            // reference server sends on an idle connection.
+            activities: if will_play {
+                vec![Activity::Playback]
+            } else {
+                Vec::new()
+            },
             active_roles: Some(active_roles.clone()),
             pairing: None,
             selected_pair_method: None,
         }),
     )
     .await?;
+    log::info!("{client_id} activated with {active_roles:?}");
 
     // --- steady state --------------------------------------------------------------------
     let mut time_syncs = 0u64;
-    while let Some(message) = next_encrypted(&mut ws, &mut done.session, &mut reassembler).await? {
+    let mut player: Option<PlayerStream> = None;
+    let mut chunks_sent = 0u64;
+
+    if will_play {
+        let source = config.audio.as_ref().expect("checked by will_play");
+        // The first sample plays one send-ahead from now, so the client has the whole lead to
+        // receive, decode and schedule it rather than being handed audio that is already due.
+        let start = config.clock.now_micros() + DEFAULT_SEND_AHEAD_US;
+        let stream = PlayerStream::new(source.format(), start);
+        send_json(
+            &mut ws,
+            &mut done.session,
+            &Message::StreamStart(stream.stream_start(config.clock.now_micros())),
+        )
+        .await?;
+        log::info!(
+            "{client_id} stream starting: {} {}Hz {}ch {}bit",
+            stream.format().codec,
+            stream.format().sample_rate,
+            stream.format().channels,
+            stream.format().bit_depth
+        );
+        player = Some(stream);
+    }
+
+    // 20 ms of audio per chunk, which is what the reference implementation sends and small
+    // enough that a stop is not heard long after it was asked for.
+    const CHUNK_MS: u32 = 20;
+
+    loop {
+        // Sending is driven by the timeline rather than by a timer: the stream says when it is
+        // behind its lead, and the wait is only ever long enough to get back to that point.
+        let sleep_until = match (&player, &config.audio) {
+            (Some(stream), Some(_)) => {
+                let now = config.clock.now_micros();
+                if stream.should_send(now, DEFAULT_SEND_AHEAD_US) {
+                    None
+                } else {
+                    Some(std::time::Duration::from_micros(
+                        (stream.next_timestamp_us() - now - DEFAULT_SEND_AHEAD_US).max(0) as u64,
+                    ))
+                }
+            }
+            _ => None,
+        };
+
+        if let (Some(stream), Some(source)) = (player.as_mut(), config.audio.as_ref()) {
+            if sleep_until.is_none() {
+                let frames = (stream.format().sample_rate * CHUNK_MS / 1000) as usize;
+                match source.next_chunk(frames) {
+                    Some(pcm) => match stream.chunk(&pcm) {
+                        Some(framed) => {
+                            send_binary(&mut ws, &mut done.session, &framed).await?;
+                            chunks_sent += 1;
+                        }
+                        None => {
+                            log::error!("{client_id}: the source produced a partial frame");
+                            player = None;
+                        }
+                    },
+                    None => {
+                        log::info!("{client_id} stream ended after {chunks_sent} chunks");
+                        send_json(
+                            &mut ws,
+                            &mut done.session,
+                            &Message::StreamEnd(StreamEnd {
+                                roles: None,
+                                server_transmitted: Some(config.clock.now_micros()),
+                            }),
+                        )
+                        .await?;
+                        player = None;
+                    }
+                }
+                continue;
+            }
+        }
+
+        let message = match sleep_until {
+            // Racing the read against the next send keeps both responsive: a client's message
+            // is answered while audio is pending, and audio does not wait on a quiet client.
+            Some(wait) => tokio::select! {
+                incoming = next_encrypted(&mut ws, &mut done.session, &mut reassembler) => incoming?,
+                () = tokio::time::sleep(wait) => continue,
+            },
+            None => next_encrypted(&mut ws, &mut done.session, &mut reassembler).await?,
+        };
+        let Some(message) = message else { break };
+
         match message {
             Message::ClientTime(request) => {
                 // Both stamps come off this server's own monotonic clock, and the reply goes
@@ -153,6 +265,7 @@ pub async fn serve(
         name,
         active_roles,
         time_syncs,
+        chunks_sent,
     })
 }
 
@@ -203,6 +316,26 @@ async fn send_json<T: serde::Serialize>(
     let json = serde_json::to_vec(message)
         .map_err(|e| Error::Protocol(format!("could not encode a message: {e}")))?;
     for plaintext in frame(MSG_TYPE_JSON_BODY, &json)? {
+        let ciphertext = session.encrypt(&plaintext)?;
+        ws.send(WsMessage::binary(ciphertext))
+            .await
+            .map_err(|e| Error::Connection(format!("WebSocket write failed: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Encrypt, frame and send one binary message, already carrying its own type byte.
+async fn send_binary(
+    ws: &mut WebSocketStream<TcpStream>,
+    session: &mut sendspin::noise::session::NoiseSession,
+    body: &[u8],
+) -> Result<(), Error> {
+    // The audio frame's own type byte is the *inner* one, inside the framing layer's envelope;
+    // the two are separate headers and collapsing them sends a chunk no client can read.
+    let (msg_type, payload) = body.split_first().ok_or_else(|| {
+        Error::Protocol("a binary message needs at least a type byte".to_string())
+    })?;
+    for plaintext in frame(*msg_type, payload)? {
         let ciphertext = session.encrypt(&plaintext)?;
         ws.send(WsMessage::binary(ciphertext))
             .await

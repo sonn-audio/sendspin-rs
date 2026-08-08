@@ -16,16 +16,16 @@
 //!
 //! # What works
 //!
-//! Enough to bring a real client up and keep it there: the WebSocket upgrade, the encrypted
-//! `KKpsk2` handshake with this side as the Noise initiator, `server/hello` →
-//! `client/hello` → `server/activate`, and `client/time` answered so the client's filter can
-//! converge.
+//! Enough to bring a real client up, keep it there and play to it: the WebSocket upgrade, the
+//! encrypted `KKpsk2` handshake with this side as the Noise initiator, `server/hello` →
+//! `client/hello` → `server/activate`, `client/time` answered so the client's filter can
+//! converge, and `player@v1` fed with paced PCM on the server's own timeline.
 //!
 //! # What does not
 //!
-//! Roles, audio, groups and pairing. This activates no roles at all, deliberately: a client
-//! granted `player@v1` that is then never sent audio looks broken, while one told it has no
-//! active roles is being told the truth.
+//! Groups, pairing, management, and every role but `player@v1`. A role this server does not
+//! serve is not activated even when a client offers it: activating one is a promise, and a
+//! client granted a role that is then never served looks broken from the outside.
 //!
 //! ```no_run
 //! # #[tokio::main]
@@ -47,8 +47,24 @@ use sendspin::error::Error;
 use sendspin::noise::keys::Identity;
 use sendspin::sync::raw_clock::{Clock, DefaultClock};
 
+/// Where a server's audio comes from.
+///
+/// Deliberately a trait rather than a queue: what a server plays is its own business — a file,
+/// a capture device, a mixer, a test tone — and the only thing this crate needs is PCM in a
+/// stated format, on demand. Pull rather than push, so the pacing stays with the stream that
+/// knows the timeline rather than with whatever is producing samples.
+pub trait AudioSource: Send + Sync {
+    /// The format the PCM is in. Fixed for the life of the source.
+    fn format(&self) -> sendspin::protocol::messages::StreamPlayerConfig;
+
+    /// Fill `frames` worth of PCM, or return `None` when the source is finished.
+    fn next_chunk(&self, frames: usize) -> Option<Vec<u8>>;
+}
+
 pub mod connection;
 pub mod handshake;
+pub mod roles;
+pub mod stream;
 
 /// What a server is: an identity, a name, and a clock.
 pub struct ServerConfig {
@@ -59,6 +75,11 @@ pub struct ServerConfig {
     pub identity: Identity,
     /// The friendly name sent in `server/hello`.
     pub name: String,
+    /// Where the audio comes from, when there is any.
+    ///
+    /// `None` serves connections without ever starting a stream, which is what the interop
+    /// check for the handshake wants. A real server has a pipeline behind this.
+    pub audio: Option<Arc<dyn AudioSource>>,
     /// The timebase the clock replies are stamped from.
     ///
     /// Must be monotonic and not NTP-conditioned: a clock that steps backwards puts a step
@@ -72,8 +93,16 @@ impl ServerConfig {
         Self {
             identity,
             name,
+            audio: None,
             clock: Arc::new(DefaultClock::new()),
         }
+    }
+
+    /// The same config, playing `source` to every player that connects.
+    #[must_use]
+    pub fn with_audio(mut self, source: Arc<dyn AudioSource>) -> Self {
+        self.audio = Some(source);
+        self
     }
 
     /// This server's `server_id`, as clients see it.

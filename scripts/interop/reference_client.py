@@ -19,9 +19,12 @@ import os
 import sys
 
 from aiosendspin.client.client import SendspinClient
-from aiosendspin.models.types import Roles
+from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+from aiosendspin.models.types import AudioCodec, PlayerCommand, Roles
 from aiosendspin.noise import Identity
 from aiosendspin.noise.session import NoiseCipherSuite
+from dataclasses import replace
+
 from aiosendspin.noise.trust_store import InMemoryClientPairingStore
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8927/sendspin"
@@ -47,15 +50,53 @@ async def main() -> int:
         stream=sys.stderr,
     )
 
-    # The metadata role on purpose: it needs no support object, so this checks the connection
-    # rather than the negotiation of a role the server does not implement yet.
+    # The player role, so the run covers negotiation and the stream rather than only the
+    # connection. PCM 16-bit is what the Rust server sends today; a client that advertised
+    # something else would be testing the server's transcoding, which does not exist yet.
+    # Unpaired access on, or the client refuses an activation from a Sentinel-keyed server with
+    # `goodbye(pairing_required)` — correctly, since that key authenticates nobody. Turning it
+    # on here is the operator decision a real device makes once, and it is what lets this run
+    # reach the stream at all before the server can pair.
+    store = InMemoryClientPairingStore()
+    await store.store_pairing_config(
+        replace(await store.get_pairing_config(), unpaired_access_enabled=True)
+    )
+
     client = SendspinClient(
         Identity.generate(),
         "aiosendspin Interop",
-        [Roles.METADATA],
-        pairing_store=InMemoryClientPairingStore(),
+        [Roles.PLAYER],
+        pairing_store=store,
         cipher_suite=SUITE,
+        player_support=ClientHelloPlayerSupport(
+            supported_formats=[
+                SupportedAudioFormat(
+                    codec=AudioCodec.PCM, channels=2, sample_rate=48000, bit_depth=16
+                )
+            ],
+            buffer_capacity=50 * 1024 * 1024,
+            supported_commands=[PlayerCommand.VOLUME, PlayerCommand.MUTE],
+        ),
     )
+
+    # Counted rather than played: there is no sound card in a harness, and what is under test
+    # is that the chunks arrive and parse at all.
+    #
+    # Lead time is deliberately *not* reported here. The reference client exposes no
+    # server-clock reading on its public surface, and a number this script cannot measure is
+    # worse than one it does not print — the Rust client's own `--player` harness measures it
+    # from the other side, where the clock is reachable.
+    stats = {"chunks": 0, "bytes": 0}
+
+    def on_stream_start(message: object) -> None:
+        print(f"STREAM_START={message.payload.player}", flush=True)
+
+    def on_chunk(_timestamp_us: int, data: bytes, _fmt: object) -> None:
+        stats["chunks"] += 1
+        stats["bytes"] += len(data)
+
+    client.add_stream_start_listener(on_stream_start)
+    client.add_audio_chunk_listener(on_chunk)
     print(f"SUITE={SUITE.value}", flush=True)
     print(f"CONNECTING={URL}", flush=True)
     try:
@@ -78,14 +119,27 @@ async def main() -> int:
     while asyncio.get_running_loop().time() < deadline:
         if client.is_time_synchronized():
             print("TIME_SYNCHRONIZED", flush=True)
-            print("CLIENT_INTEROP_OK", flush=True)
-            await client.disconnect()
-            return 0
+            break
         await asyncio.sleep(0.1)
+    else:
+        print(f"NOT_SYNCHRONIZED within {SYNC_TIMEOUT}s", flush=True)
+        await client.disconnect()
+        return 1
 
-    print(f"NOT_SYNCHRONIZED within {SYNC_TIMEOUT}s", flush=True)
+    # PLAY_SECONDS>0 keeps the connection open so a stream can be received and counted.
+    play_seconds = float(os.environ.get("PLAY_SECONDS", "0"))
+    if play_seconds > 0:
+        await asyncio.sleep(play_seconds)
+        print(f"AUDIO chunks={stats['chunks']} bytes={stats['bytes']}", flush=True)
+        if stats["chunks"] == 0:
+            print("NO_AUDIO", flush=True)
+            await client.disconnect()
+            return 1
+
+    print("CLIENT_INTEROP_OK", flush=True)
     await client.disconnect()
-    return 1
+    return 0
+
 
 
 if __name__ == "__main__":
