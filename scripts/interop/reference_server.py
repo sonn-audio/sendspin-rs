@@ -206,6 +206,14 @@ async def main() -> None:
     print(f"URL=ws://127.0.0.1:{PORT}/sendspin", flush=True)
     print("READY", flush=True)
 
+    # PAIR_PIN=<client_id>:<pin> drives a static-PIN pairing instead, which runs the whole
+    # CPace exchange rather than handing a key over on an already-authenticated channel.
+    pin_spec = os.environ.get("PAIR_PIN")
+    pin_client, static_pin = (None, None)
+    if pin_spec:
+        pin_client, _, static_pin = pin_spec.partition(":")
+        print(f"WILL_PIN_PAIR_WITH={pin_client} pin={static_pin}", flush=True)
+
     # PAIR_WITH=<client_id>:<pairing_psk_b64url> drives a real Pairing PSK pairing as soon
     # as that client connects, which is what an operator pasting a pairing token does.
     pair_spec = os.environ.get("PAIR_WITH")
@@ -247,6 +255,21 @@ async def main() -> None:
                 if drive_management and cid not in managed and _is_paired(server, cid):
                     managed.add(cid)
                     loop.create_task(_drive_management(server, cid))
+            if pin_client and not paired and pin_client in ids:
+                paired = True
+                print("PIN_PAIRING_START", flush=True)
+
+                async def _pin() -> str:
+                    return static_pin
+
+                try:
+                    await server.initiate_pairing(
+                        pin_client,
+                        PairingAttempt(method=PairMethod.STATIC_PIN, pin_provider=_pin),
+                    )
+                    print("PIN_PAIRING_OK", flush=True)
+                except Exception as exc:  # noqa: BLE001 - report whatever the server raised
+                    print(f"PIN_PAIRING_FAILED={type(exc).__name__}: {exc}", flush=True)
             if pair_client and not paired and pair_client in ids:
                 paired = True
                 print("PAIRING_START", flush=True)

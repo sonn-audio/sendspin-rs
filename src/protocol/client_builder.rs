@@ -298,6 +298,25 @@ impl ProtocolClientBuilder {
                     min_pin_length: None,
                 });
             }
+            if config.static_pin.is_some() {
+                methods.push(PairMethodDescriptor {
+                    method: PairMethod::StaticPin,
+                    out_channels: None,
+                    locked_out: None,
+                    min_pin_length: None,
+                });
+            }
+            if config.dynamic_pin_enabled {
+                methods.push(PairMethodDescriptor {
+                    method: PairMethod::DynamicPin,
+                    // The server combines this with its own minimum to pick the session's
+                    // length, so leaving it out would let a shorter PIN be chosen than this
+                    // client agreed to accept.
+                    min_pin_length: Some(config.dynamic_pin_min_length),
+                    out_channels: None,
+                    locked_out: None,
+                });
+            }
             hello.supported_pair_methods = Some(methods);
             hello.unpaired_access = UnpairedAccess {
                 enabled: config.unpaired_access,

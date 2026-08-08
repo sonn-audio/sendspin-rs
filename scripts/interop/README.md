@@ -89,6 +89,27 @@ the reference unpacks them. The run also covers `server/command` in both directi
 `SOURCE_STOP_AFTER=<seconds>` (default 3) sets how much capture the server accepts before
 asking the source to stop.
 
+## Driving static-PIN pairing
+
+`PAIR_PIN=<client_id>:<pin>` runs a static-PIN pairing instead of the Pairing PSK flow —
+which means the whole CPace exchange over the wire, rather than handing a key over on a
+channel the handshake already authenticated.
+
+```bash
+PAIR_PIN=<client_id>:12345678 \
+    PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_server.py 8980
+cargo run --example noise_interop -- --source --seed 9 --static-pin 12345678 \
+    --listen-secs 20 --server ws://127.0.0.1:8980/sendspin
+```
+
+The harness opens the pairing window itself, standing in for the operator gesture the flow
+is gated on — that is the one thing here that is faked, because there is no button to press.
+
+A pass prints `PIN_PAIRING_OK` on the server. Two things make that conclusive rather than
+suggestive: `initiate_pairing` raises on any failure in the exchange, and the client comes
+back on a long-term PSK afterwards — which only exists if the server unwrapped the sealed
+PSK, and it can only do that with a CPace output that matches.
+
 ## Driving `management/*`
 
 `DRIVE_MANAGEMENT=1` on the server opens a management session as soon as a client is on a
@@ -125,6 +146,9 @@ long-term record bound to the server's id.
 binding and `used` flag, a record added and re-added, the pairing config read, patched and
 read back, a record removed, and both negative outcomes (`already_exists`, `not_found`)
 observed rather than assumed.
+
+Static-PIN pairing completes end to end, so the CPace exchange, the confirmation ordering
+and the PSK wrapping have all spoken rather than only passing their own tests.
 
 Six defects came out of pointing it at the reference server, none of which a loopback test
 would have surfaced:

@@ -52,6 +52,12 @@ struct Args {
     #[arg(long)]
     seed: Option<u8>,
 
+    /// Configure this static PIN, so a server can be told the same one.
+    ///
+    /// Only for interop testing. A real device is given a random PIN at the factory.
+    #[arg(long)]
+    static_pin: Option<String>,
+
     /// Codec the source streams: `pcm`, `flac` or `opus`.
     ///
     /// The server transcodes centrally, so this is the source's choice alone — which makes
@@ -284,6 +290,15 @@ async fn run_source_client(
     );
 
     let conn = pairing_client.split();
+    // Static PIN pairing is gesture-gated on every attempt: the client withholds
+    // `client/pair-init` until an operator opens a window. Standing in for that operator is
+    // the one thing this harness has to fake, because there is no button to press here.
+    if args.static_pin.is_some() {
+        if let Some(window) = &conn.pairing_window {
+            window.open();
+            println!("  window    : opened (standing in for the operator gesture)");
+        }
+    }
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(args.listen_secs);
     while tokio::time::Instant::now() < deadline && store.records()?.is_empty() {
         tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -453,7 +468,13 @@ fn build_pairing_store(args: &Args) -> Result<Arc<dyn PairingStore>, Box<dyn std
             pairing_psk: Some(psk),
             unpaired_access: true,
             record_mode_psk_id: None,
-            ..PairingConfig::disabled()
+            // A fixed PIN so the server can be told the same one. A real device is given a
+            // random one at the factory; this is exactly the shared default the spec forbids,
+            // and it is here only because both ends of a test have to agree on it.
+            static_pin: args.static_pin.clone(),
+            dynamic_pin_enabled: true,
+            dynamic_pin_min_length: 6,
+            dynamic_pin_failures: 0,
         },
         None => PairingConfig::generate()?,
     };
