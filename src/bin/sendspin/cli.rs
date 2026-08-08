@@ -50,12 +50,28 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub name: Option<String>,
 
-    /// Stable identifier for this client. Defaults to `sendspin-rs-<hostname>`.
+    /// Stable identifier for this client. Ignored unless `--no-encryption` is set.
     ///
-    /// A server remembers a client by this, so a value that changes between restarts loses
-    /// the client's group membership and its pairing along with it.
+    /// Under the encrypted transport the `client_id` is the public half of this device's
+    /// keypair and cannot be chosen: it comes from the identity in the settings directory.
     #[arg(long)]
     pub id: Option<String>,
+
+    /// Directory holding the identity key and pairing records.
+    ///
+    /// Both have to outlive a reboot for a pairing to still mean anything, and the failure
+    /// counter that limits PIN guessing lives here too. Defaults to `$XDG_CONFIG_HOME/sendspin`,
+    /// or `~/.config/sendspin`.
+    #[arg(long)]
+    pub settings_dir: Option<std::path::PathBuf>,
+
+    /// Speak the legacy cleartext transport instead of the spec's encrypted one.
+    ///
+    /// Only for a server that has not implemented the Noise layer. It cannot pair, so it
+    /// cannot reach anything gated on pairing, and a server that requires encryption will
+    /// refuse the connection outright.
+    #[arg(long)]
+    pub no_encryption: bool,
 
     /// Logging level.
     #[arg(long, default_value = "info",
@@ -113,6 +129,30 @@ impl DaemonArgs {
             Some(ip) => format!("{ip}:{}", self.port),
             None => format!("0.0.0.0:{}", self.port),
         }
+    }
+}
+
+impl DaemonArgs {
+    /// Where the identity and the pairing records live.
+    ///
+    /// Follows the XDG base directory spec, because an operator who has set `XDG_CONFIG_HOME`
+    /// meant it, and falls back to `~/.config` rather than the working directory — secrets
+    /// should not land wherever the service happened to be started from.
+    pub fn settings_dir(&self) -> Result<std::path::PathBuf, String> {
+        if let Some(dir) = &self.settings_dir {
+            return Ok(dir.clone());
+        }
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            return Ok(std::path::PathBuf::from(xdg).join("sendspin"));
+        }
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                "no --settings-dir given and neither XDG_CONFIG_HOME nor HOME is set".to_string()
+            })?;
+        Ok(std::path::PathBuf::from(home)
+            .join(".config")
+            .join("sendspin"))
     }
 }
 

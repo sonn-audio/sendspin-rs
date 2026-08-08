@@ -39,6 +39,8 @@
 pub mod constants;
 /// CPACE-X25519-SHA512, the PAKE the PIN pairing flows run.
 pub mod cpace;
+
+pub mod file_store;
 /// The client-side handshake driver.
 pub mod handshake;
 /// Identities, pre-shared keys, and `psk_id` derivation.
@@ -62,6 +64,7 @@ pub mod trust_store;
 /// Encrypted binary framing, with fragmentation and reassembly.
 pub mod wire;
 
+pub use file_store::{load_or_create_identity, FilePairingStore};
 pub use handshake::{ClientHandshake, HandshakeResult, HandshakeStep};
 pub use keys::{Identity, Psk, PskCategory};
 pub use management::{

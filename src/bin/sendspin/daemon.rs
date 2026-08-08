@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
-use sendspin::protocol::client::{AudioChunk, WsSender};
+use sendspin::noise::file_store::{load_or_create_identity, FilePairingStore};
+use sendspin::noise::trust_store::PairingStore;
+use sendspin::protocol::client::{AudioChunk, Encryption, EncryptionSettings, WsSender};
 use sendspin::protocol::manager::ConnectionManager;
 use sendspin::protocol::messages::{
     ClientState, Message, PlaybackState, PlayerCommandType, PlayerState,
@@ -20,69 +22,108 @@ use sendspin::ProtocolClientBuilder;
 
 use crate::cli::{default_product_name, hostname, DaemonArgs};
 
+/// What this daemon presents to a server, resolved once so both directions cannot drift.
+struct Device {
+    name: String,
+    client_id: String,
+    product_name: String,
+    manufacturer: Option<String>,
+    /// `None` in transition mode. Carries the identity and the store together, because the
+    /// encrypted transport needs both and neither is any use alone.
+    encryption: Option<EncryptionSettings>,
+    static_delay: u16,
+}
+
 /// Run the daemon until the process is stopped.
 pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     let static_delay = args.static_delay()?;
     let name = args.name.clone().unwrap_or_else(hostname);
-    let client_id = args
-        .id
-        .clone()
-        .unwrap_or_else(|| format!("sendspin-rs-{}", hostname()));
     let product_name = args
         .product_name
         .clone()
         .unwrap_or_else(default_product_name);
 
+    // The encrypted transport decides the `client_id` rather than taking one: it is the public
+    // half of the stored keypair. Only transition mode leaves the name to the operator.
+    let (client_id, encryption) = if args.no_encryption {
+        if args.settings_dir.is_some() {
+            log::warn!("--settings-dir is unused with --no-encryption: nothing is persisted");
+        }
+        let client_id = args
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("sendspin-rs-{}", hostname()));
+        log::warn!(
+            "Running in transition mode: no Noise layer, and no pairing. A server that \
+             requires the encrypted transport will refuse this connection."
+        );
+        (client_id, None)
+    } else {
+        let dir = args.settings_dir()?;
+        if args.id.is_some() {
+            log::warn!(
+                "--id is ignored under the encrypted transport: the client_id is the public \
+                 half of the identity in {}",
+                dir.display()
+            );
+        }
+        let identity = load_or_create_identity(dir.join("identity.key"))?;
+        let store = FilePairingStore::open(dir.join("pairing.json"))?;
+        let records = store.records()?.len();
+        log::info!("Settings: {} ({records} pairing record(s))", dir.display());
+        let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::new(store));
+        // The dynamic PIN has to reach the operator through this device, and only the host
+        // application knows how. A daemon with no display or speaker has the log and nothing
+        // else, so it says so rather than emitting a PIN nobody was told to look for.
+        settings.emit_pin = Some(Arc::new(|pin: &str| {
+            log::warn!("Pairing PIN (type this into the server): {pin}");
+        }));
+        (identity.client_id(), Some(settings))
+    };
+
     log::info!("Client id: {client_id}");
     log::info!("Name: {name}");
-    // Said once, plainly, because it decides which servers this daemon can reach: a server
-    // with `allow_unencrypted` off refuses the cleartext hello outright. Turning it on needs
-    // an identity that survives a restart — under the encrypted transport the `client_id` *is*
-    // the public half of that key — so it waits on a settings directory to keep one in.
-    log::warn!(
-        "Running in transition mode: no Noise layer. Servers that require the encrypted \
-         transport will refuse this connection."
-    );
+
+    let device = Device {
+        name,
+        client_id,
+        product_name,
+        manufacturer: args.manufacturer.clone(),
+        encryption,
+        static_delay,
+    };
 
     match args.url.clone() {
-        Some(url) => {
-            run_outbound(&args, &url, &name, &client_id, &product_name, static_delay).await
-        }
-        None => run_inbound(&args, &name, &client_id, &product_name, static_delay).await,
+        Some(url) => run_outbound(&args, &url, &device).await,
+        None => run_inbound(&args, &device).await,
     }
 }
 
 /// Build a client template carrying everything a server learns about this device in
 /// `client/hello`. Shared by both directions so the two cannot drift.
-fn template(
-    name: &str,
-    client_id: &str,
-    product_name: &str,
-    manufacturer: Option<&str>,
-) -> ProtocolClientBuilder {
+fn template(device: &Device) -> ProtocolClientBuilder {
     ProtocolClientBuilder::builder()
-        .client_id(client_id.to_string())
-        .name(name.to_string())
-        .product_name(Some(product_name.to_string()))
+        .client_id(device.client_id.clone())
+        .name(device.name.clone())
+        .product_name(Some(device.product_name.clone()))
         // Passed unconditionally rather than behind an `if`: each setter moves the builder to
         // a new type, so a conditional one would need both branches to agree on it.
-        .manufacturer(manufacturer.map(str::to_string))
+        .manufacturer(device.manufacturer.clone())
+        .encryption(match &device.encryption {
+            Some(settings) => Encryption::Enabled(settings.clone()),
+            None => Encryption::Disabled,
+        })
         .build()
 }
 
 /// Dial a named server and play whatever it sends, until it goes away.
 async fn run_outbound(
-    args: &DaemonArgs,
+    _args: &DaemonArgs,
     url: &str,
-    name: &str,
-    client_id: &str,
-    product_name: &str,
-    static_delay: u16,
+    device: &Device,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Connecting to {url}");
-    let client = template(name, client_id, product_name, args.manufacturer.as_deref())
-        .connect(url)
-        .await?;
+    let client = template(device).connect(url).await?;
     let hello = client.server_hello().clone();
     log::info!(
         "Connected to {} ({}), roles {:?}",
@@ -97,7 +138,7 @@ async fn run_outbound(
         conn.audio,
         conn.clock_sync,
         conn.sender,
-        static_delay,
+        device.static_delay,
     )
     .await;
     log::info!("Server closed the connection");
@@ -108,33 +149,31 @@ async fn run_outbound(
 ///
 /// The manager owns the accept loop and the keep-or-switch policy; this only has to play what
 /// the winner sends and be ready for the next one, because a server going away is ordinary.
-async fn run_inbound(
-    args: &DaemonArgs,
-    name: &str,
-    client_id: &str,
-    product_name: &str,
-    static_delay: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_inbound(args: &DaemonArgs, device: &Device) -> Result<(), Box<dyn std::error::Error>> {
     let bind = args.bind_address();
-    let listener = template(name, client_id, product_name, args.manufacturer.as_deref())
-        .listen(&bind)
-        .await?;
+    let listener = template(device).listen(&bind).await?;
     let port = listener.local_addr()?.port();
     let mut manager = ConnectionManager::new(listener);
 
     // Withdrawn on drop, so a daemon that exits stops being advertised. A stale record is
     // worse than none: a server dials it, fails, and retries.
-    let _advertisement =
-        sendspin::protocol::discovery::ClientAdvertisement::new(client_id, name, port)
-            .inspect_err(|e| log::error!("Could not advertise over mDNS: {e}"))
-            .ok();
+    let _advertisement = sendspin::protocol::discovery::ClientAdvertisement::new(
+        &device.client_id,
+        &device.name,
+        port,
+    )
+    .inspect_err(|e| log::error!("Could not advertise over mDNS: {e}"))
+    .ok();
     if args.interface.is_some() {
         log::warn!(
             "--interface restricts the listening socket only; the mDNS advertisement still \
              goes out on every interface"
         );
     }
-    log::info!("Listening on {bind}, advertising _sendspin._tcp.local. as {name:?}");
+    log::info!(
+        "Listening on {bind}, advertising _sendspin._tcp.local. as {:?}",
+        device.name
+    );
 
     while let Some(conn) = manager.next_connection().await {
         let server_id = conn.server_hello.server_id.clone();
@@ -148,7 +187,7 @@ async fn run_inbound(
             conn.audio,
             conn.clock_sync,
             conn.sender,
-            static_delay,
+            device.static_delay,
         )
         .await;
         // A server this client actually played for wins a later discovery tie, which is what

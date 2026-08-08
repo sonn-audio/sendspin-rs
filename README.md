@@ -4,8 +4,7 @@ Hyper-efficient Rust implementation of the [Sendspin Protocol](https://github.co
 for synchronized multi-room audio streaming.
 
 > [!WARNING]
-> Pre-1.0 and under active development. The API is not yet stable, and pairing is not
-> implemented yet — see [Status](#status).
+> Pre-1.0 and under active development. The API is not yet stable — see [Status](#status).
 
 ## What this is
 
@@ -148,18 +147,20 @@ is `ConnectionManager`'s, so a server that takes over is served and the previous
 go.
 
 The flag names track `sendspin-cli`'s, so an operator who knows one does not have to learn
-the other. Two limits worth knowing before you deploy it:
+the other.
 
-- **It speaks transition mode**, not the encrypted transport, so a server with
-  `allow_unencrypted` off refuses it. Under Noise the `client_id` *is* the public half of a
-  keypair, so turning encryption on means keeping that key across restarts — which needs the
-  settings directory that is not built yet. The daemon says so on startup rather than
-  failing with a bare disconnect.
-- **`--interface` binds the listening socket only.** It does not yet restrict which
-  interface mDNS advertises on, because the advertisement API takes no interface.
+It speaks the encrypted transport and can pair. The identity key and the pairing records
+live in `--settings-dir` (`$XDG_CONFIG_HOME/sendspin`, else `~/.config/sendspin`), owner-only,
+so a pairing survives a restart — which is the only way one means anything. Because the
+`client_id` under Noise is the public half of that key, it comes from the identity rather
+than from `--id`; `--no-encryption` falls back to the legacy cleartext transport for a server
+that has not implemented Noise, and cannot pair.
 
-Still to come, in the order they are being built: a durable settings directory (which also
-fixes the pairing failure counter losing its state on restart), audio device selection with
+One limit worth knowing: **`--interface` binds the listening socket only.** It does not yet
+restrict which interface mDNS advertises on, because the advertisement API takes no
+interface.
+
+Still to come, in the order they are being built: audio device selection with
 `--audio-device` and `--audio-format`, then hooks, hardware volume and MPRIS.
 
 ## Quick start
