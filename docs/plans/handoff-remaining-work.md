@@ -3,8 +3,10 @@
 > Fork-internal. Written at the end of a long session so the next one does not re-derive any
 > of this. Read the "Traps" section before writing code.
 
-State as of `684a998` on `claude/sendspin-rust-python-parity-m6ktw9` (40 commits ahead of
-`main`). CI-equivalent green throughout: `cargo test --workspace --all-features`,
+State as of `719bdd8` on `claude/sendspin-rust-python-parity-m6ktw9` (42 commits ahead of
+`main`). **The client is done**: all 36 wire message types the two implementations name
+between them are spoken and driven, and the load-bearing ones have been validated against
+`aiosendspin` rather than only against their own tests. CI-equivalent green throughout: `cargo test --workspace --all-features`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace`,
 `cargo fmt --all --check`.
@@ -23,43 +25,79 @@ State as of `684a998` on `claude/sendspin-rust-python-parity-m6ktw9` (40 commits
 | Source encoders | pcm/flac/opus decoded by the reference server's ffmpeg, byte counts exact |
 | CPace | draft-21 vectors: generator, both shares, ISK, tags, low-order table both ways |
 | PIN bindings | sid, PIN, commitment and wrapped PSK byte-exact against `aiosendspin` |
-| Both PIN flows | driven end to end against a server side; both peers finish on one PSK |
+| Both PIN flows | driven from the router; static PIN completes against the reference server |
 | Playback sync bounds | ±0.5 ms steady state, ±0.5% speed, asserted by tests |
 
 ## Left to do
 
-**Drive the PIN flows from the router.** This is the only thing standing between the client
-and full wire parity, and it is wiring rather than research: `noise::pin_flow` is complete
-and tested, `plan_pairing` already routes an offered method into it, and the router has an
-arm that declines because it cannot yet finish the exchange.
+### 1. Interop-run the dynamic PIN flow
 
-Three things the router does not currently carry, and each is small on its own:
+The static flow has spoken to `aiosendspin` (`PAIR_PIN=<client_id>:<pin>`, see
+`scripts/interop/README.md`). The dynamic one has not, and the reason is a plumbing problem
+rather than a protocol one: in that flow the PIN travels the *other* way. The client derives
+it and shows it; the operator types it into the server. So a harness run has to carry a value
+out of the Rust process and into the Python one.
 
-- **The Noise handshake hash.** The PAKE's `sid` binds to it. `snow` exposes it as the
-  handshake hash once transport mode begins; it has to be captured there and kept in
-  `SecurityContext` alongside `psk_id`, and it changes on a re-handshake like the rest.
-- **A pairing-index counter.** The number of pairing `server/activate` messages since the
-  last handshake. `client/pair-pending` and `client/pair-init` both carry it, and the server
-  discards a lower value silently and treats a higher one as a protocol error.
-- **An attempt held across several inbound messages.** Today `handle_pairing_activation`
-  runs to completion inside one message; a PIN attempt spans four. It wants a
-  `Option<PinPairing>` next to `pending_pairing`, fed from the router's match arms.
+The cheapest honest route: give the example a `--pin-file <path>`, wire it to
+`EncryptionSettings::emit_pin` so the derived PIN is written there, and give the server's
+`PinProvider` a poll-until-present loop on the same path. Both ends already exist —
+`emit_pin` is a callback on the settings, and `PairingAttempt(method=DYNAMIC_PIN,
+pin_provider=...)` takes an awaitable.
 
-Two client-side obligations that go with it and have decision functions waiting in
-`noise::pin`, but no persistence yet:
+Worth doing even though the derivation is already byte-exact against the reference: what is
+untested is the *sequencing* — `server/pair-init` arriving where this client expects it, the
+commitment surviving the round trip, and the server's three-step verification order accepting
+what the client sends. Six defects this session lived in code that passed its own tests.
 
-- **The failure counter.** `PinPairing::counts_as_failure` reports the one event that
-  increments it — this side's own `server_kc` verification failing. It resets on success,
-  persists across reboots, and is not partitioned by server or source address. It lives in
-  `PairingConfig::dynamic_pin_failures`; nothing writes it yet.
-- **The pairing window.** `dynamic_pin_needs_gesture` decides when an attempt is gated.
-  Opening the window is an operator gesture the host application owns, so this needs an API
-  on the builder rather than a policy in the crate — and `management/open-pairing-window`
-  should stop answering `invalid` once one exists.
+### 2. Open the PR
 
-After that: advertise the methods in `client/hello`. The descriptor needs `min_pin_length`
-on `dynamic_pin` and the `locations` hint on the others, derived from the store the way
-`supported_pair_methods` already is.
+`main` and the fork's `main` are byte-identical, so the branch sits on current upstream.
+Upstream PR #94 is a release-plz bot PR bumping 0.3.6 → 0.4.0; when someone merges it, this
+branch will conflict on `Cargo.toml` and `CHANGELOG.md`. Trivial, but see it coming.
+
+Note that `docs/tracking` is deliberately *not* on the code branch, so these notes cannot
+ride along into an upstream PR by accident.
+
+### 3. The server
+
+Now in scope by decision. Measured against `aiosendspin` at `4c2d7c9`: the server is 14962
+lines, and more is reusable than that number suggests.
+
+**Already free.** Every message type derives both `Serialize` and `Deserialize`, so the whole
+1329-line wire vocabulary works in both directions with no new model code. `session.rs`
+already has `build_responder()` — the Noise responder is wired and tested, because a client is
+the responder in a re-handshake. Framing, fragmentation and the transport are
+direction-agnostic. `opus-rs` and `flac-codec` encode as well as decode, and now do.
+
+**The six packages, by size and by kind:**
+
+| Package | Python | Kind |
+| --- | --- | --- |
+| `push_stream.py` | 2613 | the motor: buffering, send-ahead, per-client pacing, resampling |
+| `connection.py` | 2263 | per-connection state machine, Noise responder, role negotiation |
+| visualizer DSP | ~1850 | FFT, mel, loudness, beat, f-peak, spectrum, pitch — real signal work |
+| `server.py` + `client.py` | 2070 | lifecycle, zeroconf advertisement, the server's view of a client |
+| roles (8) | ~2800 | player, visualizer, artwork, source, metadata, color, controller, draft_r1 |
+| groups | ~1500 | `group/update`, the volume algorithm, membership |
+
+Two of those are building rather than translating. `push_stream.py` leans on PyAV — ffmpeg
+filter graphs for resampling — which Rust does not get for free; that becomes `rubato` plus
+own pacing, and it is where synchronisation is won or lost. The visualizer DSP is numpy, so
+686 lines of it is more than 686 lines of Rust.
+
+**Start with a skeleton that brings a Python client up.** Noise responder, `server/hello` →
+`client/hello` → `server/activate`, clock sync answered. No roles, no audio. The moment
+`aiosendspin`'s `SendspinClient.connect(url)` reaches `is_time_synchronized()`, the interop
+harness *inverts* — and everything after it is testable instead of hopeful. There are 35191
+lines of Python tests pinning server behaviour to borrow from.
+
+Then: role negotiation + player → PushStream → groups → the remaining roles → visualizer DSP
+last, because it is the most decoupled and the least load-bearing.
+
+**One architecture decision to take at commit one, not later.** This crate has had a single
+entry point since #36, and `cpal`/`flac-codec`/`opus-rs` are unconditional dependencies. An
+embedded player should not link the server. Put it behind a `server` feature from the start —
+`discovery` is already precedent for the pattern.
 
 ## Traps
 
@@ -113,6 +151,14 @@ that no `server/command {command: start}` asked for.
 `client/state` reports only what it granted. This is what `ClientState::retain_active_roles`
 is for; anything new that reports per-role state has to go through it.
 
+**PIN pairing is gated on a gesture the crate cannot perform.** Static PIN gates every
+attempt; dynamic PIN gates an escalated method or a PIN under six digits. The gesture is a
+button, a reset pinhole, a power-cycle pattern — things only the host application observes —
+so `PairingWindow` on `Connection` is a handle the crate holds and never raises by itself. The
+interop harness opens it directly, which is the one thing there that is faked. Likewise
+`EncryptionSettings::emit_pin`: the dynamic PIN has to reach the operator through *this
+device*, and a crate that picked a channel would be guessing at hardware it cannot see.
+
 **CPace's low-order point table is not "reject everything".** The draft is precise: `u0`-`u5`
 and `u7` MUST abort, and the other five are unusual encodings that still multiply to a value
 it publishes. The first attempt here asserted that all twelve were rejected and was wrong —
@@ -153,6 +199,10 @@ Both deliberate, both stated in the README so they do not read as oversights:
   connection's playback activity, so a source arrives with its roles already settled — but it
   is a gap for any server that re-activates in place. Noticed while fixing the inactive-role
   state defect; deliberately left alone rather than widened into that change.
+- The dynamic-PIN failure counter is persisted through `PairingConfig`, so a store that only
+  keeps records in memory forgets it on restart — which is exactly the reset an attacker
+  wants. A durable store is the fix, and the trait already allows one; nothing in-tree
+  provides it.
 - No benchmark exists, so the README's CPU and memory figures are labelled design targets.
   `aiosendspin` has `scripts/benchmark_clients.py` and a sync harness
   (`test_audible_sync_matrix`, `test_audible_sync_fuzz`) worth mirroring if the
