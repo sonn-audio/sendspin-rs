@@ -37,7 +37,8 @@ use tokio::sync::{broadcast, Notify};
 
 use sendspin_proto::messages::{
     ControllerCommand, ControllerCommandType, ControllerState, GroupUpdate, Message, PlaybackState,
-    PlayerCommand, PlayerCommandType, ServerCommand, ServerState, StreamEnd, StreamStart,
+    PlayerCommand, PlayerCommandType, ServerCommand, ServerState, StreamClear, StreamEnd,
+    StreamStart,
 };
 
 use crate::stream::{PlayerStream, DEFAULT_SEND_AHEAD_US};
@@ -88,6 +89,13 @@ struct GroupInner {
     /// Group volume, 0-100.
     volume: u8,
     muted: bool,
+    /// Whether delivery is held.
+    ///
+    /// A pause here is a *delivery* pause. Because the source is pulled rather than pushed,
+    /// holding delivery holds production too: nothing is consumed while nothing is being sent,
+    /// so a resume continues from the same sample instead of skipping the pause's worth of
+    /// audio.
+    paused: bool,
 }
 
 /// A set of clients sharing one playback timeline.
@@ -118,6 +126,7 @@ impl Group {
                 current_start: None,
                 volume: 100,
                 muted: false,
+                paused: false,
             }),
             wake: Notify::new(),
             chunks_sent: AtomicU64::new(0),
@@ -149,6 +158,27 @@ impl Group {
     /// The group's current playback state.
     pub fn playback_state(&self) -> PlaybackState {
         self.inner.lock().expect("group lock").playback
+    }
+
+    /// Whether delivery is currently held.
+    pub fn is_paused(&self) -> bool {
+        self.inner.lock().expect("group lock").paused
+    }
+
+    /// Hold or release delivery.
+    ///
+    /// Waking the group task is the point: a pause that only set a flag would not take effect
+    /// until the next chunk was due, which at a half-second send-ahead is a pause the listener
+    /// hears late.
+    pub fn set_paused(&self, paused: bool) {
+        {
+            let mut inner = self.inner.lock().expect("group lock");
+            if inner.paused == paused {
+                return;
+            }
+            inner.paused = paused;
+        }
+        self.wake.notify_waiters();
     }
 
     /// Add a member, returning its feed and everything it needs to catch up.
@@ -271,6 +301,17 @@ impl Group {
                     }
                     _ => log::warn!("refusing seek with no position or no seekable range"),
                 }
+            }
+            // Pause and play hold and release delivery here, *and* still reach the
+            // application: this crate can stop the bytes, but only the thing producing them
+            // can stop a turntable or release a network stream.
+            ControllerCommandType::Pause => {
+                self.set_paused(true);
+                controller.handle(cmd);
+            }
+            ControllerCommandType::Play => {
+                self.set_paused(false);
+                controller.handle(cmd);
             }
             _ => controller.handle(cmd),
         }
@@ -484,8 +525,38 @@ async fn stream_once(group: &Arc<Group>, source: &dyn crate::AudioSource) {
     );
 
     let frames_per_chunk = (stream.format().sample_rate * CHUNK_MS / 1000) as usize;
+    let mut held = false;
 
     loop {
+        if group.is_paused() {
+            if !held {
+                // Clearing is what makes a pause immediate. Every member is holding up to a
+                // send-ahead of audio already stamped with times that are about to arrive, and
+                // without this it would play on for that long after the button was pressed.
+                group.broadcast(Outgoing::Json(Box::new(Message::StreamClear(
+                    StreamClear {
+                        server_transmitted: Some(clock.now_micros()),
+                        roles: None,
+                    },
+                ))));
+                group.set_playback(PlaybackState::Paused);
+                group.broadcast_group_update();
+                log::info!("group {} paused", group.id);
+                held = true;
+            }
+            group.wake.notified().await;
+            continue;
+        }
+        if held {
+            // Resuming re-anchors rather than resuming the old timeline: those timestamps are
+            // now in the past, and a chunk that is already due is one a player must drop.
+            stream.rebase(clock.now_micros() + DEFAULT_SEND_AHEAD_US);
+            group.set_playback(PlaybackState::Playing);
+            group.broadcast_group_update();
+            log::info!("group {} resumed", group.id);
+            held = false;
+        }
+
         if group.listeners() == 0 {
             log::info!("group {} lost its last player; stopping", group.id);
             break;
@@ -884,6 +955,85 @@ mod tests {
         let _player = group.join(true);
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(group.chunks_sent() > 0);
+    }
+
+    /// A pause has to reach the wire, not just the state. Every member is holding up to a
+    /// send-ahead of audio already stamped with times about to arrive, so without a
+    /// `stream/clear` the music plays on for that long after the button was pressed.
+    #[tokio::test]
+    async fn pausing_clears_what_members_have_buffered() {
+        let controller = Arc::new(RecordingController {
+            supported: vec![ControllerCommandType::Pause, ControllerCommandType::Play],
+            seek_max: None,
+            handled: Mutex::new(Vec::new()),
+        });
+        let group = Group::spawn(with_controller(controller), "g1".to_string(), None);
+        let mut player = group.join(true);
+
+        // Let the stream get going first, or the pause proves nothing.
+        loop {
+            match player.next().await {
+                Some(Ok(out)) if matches!(out.as_ref(), Outgoing::Binary(_)) => break,
+                Some(_) => continue,
+                None => panic!("the stream never started"),
+            }
+        }
+
+        group.handle_controller_command(&command(ControllerCommandType::Pause));
+
+        let mut saw_clear = false;
+        for _ in 0..200 {
+            match player.next().await {
+                Some(Ok(out)) => {
+                    if let Outgoing::Json(msg) = out.as_ref() {
+                        if matches!(msg.as_ref(), Message::StreamClear(_)) {
+                            saw_clear = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            saw_clear,
+            "a pause never reached the members as a stream/clear"
+        );
+        assert_eq!(group.playback_state(), PlaybackState::Paused);
+    }
+
+    /// A paused group consumes nothing. Because the source is pulled rather than pushed,
+    /// holding delivery holds production too — so a resume continues from the same sample
+    /// instead of skipping the pause's worth of audio.
+    #[tokio::test]
+    async fn a_paused_group_stops_consuming_the_source() {
+        let controller = Arc::new(RecordingController {
+            supported: vec![ControllerCommandType::Pause, ControllerCommandType::Play],
+            seek_max: None,
+            handled: Mutex::new(Vec::new()),
+        });
+        let group = Group::spawn(with_controller(controller), "g1".to_string(), None);
+        let _player = group.join(true);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        assert!(group.chunks_sent() > 0);
+
+        group.handle_controller_command(&command(ControllerCommandType::Pause));
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let while_paused = group.chunks_sent();
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(
+            group.chunks_sent(),
+            while_paused,
+            "the source kept being consumed while the group was paused"
+        );
+
+        group.handle_controller_command(&command(ControllerCommandType::Play));
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert!(
+            group.chunks_sent() > while_paused,
+            "the group never resumed"
+        );
+        assert_eq!(group.playback_state(), PlaybackState::Playing);
     }
 
     /// Leaving is by drop, so every way a connection can end takes its member with it.

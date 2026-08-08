@@ -116,6 +116,17 @@ impl PlayerStream {
         Some(framed)
     }
 
+    /// Move the timeline so the next chunk plays at `next_timestamp_us`.
+    ///
+    /// What a resume needs. The position is `start + micros(frames_sent)`, so shifting the
+    /// anchor moves every future timestamp without touching the frame count — the stream picks
+    /// up at the same *sample* it stopped at, but at a new moment. Recomputing from the frame
+    /// count instead would replay the pause as silence a listener has to sit through.
+    pub fn rebase(&mut self, next_timestamp_us: i64) {
+        self.start_us =
+            next_timestamp_us - frames_to_micros(self.frames_sent, self.format.sample_rate);
+    }
+
     /// Whether the next chunk should go out yet, given the clock and how far ahead to stay.
     ///
     /// The stream sends while it is *behind* its send-ahead target and waits once it is
@@ -182,6 +193,29 @@ mod tests {
         // A thousand chunks of 9187.5 µs is 9187500 µs. Adding per-chunk durations would have
         // lost half a microsecond a thousand times over.
         assert_eq!(stream.next_timestamp_us(), 9_187_500);
+    }
+
+    /// A resume moves every future timestamp forward without losing the caller's place in the
+    /// audio: the same sample plays next, at a later moment.
+    #[test]
+    fn rebasing_moves_the_timeline_without_losing_the_position() {
+        let mut stream = PlayerStream::new(format(), 0);
+        let pcm = vec![0u8; 480 * 4];
+        stream.chunk(&pcm).unwrap();
+        stream.chunk(&pcm).unwrap();
+        let frames_before = stream.frames_sent();
+        assert_eq!(stream.next_timestamp_us(), 20_000);
+
+        stream.rebase(5_000_000);
+        assert_eq!(stream.next_timestamp_us(), 5_000_000);
+        assert_eq!(
+            stream.frames_sent(),
+            frames_before,
+            "the resume threw away the caller's place in the audio"
+        );
+        // And the timeline keeps advancing by samples from the new anchor.
+        stream.chunk(&pcm).unwrap();
+        assert_eq!(stream.next_timestamp_us(), 5_010_000);
     }
 
     /// Send-ahead is a distance from the *playback* time, not a rate: a stream behind its

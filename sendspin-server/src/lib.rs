@@ -19,7 +19,7 @@
 //! # What does not
 //!
 //! Pairing, management, transcoding, and the `artwork`, `visualizer`, `color` and `source`
-//! roles. Playback control reaches the application but does not yet pause the timeline itself.
+//! roles. Pause and play act on the timeline; a seek only reaches the application.
 //! A role this server cannot serve is not activated even when a client offers it: activating
 //! one is a promise, and a client granted a role that is then never served looks broken from
 //! the outside.
