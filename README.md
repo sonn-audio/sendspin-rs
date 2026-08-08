@@ -55,11 +55,20 @@ see [scripts/interop](scripts/interop). Loopback tests cannot tell you whether t
 being read the same way the reference reads it, which is exactly where a transport layer
 fails.
 
-**Not implemented:** pairing and everything keyed to it — the trust store, the PSK and PIN
-pairing flows, and the `management/*` messages. A client reaches a server today on the
-Sentinel PSK, which is what the protocol keys a first connection with; pairing is what
-promotes that to a trusted session. The PIN methods additionally need CPace, for which no
-usable Rust crate exists.
+Pairing works too: the trust store, all three pairing methods — Pairing PSK, static PIN and
+dynamic PIN — and the `management/*` messages. All three complete end to end against
+`aiosendspin`'s server, which for the PIN methods means the whole CPace exchange over the
+wire; CPace is implemented in-crate against draft-21 and its vectors, because no usable Rust
+crate exists. A client still reaches a server on the Sentinel PSK, which is what the protocol
+keys a first connection with; pairing is what promotes that to a trusted session.
+
+The one thing the crate cannot do by itself is the operator gesture the PIN methods are gated
+on — a button, a reset pinhole, a power-cycle pattern. `PairingWindow` is a handle the host
+application raises, and the dynamic PIN reaches the operator through
+`EncryptionSettings::emit_pin`, because only the host knows whether this device has a display,
+a speaker or a row of LEDs.
+
+**Not implemented:** the server side. This crate is a client.
 
 **Encryption is opt-in for now**, because turning it on changes which servers a client can
 reach. Pass it explicitly:
@@ -82,6 +91,13 @@ let client = ProtocolClientBuilder::builder()
 `aiosendspin` ships and the spec still reserves; and the `client_id` / `version` fields in
 `client/hello` plus the legacy `state` enum in `client/state`, which the spec has moved or
 dropped but current servers still read. The latter go away with the encrypted transport.
+
+Where the spec and the reference disagree about *where* a field lives, both are read rather
+than one being picked. The pairing method in `server/activate` (spec: a `pairing` object;
+reference: a bare `selected_pair_method`) and the dynamic PIN's negotiated `pin_length` (spec:
+in that same activation; reference: on `server/pair-init`) are each accepted from either
+place, preferring the spec's. Reading only one of the two turns away every server that speaks
+the other.
 
 ## Performance
 

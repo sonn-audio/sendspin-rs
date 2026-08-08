@@ -40,6 +40,35 @@ SERVER_PRIVATE = bytes(range(32))
 SOURCE_STOP_AFTER = float(os.environ.get("SOURCE_STOP_AFTER", "3"))
 
 
+# How long to wait for the client to publish its derived dynamic PIN before giving up. The
+# server's own attempt timeout is 180s, so this stays well inside it.
+PIN_FILE_TIMEOUT = float(os.environ.get("PIN_FILE_TIMEOUT", "30"))
+
+
+async def _read_pin_file(path: str) -> str:
+    """Poll ``path`` until the client writes the dynamic PIN it derived, and return it.
+
+    This stands in for the operator, and it is the whole reason the dynamic flow needs a
+    harness at all: the PIN travels the other way. The client derives it from the handshake
+    hash and both nonces and shows it on the device; a human reads it off and types it into
+    the server. A file is the cheapest way to carry a value out of one process and into the
+    other without pretending either side computed it.
+    """
+    deadline = asyncio.get_running_loop().time() + PIN_FILE_TIMEOUT
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            with open(path, encoding="ascii") as handle:
+                pin = handle.read().strip()
+        except FileNotFoundError:
+            pin = ""
+        if pin:
+            print(f"PIN_FROM_FILE={pin}", flush=True)
+            return pin
+        await asyncio.sleep(0.05)
+    msg = f"no PIN appeared at {path} within {PIN_FILE_TIMEOUT}s"
+    raise TimeoutError(msg)
+
+
 def _is_paired(server: object, client_id: str) -> bool:
     """Whether this client's live connection is keyed by a long-term PSK."""
     try:
@@ -214,6 +243,18 @@ async def main() -> None:
         pin_client, _, static_pin = pin_spec.partition(":")
         print(f"WILL_PIN_PAIR_WITH={pin_client} pin={static_pin}", flush=True)
 
+    # PAIR_DYNAMIC_PIN=<client_id>:<pin_file> drives a dynamic-PIN pairing, where the PIN is
+    # derived by the *client* and read back off the device — so the server waits for the file
+    # the client's --pin-file writes rather than being told a PIN up front.
+    dynamic_spec = os.environ.get("PAIR_DYNAMIC_PIN")
+    dynamic_client, dynamic_pin_file = (None, None)
+    if dynamic_spec:
+        dynamic_client, _, dynamic_pin_file = dynamic_spec.partition(":")
+        print(
+            f"WILL_DYNAMIC_PIN_PAIR_WITH={dynamic_client} pin_file={dynamic_pin_file}",
+            flush=True,
+        )
+
     # PAIR_WITH=<client_id>:<pairing_psk_b64url> drives a real Pairing PSK pairing as soon
     # as that client connects, which is what an operator pasting a pairing token does.
     pair_spec = os.environ.get("PAIR_WITH")
@@ -270,6 +311,25 @@ async def main() -> None:
                     print("PIN_PAIRING_OK", flush=True)
                 except Exception as exc:  # noqa: BLE001 - report whatever the server raised
                     print(f"PIN_PAIRING_FAILED={type(exc).__name__}: {exc}", flush=True)
+            if dynamic_client and not paired and dynamic_client in ids:
+                paired = True
+                print("DYNAMIC_PIN_PAIRING_START", flush=True)
+
+                async def _dynamic_pin() -> str:
+                    return await _read_pin_file(dynamic_pin_file)
+
+                try:
+                    await server.initiate_pairing(
+                        dynamic_client,
+                        PairingAttempt(
+                            method=PairMethod.DYNAMIC_PIN, pin_provider=_dynamic_pin
+                        ),
+                    )
+                    print("DYNAMIC_PIN_PAIRING_OK", flush=True)
+                except Exception as exc:  # noqa: BLE001 - report whatever the server raised
+                    print(
+                        f"DYNAMIC_PIN_PAIRING_FAILED={type(exc).__name__}: {exc}", flush=True
+                    )
             if pair_client and not paired and pair_client in ids:
                 paired = True
                 print("PAIRING_START", flush=True)

@@ -58,6 +58,15 @@ struct Args {
     #[arg(long)]
     static_pin: Option<String>,
 
+    /// Write the derived dynamic PIN to this path, so a server can read it back.
+    ///
+    /// Only for interop testing. The dynamic PIN is meant to reach the operator through the
+    /// device itself — a display, a speaker, a row of LEDs — and they type it into the
+    /// server. A file stands in for that human, which is the only way a harness can carry a
+    /// value that leaves this process and comes back on the other side.
+    #[arg(long)]
+    pin_file: Option<std::path::PathBuf>,
+
     /// Codec the source streams: `pcm`, `flac` or `opus`.
     ///
     /// The server transcodes centrally, so this is the source's choice alone — which makes
@@ -264,11 +273,12 @@ async fn run_source_client(
     println!("codec     : {}", args.codec);
 
     let store = build_pairing_store(args)?;
+    clear_pin_file(args)?;
 
     // Pass 1: pair. The server re-handshakes onto a long-term PSK and this client
     // persists a record bound to the server's id.
     println!("\n=== pass 1: pairing ===");
-    let paired_settings = encryption_settings(&identity, &store, suite);
+    let paired_settings = encryption_settings(args, &identity, &store, suite);
     let pairing_client = ProtocolClientBuilder::builder()
         .client_id(identity.client_id())
         .name("Rust Interop Source".to_string())
@@ -319,7 +329,7 @@ async fn run_source_client(
         .client_id(identity.client_id())
         .name("Rust Interop Source".to_string())
         .encryption(Encryption::Enabled(encryption_settings(
-            &identity, &store, suite,
+            args, &identity, &store, suite,
         )))
         .source_v1_support(SourceV1Support {
             features: Some(SourceFeatures {
@@ -487,13 +497,43 @@ fn build_pairing_store(args: &Args) -> Result<Arc<dyn PairingStore>, Box<dyn std
 /// Encryption settings sharing one store, so a second connection sees the record the
 /// first one persisted.
 fn encryption_settings(
+    args: &Args,
     identity: &Identity,
     store: &Arc<dyn PairingStore>,
     suite: CipherSuite,
 ) -> EncryptionSettings {
     let mut settings = EncryptionSettings::with_store(identity.clone(), Arc::clone(store));
     settings.suite = suite;
+    if let Some(path) = args.pin_file.clone() {
+        // Written whole and renamed into place: the server polls this path, and a reader that
+        // catches a half-written file would derive a PIN that never matches.
+        settings.emit_pin = Some(Arc::new(move |pin: &str| {
+            let temp = path.with_extension("tmp");
+            if let Err(e) = std::fs::write(&temp, pin).and_then(|()| std::fs::rename(&temp, &path))
+            {
+                eprintln!("could not write the PIN to {}: {e}", path.display());
+            } else {
+                println!("  pin       : {pin} -> {}", path.display());
+            }
+        }));
+    }
     settings
+}
+
+/// Clear a stale PIN file before connecting, so a server polling it cannot read the value a
+/// previous run left behind and then fail on a mismatch that says nothing about this one.
+fn clear_pin_file(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = &args.pin_file else {
+        return Ok(());
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => println!("pin file  : {} (cleared)", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("pin file  : {}", path.display());
+        }
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
 }
 
 /// One 20 ms chunk of a 440 Hz tone, interleaved, little-endian 16-bit.
@@ -522,7 +562,8 @@ async fn run_full_client(
     use sendspin::ProtocolClientBuilder;
 
     let store = build_pairing_store(args)?;
-    let settings = encryption_settings(&identity, &store, suite);
+    clear_pin_file(args)?;
+    let settings = encryption_settings(args, &identity, &store, suite);
 
     let client = ProtocolClientBuilder::builder()
         .client_id(identity.client_id())

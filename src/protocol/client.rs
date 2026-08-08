@@ -356,7 +356,7 @@ async fn start_pin_attempt(
     pairing_index: u32,
 ) -> Option<PairingOutcome> {
     use crate::noise::pin;
-    use crate::noise::pin_flow::{ClientPairPending, PinPairing};
+    use crate::noise::pin_flow::{ClientPairPending, PinLength, PinPairing};
 
     let config = match context.store.pairing_config() {
         Ok(config) => config,
@@ -366,32 +366,39 @@ async fn start_pin_attempt(
         }
     };
 
-    // Static PIN is a fixed eight digits; only the dynamic flow negotiates a length.
+    // Static PIN is a fixed eight digits; only the dynamic flow negotiates a length. A server
+    // that states none here states it in `server/pair-init` instead, and the attempt holds
+    // that late value to the same floor — so `None` is a deferral, not an omission.
     let pin_length = if method == super::messages::PairMethod::DynamicPin {
-        let offered = activate
-            .pairing
-            .as_ref()
-            .and_then(|p| p.pin_length)
-            .unwrap_or(config.dynamic_pin_min_length);
-        if !pin::pin_length_acceptable(offered, config.dynamic_pin_min_length) {
-            log::warn!(
-                "Declining a {offered}-digit PIN: this client requires at least {}",
-                config.dynamic_pin_min_length
-            );
-            let _ = send_abort(out_tx, PairAbortReason::PinLengthUnacceptable).await;
-            return None;
+        let offered = activate.pairing.as_ref().and_then(|p| p.pin_length);
+        if let Some(offered) = offered {
+            if !pin::pin_length_acceptable(offered, config.dynamic_pin_min_length) {
+                log::warn!(
+                    "Declining a {offered}-digit PIN: this client requires at least {}",
+                    config.dynamic_pin_min_length
+                );
+                let _ = send_abort(out_tx, PairAbortReason::PinLengthUnacceptable).await;
+                return None;
+            }
         }
         offered
     } else {
-        pin::STATIC_PIN_DIGITS as u8
+        Some(pin::STATIC_PIN_DIGITS as u8)
     };
 
     // The gesture is the operator's, and this crate cannot perform one. Saying so is what
     // `client/pair-pending` is for: it tells the server a human is being waited on rather
     // than leaving it to time out against a silent client.
+    //
+    // An activation that deferred the length is gated on this client's own floor, which is
+    // the shortest PIN the attempt can go on to accept — so the gate is never applied to a
+    // longer PIN than the one that actually runs.
     let gated = match method {
         super::messages::PairMethod::StaticPin => true,
-        _ => pin::dynamic_pin_needs_gesture(config.dynamic_pin_failures, pin_length),
+        _ => pin::dynamic_pin_needs_gesture(
+            config.dynamic_pin_failures,
+            pin_length.unwrap_or(config.dynamic_pin_min_length),
+        ),
     };
     if gated && !context.pairing_window_open.load(Ordering::Acquire) {
         log::info!("{method:?} pairing is gesture-gated and no window is open");
@@ -407,7 +414,10 @@ async fn start_pin_attempt(
         context.suite,
         handshake_hash,
         pairing_index,
-        pin_length,
+        PinLength {
+            negotiated: pin_length,
+            minimum: config.dynamic_pin_min_length,
+        },
         &context.server_id,
         config.static_pin.as_deref(),
     ) {

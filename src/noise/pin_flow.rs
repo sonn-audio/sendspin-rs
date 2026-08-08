@@ -61,15 +61,29 @@ pub struct ClientPairInit {
     /// error.
     pub pairing_index: u32,
     /// The commitment to `nonce_B`. Dynamic PIN only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ///
+    /// Spelled `commit_B` on the wire — one of the three pairing fields the spec capitalises,
+    /// after the CPace roles they name. A snake-cased spelling is silently absent to a peer,
+    /// which reads as "this client offered no commitment" rather than as a typo.
+    #[serde(rename = "commit_B", default, skip_serializing_if = "Option::is_none")]
     pub commit_b: Option<String>,
 }
 
 /// `server/pair-init` — the server's nonce. Dynamic PIN only.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerPairInit {
-    /// 32 CSPRNG bytes, base64url.
+    /// 32 CSPRNG bytes, base64url. Spelled `nonce_A` on the wire.
+    #[serde(rename = "nonce_A")]
     pub nonce_a: String,
+    /// The negotiated PIN length, where a server states it here rather than in the activation.
+    ///
+    /// The spec carries this in `server/activate`'s `pairing` object and does not list it on
+    /// this message; `aiosendspin` sends it here and leaves the activation without a `pairing`
+    /// object at all. A client that reads only one of the two either derives a PIN of the
+    /// wrong length or refuses to start, so both are read — see
+    /// [`PinPairing::on_server_pair_init`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_length: Option<u8>,
 }
 
 /// `server/pair-auth` — the server's CPace public share.
@@ -98,9 +112,24 @@ pub struct ServerPairConfirm {
 pub struct ClientPairConfirm {
     /// `Tb`, 64 bytes base64url.
     pub client_kc: String,
-    /// The preimage of `commit_B`. Dynamic PIN only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The preimage of `commit_B`. Dynamic PIN only. Spelled `nonce_B` on the wire.
+    #[serde(rename = "nonce_B", default, skip_serializing_if = "Option::is_none")]
     pub nonce_b: Option<String>,
+}
+
+/// What an attempt knows about its PIN length when it starts.
+///
+/// Two values rather than one because the spec and `aiosendspin` put the negotiated length on
+/// different messages: an attempt may begin without knowing it, and then has to hold whatever
+/// arrives to the floor the activation would have been held to.
+#[derive(Debug, Clone, Copy)]
+pub struct PinLength {
+    /// The negotiated length, when the activation's `pairing` object stated one. `None` defers
+    /// it to `server/pair-init`.
+    pub negotiated: Option<u8>,
+    /// This client's own `min_pin_length`. Anything below it is a weakening it agreed to
+    /// refuse, whenever it arrives.
+    pub minimum: u8,
 }
 
 /// What the client does next in a PIN pairing attempt.
@@ -151,7 +180,11 @@ pub struct PinPairing {
     suite: CipherSuite,
     handshake_hash: [u8; 32],
     pairing_index: u32,
-    pin_length: u8,
+    /// The negotiated PIN length, when the activation stated one. `None` until
+    /// `server/pair-init` supplies it on a server that carries it there instead.
+    pin_length: Option<u8>,
+    /// This client's own floor, kept so a length arriving late can be held to it too.
+    min_pin_length: u8,
     server_id: String,
     /// The session id, fixed at construction because it binds this attempt to this
     /// connection.
@@ -170,9 +203,11 @@ pub struct PinPairing {
 impl PinPairing {
     /// Begin an attempt for a pairing activation.
     ///
-    /// `pin_length` comes from the activation and is only meaningful for the dynamic flow;
-    /// the caller checks it against its own minimum before getting here, because a value
-    /// below that draws `pair/abort(pin_length_unacceptable)` rather than starting anything.
+    /// `pin_length` is only meaningful for the dynamic flow; the caller checks a stated length
+    /// against its own minimum before getting here, because a value below that draws
+    /// `pair/abort(pin_length_unacceptable)` rather than starting anything. A `negotiated` of
+    /// `None` means the activation did not state one, and the attempt takes it from
+    /// `server/pair-init` instead — holding it to the same `minimum` there.
     ///
     /// `static_pin` is the configured secret and is required for the static flow.
     pub fn start(
@@ -180,7 +215,7 @@ impl PinPairing {
         suite: CipherSuite,
         handshake_hash: [u8; 32],
         pairing_index: u32,
-        pin_length: u8,
+        pin_length: PinLength,
         server_id: &str,
         static_pin: Option<&str>,
     ) -> Result<(Self, ClientPairInit), Error> {
@@ -190,7 +225,8 @@ impl PinPairing {
             suite,
             handshake_hash,
             pairing_index,
-            pin_length,
+            pin_length: pin_length.negotiated,
+            min_pin_length: pin_length.minimum,
             server_id: server_id.to_string(),
             sid,
             nonce_b: None,
@@ -250,9 +286,26 @@ impl PinPairing {
             return self.protocol_error("no client nonce for a dynamic PIN attempt");
         };
 
-        match pin::derive_pin(&self.handshake_hash, &nonce_a, &nonce_b, self.pin_length) {
+        // The activation's value wins where there is one: it is where the spec puts it, and
+        // preferring it means a server cannot shorten an already-agreed PIN here. Only when
+        // the activation was silent does this message decide the length — and then it is held
+        // to the same floor the activation would have been.
+        let pin_length = match self.pin_length.or(message.pin_length) {
+            Some(length) if pin::pin_length_acceptable(length, self.min_pin_length) => length,
+            Some(_) => {
+                self.phase = Phase::Done;
+                return PinStep::Abort(PairAbortReason::PinLengthUnacceptable);
+            }
+            None => {
+                return self
+                    .protocol_error("no pin_length in either the activation or server/pair-init")
+            }
+        };
+
+        match pin::derive_pin(&self.handshake_hash, &nonce_a, &nonce_b, pin_length) {
             Ok(pin_value) => {
                 self.nonce_a = Some(nonce_a);
+                self.pin_length = Some(pin_length);
                 self.pin = Some(pin_value.clone());
                 self.phase = Phase::PinKnown;
                 PinStep::EmitPin(pin_value)

@@ -18,7 +18,8 @@ use sendspin::noise::keys::{b64_decode_bytes, b64_encode_bytes, b64_encode_slice
 use sendspin::noise::pairing::PairAbortReason;
 use sendspin::noise::pin::{self, AD_CLIENT, AD_SERVER};
 use sendspin::noise::pin_flow::{
-    open_wrapped_psk, PinPairing, PinStep, ServerPairAuth, ServerPairConfirm, ServerPairInit,
+    open_wrapped_psk, PinLength, PinPairing, PinStep, ServerPairAuth, ServerPairConfirm,
+    ServerPairInit,
 };
 use sendspin::noise::{CipherSuite, InMemoryPairingStore, PairingStore};
 use sendspin::protocol::messages::{Message, PairMethod};
@@ -73,7 +74,10 @@ fn run_static(client_pin: &str, server_pin: &str) -> (PinStep, Server, InMemoryP
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        8,
+        PinLength {
+            negotiated: Some(8),
+            minimum: 8,
+        },
         "server-1",
         Some(client_pin),
     )
@@ -155,7 +159,10 @@ fn a_static_attempt_needs_a_configured_pin_of_the_right_shape() {
                 CipherSuite::ChaChaPoly,
                 HASH,
                 INDEX,
-                8,
+                PinLength {
+                    negotiated: Some(8),
+                    minimum: 8,
+                },
                 "server-1",
                 bad,
             )
@@ -179,7 +186,10 @@ fn the_dynamic_flow_commits_first_and_opens_last() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        6,
+        PinLength {
+            negotiated: Some(6),
+            minimum: 6,
+        },
         "server-1",
         None,
     )
@@ -190,6 +200,7 @@ fn the_dynamic_flow_commits_first_and_opens_last() {
     let nonce_a = [0x11u8; 32];
     let step = attempt.on_server_pair_init(&ServerPairInit {
         nonce_a: b64_encode_bytes(&nonce_a),
+        pin_length: None,
     });
     let PinStep::EmitPin(pin_value) = step else {
         panic!("expected a PIN to emit, got {step:?}");
@@ -234,13 +245,17 @@ fn a_failed_verification_is_what_counts_as_a_failure() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        6,
+        PinLength {
+            negotiated: Some(6),
+            minimum: 6,
+        },
         "server-1",
         None,
     )
     .unwrap();
     let step = attempt.on_server_pair_init(&ServerPairInit {
         nonce_a: b64_encode_bytes(&[0x11u8; 32]),
+        pin_length: None,
     });
     let PinStep::EmitPin(_) = step else {
         panic!("expected a PIN")
@@ -274,7 +289,10 @@ fn out_of_sequence_messages_are_protocol_errors() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        8,
+        PinLength {
+            negotiated: Some(8),
+            minimum: 8,
+        },
         "server-1",
         Some("12345678"),
     )
@@ -283,6 +301,7 @@ fn out_of_sequence_messages_are_protocol_errors() {
     // The static flow has no server/pair-init at all.
     let step = attempt.on_server_pair_init(&ServerPairInit {
         nonce_a: b64_encode_bytes(&[0u8; 32]),
+        pin_length: None,
     });
     assert!(matches!(step, PinStep::ProtocolError(_)), "got {step:?}");
 
@@ -292,7 +311,10 @@ fn out_of_sequence_messages_are_protocol_errors() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        8,
+        PinLength {
+            negotiated: Some(8),
+            minimum: 8,
+        },
         "server-1",
         Some("12345678"),
     )
@@ -314,7 +336,10 @@ fn malformed_fields_are_protocol_errors() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        6,
+        PinLength {
+            negotiated: Some(6),
+            minimum: 6,
+        },
         "server-1",
         None,
     )
@@ -325,13 +350,17 @@ fn malformed_fields_are_protocol_errors() {
             CipherSuite::ChaChaPoly,
             HASH,
             INDEX,
-            6,
+            PinLength {
+                negotiated: Some(6),
+                minimum: 6,
+            },
             "server-1",
             None,
         )
         .unwrap();
         let step = fresh.on_server_pair_init(&ServerPairInit {
             nonce_a: bad.to_string(),
+            pin_length: None,
         });
         assert!(
             matches!(step, PinStep::ProtocolError(_)),
@@ -342,6 +371,7 @@ fn malformed_fields_are_protocol_errors() {
     // A share of the wrong length is refused before it reaches the curve.
     let step = attempt.on_server_pair_init(&ServerPairInit {
         nonce_a: b64_encode_bytes(&[1u8; 32]),
+        pin_length: None,
     });
     assert!(matches!(step, PinStep::EmitPin(_)));
     let step = attempt.on_server_pair_auth(&ServerPairAuth {
@@ -358,7 +388,10 @@ fn the_psk_method_is_not_a_pin_flow() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        8,
+        PinLength {
+            negotiated: Some(8),
+            minimum: 8,
+        },
         "server-1",
         None,
     )
@@ -381,6 +414,7 @@ fn the_pairing_messages_use_the_names_the_spec_defines() {
         (
             Message::ServerPairInit(ServerPairInit {
                 nonce_a: "x".into(),
+                pin_length: None,
             }),
             "server/pair-init",
         ),
@@ -403,6 +437,130 @@ fn the_pairing_messages_use_the_names_the_spec_defines() {
     }
 }
 
+/// The three pairing fields the spec capitalises, spelled the way it spells them.
+///
+/// Worth a test of its own because getting one wrong is invisible to this crate: the field is
+/// optional on the wire, so a snake-cased `commit_b` does not fail to parse anywhere — it
+/// simply is not the field the peer is looking for, and the server reports a client that
+/// offered no commitment. Both the spec and `aiosendspin` name these after the CPace roles.
+#[test]
+fn the_capitalised_pairing_fields_keep_their_wire_spelling() {
+    let init = serde_json::to_value(Message::ClientPairInit(
+        sendspin::noise::pin_flow::ClientPairInit {
+            pairing_index: 1,
+            commit_b: Some("commitment".into()),
+        },
+    ))
+    .unwrap();
+    assert_eq!(init["payload"]["commit_B"], "commitment");
+
+    let confirm = serde_json::to_value(Message::ClientPairConfirm(
+        sendspin::noise::pin_flow::ClientPairConfirm {
+            client_kc: "tag".into(),
+            nonce_b: Some("nonce".into()),
+        },
+    ))
+    .unwrap();
+    assert_eq!(confirm["payload"]["nonce_B"], "nonce");
+
+    // And the one that arrives: a server sends `nonce_A`, so that is what has to parse.
+    let incoming = r#"{"nonce_A":"nonce","pin_length":6}"#;
+    let parsed: ServerPairInit = serde_json::from_str(incoming).unwrap();
+    assert_eq!(parsed.nonce_a, "nonce");
+    assert_eq!(parsed.pin_length, Some(6));
+}
+
+/// Where the two sources disagree about which message carries `pin_length`, read both.
+///
+/// The spec puts it in the activation's `pairing` object and does not list it on
+/// `server/pair-init`; `aiosendspin` sends it on `server/pair-init` and leaves the activation
+/// without a `pairing` object. A client that reads only one derives a PIN of the wrong length
+/// against half the servers in existence.
+#[test]
+fn a_pin_length_stated_only_in_server_pair_init_still_decides_the_length() {
+    let (mut attempt, _) = PinPairing::start(
+        PairMethod::DynamicPin,
+        CipherSuite::ChaChaPoly,
+        HASH,
+        INDEX,
+        // The activation named none, which is what the reference server does.
+        PinLength {
+            negotiated: None,
+            minimum: 6,
+        },
+        "server-1",
+        None,
+    )
+    .unwrap();
+    let step = attempt.on_server_pair_init(&ServerPairInit {
+        nonce_a: b64_encode_bytes(&[0x11u8; 32]),
+        pin_length: Some(8),
+    });
+    let PinStep::EmitPin(pin_value) = step else {
+        panic!("expected a PIN, got {step:?}");
+    };
+    assert_eq!(pin_value.len(), 8, "the late length is the one used");
+}
+
+/// The activation's value wins, so a late message cannot shorten an agreed PIN.
+#[test]
+fn a_pin_length_agreed_in_the_activation_is_not_reopened() {
+    let (mut attempt, _) = PinPairing::start(
+        PairMethod::DynamicPin,
+        CipherSuite::ChaChaPoly,
+        HASH,
+        INDEX,
+        PinLength {
+            negotiated: Some(10),
+            minimum: 6,
+        },
+        "server-1",
+        None,
+    )
+    .unwrap();
+    let step = attempt.on_server_pair_init(&ServerPairInit {
+        nonce_a: b64_encode_bytes(&[0x11u8; 32]),
+        pin_length: Some(6),
+    });
+    let PinStep::EmitPin(pin_value) = step else {
+        panic!("expected a PIN, got {step:?}");
+    };
+    assert_eq!(pin_value.len(), 10, "the activation decided this");
+}
+
+/// A late length below this client's floor is refused, exactly as an early one would be.
+///
+/// Otherwise the deferral would be a way around the check: name nothing in the activation,
+/// then ask for four digits once the client has already committed to its nonce.
+#[test]
+fn a_late_pin_length_is_held_to_the_same_floor() {
+    let (mut attempt, _) = PinPairing::start(
+        PairMethod::DynamicPin,
+        CipherSuite::ChaChaPoly,
+        HASH,
+        INDEX,
+        PinLength {
+            negotiated: None,
+            minimum: 6,
+        },
+        "server-1",
+        None,
+    )
+    .unwrap();
+    let step = attempt.on_server_pair_init(&ServerPairInit {
+        nonce_a: b64_encode_bytes(&[0x11u8; 32]),
+        pin_length: Some(4),
+    });
+    assert!(
+        matches!(step, PinStep::Abort(PairAbortReason::PinLengthUnacceptable)),
+        "got {step:?}"
+    );
+    assert!(
+        !PairAbortReason::PinLengthUnacceptable.closes_connection(),
+        "the server may still offer another method"
+    );
+}
+
 /// The optional fields are omitted rather than sent as null, because the static flow's
 /// absence of a commitment is what tells the server which flow it is in.
 #[test]
@@ -412,7 +570,10 @@ fn the_static_flow_omits_the_dynamic_fields() {
         CipherSuite::ChaChaPoly,
         HASH,
         INDEX,
-        8,
+        PinLength {
+            negotiated: Some(8),
+            minimum: 8,
+        },
         "server-1",
         Some("12345678"),
     )

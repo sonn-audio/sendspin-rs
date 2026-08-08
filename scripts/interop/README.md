@@ -110,6 +110,33 @@ suggestive: `initiate_pairing` raises on any failure in the exchange, and the cl
 back on a long-term PSK afterwards — which only exists if the server unwrapped the sealed
 PSK, and it can only do that with a CPace output that matches.
 
+## Driving dynamic-PIN pairing
+
+`PAIR_DYNAMIC_PIN=<client_id>:<pin_file>` runs the dynamic flow, where the PIN travels the
+*other* way: the client derives it from the handshake hash and both nonces, shows it on the
+device, and an operator types it into the server. So a harness run has to carry a value out
+of the Rust process and into the Python one — `--pin-file` writes what the client emits,
+and the server's `PinProvider` polls the same path until it appears.
+
+```bash
+PAIR_DYNAMIC_PIN=<client_id>:/tmp/dynpin.txt \
+    PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_server.py 8991
+cargo run --example noise_interop -- --full --seed 9 --listen-secs 20 \
+    --pin-file /tmp/dynpin.txt --server ws://127.0.0.1:8991/sendspin
+```
+
+The file stands in for the operator, and it is the only faked part: everything either side
+computes is its own. The client clears a stale file before connecting, so a value left by a
+previous run cannot be mistaken for this one's.
+
+A pass prints `PIN_FROM_FILE=<pin>` and `DYNAMIC_PIN_PAIRING_OK` on the server, and the
+client persists a long-term record and comes back with `player@v1` active after the
+re-handshake. `PIN_FILE_TIMEOUT` (default 30s) bounds the wait.
+
+Unlike the static flow this one is not gesture-gated at six digits, so no window is opened:
+the gate applies only to an escalated method or a PIN below six digits. Both cipher suites
+pass.
+
 ## Driving `management/*`
 
 `DRIVE_MANAGEMENT=1` on the server opens a management session as soon as a client is on a
@@ -150,7 +177,12 @@ observed rather than assumed.
 Static-PIN pairing completes end to end, so the CPace exchange, the confirmation ordering
 and the PSK wrapping have all spoken rather than only passing their own tests.
 
-Six defects came out of pointing it at the reference server, none of which a loopback test
+Dynamic-PIN pairing completes end to end on both suites, which covers the sequencing the
+derivation tests could not: `server/pair-init` arriving where this client expects it, the
+commitment surviving the round trip, and the server's three-step verification accepting what
+the client sends.
+
+Seven defects came out of pointing it at the reference server, none of which a loopback test
 would have surfaced:
 
 1. **`client/hello` advertised no `supported_pair_methods`.** The server will not pair with a
@@ -187,3 +219,20 @@ would have surfaced:
    by `ClientState::retain_active_roles`, which drops role objects the activation did not
    grant. `available` is kept either way: it is a property of the client, not of a role, and
    a server withholds binary data until it arrives.
+7. **The three capitalised pairing fields were serialized snake-cased.** The spec and
+   `aiosendspin` both name `commit_B`, `nonce_A` and `nonce_B` after the CPace roles; this
+   crate sent `commit_b` and read `nonce_a`. All three are optional or absent-tolerant on the
+   wire, so nothing failed to parse — the server simply saw a `client/pair-init` with no
+   commitment and stopped: `client/pair-init missing commit_B for dynamic PIN`. The static
+   flow uses none of the three, which is why five interop runs passed without touching it.
+   Fixed with `serde(rename)`, and pinned by a test that asserts the wire spelling rather
+   than the round trip — a round trip through one implementation agrees with itself whatever
+   it calls the field.
+
+   The same run turned up a spec-versus-reference divergence underneath it: the spec carries
+   the negotiated `pin_length` in the activation's `pairing` object and does not list it on
+   `server/pair-init`, while `aiosendspin` sends it on `server/pair-init` and omits the
+   `pairing` object entirely. Both are now read, preferring the activation's — so a server
+   cannot shorten an already-agreed PIN late — and a length that arrives late is held to the
+   same `min_pin_length` floor an early one would be. Reading only one of the two derives a
+   PIN of the wrong length against half the servers that exist.
