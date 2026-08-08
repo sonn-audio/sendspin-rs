@@ -14,9 +14,9 @@
 //! encrypted transport. Losing either one loses the pairing.
 //!
 //! ```no_run
-//! use sendspin::noise::file_store::{load_or_create_identity, FilePairingStore};
+//! use sendspin_proto::noise::file_store::{load_or_create_identity, FilePairingStore};
 //!
-//! # fn main() -> Result<(), sendspin::error::Error> {
+//! # fn main() -> Result<(), sendspin_proto::error::Error> {
 //! let dir = std::path::Path::new("/var/lib/sendspin");
 //! let identity = load_or_create_identity(&dir.join("identity.key"))?;
 //! let store = FilePairingStore::open(dir.join("pairing.json"))?;

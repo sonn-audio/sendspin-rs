@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use clap::Parser;
 use parking_lot::Mutex;
-use sendspin::noise::Identity;
-use sendspin::protocol::messages::StreamPlayerConfig;
+use sendspin_proto::messages::StreamPlayerConfig;
+use sendspin_proto::noise::Identity;
 use sendspin_server::{AudioSource, SendspinServer, ServerConfig};
 
 /// A 440 Hz tone, for a server that has to play *something* to be worth pointing a client at.

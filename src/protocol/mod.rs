@@ -13,7 +13,11 @@ pub mod listener;
 /// Managed connection lifecycle: multi-server arbitration and auto-goodbye
 pub mod manager;
 /// Protocol message type definitions and serialization
-pub mod messages;
+/// Every protocol message, in both directions.
+///
+/// Re-exported from `sendspin-proto`: the vocabulary is shared with the server crate, and the
+/// path here is what it has always been.
+pub use sendspin_proto::messages;
 /// The seam between protocol logic and the socket: plain frames, or Noise ciphertexts
 pub(crate) mod transport;
 

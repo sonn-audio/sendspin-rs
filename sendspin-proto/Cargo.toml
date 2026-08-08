@@ -1,0 +1,33 @@
+[package]
+name = "sendspin-proto"
+version = "0.3.6"
+edition = "2021"
+authors = ["Sendspin Contributors"]
+description = "Shared protocol core for the Sendspin Protocol: messages, the encrypted transport, and clock synchronization"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sendspin/sendspin-rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+log = "0.4"
+parking_lot = "0.12"
+base64 = "0.22"
+
+# The Noise transport and the pairing crypto.
+snow = "0.10.0"
+sha2 = "0.11.0"
+hmac = "0.13"
+subtle = "2"
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+crypto-bigint = { version = "0.7", default-features = false, features = ["alloc"] }
+chacha20poly1305 = "0.11"
+aes-gcm = "0.11"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# CLOCK_MONOTONIC_RAW, read directly rather than through Instant.
+libc = "0.2"
+
+[dev-dependencies]
+serde_json = "1.0"

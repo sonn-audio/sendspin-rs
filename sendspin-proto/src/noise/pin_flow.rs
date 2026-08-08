@@ -41,7 +41,7 @@ use super::pin;
 use super::session::CipherSuite;
 use super::trust_store::{random_psk, PairingRecord, PairingStore};
 use crate::error::Error;
-use crate::protocol::messages::PairMethod;
+use crate::messages::PairMethod;
 
 /// `client/pair-pending` — the attempt is gesture-gated and no window is open yet.
 ///
@@ -136,7 +136,7 @@ pub struct PinLength {
 #[derive(Debug)]
 pub enum PinStep {
     /// Send this message and wait for the next one from the server.
-    Send(Box<crate::protocol::messages::Message>),
+    Send(Box<crate::messages::Message>),
     /// Emit this PIN to the operator, then wait. Dynamic PIN only.
     ///
     /// The operator reads it off the device and types it into the server, which is what
@@ -347,11 +347,11 @@ impl PinPairing {
 
         self.output = Some(output);
         self.phase = Phase::AwaitingConfirm;
-        PinStep::Send(Box::new(
-            crate::protocol::messages::Message::ClientPairAuth(ClientPairAuth {
+        PinStep::Send(Box::new(crate::messages::Message::ClientPairAuth(
+            ClientPairAuth {
                 pake_msg_2: b64_encode_bytes(&yb),
-            }),
-        ))
+            },
+        )))
     }
 
     /// Handle `server/pair-confirm`: verify the server's tag, then reveal this side's.

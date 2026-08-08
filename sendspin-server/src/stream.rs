@@ -20,7 +20,7 @@
 //! transcoding. The reference implementation's `PushStream` does all of that; what this pins
 //! down first is the part everything else sits on.
 
-use sendspin::protocol::messages::{StreamPlayerConfig, StreamStart};
+use sendspin_proto::messages::{StreamPlayerConfig, StreamStart};
 
 /// Binary message type for player audio, per the spec.
 pub const PLAYER_AUDIO: u8 = 0x04;

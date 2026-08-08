@@ -1,5 +1,5 @@
 [workspace]
-members = ["sendspin-server"]
+members = ["sendspin-proto", "sendspin-server"]
 
 [package]
 name = "sendspin"
@@ -28,6 +28,9 @@ cli = ["dep:clap", "dep:env_logger", "dep:shlex", "discovery"]
 hardware-volume = ["dep:alsa"]
 
 [dependencies]
+# The shared protocol core: messages, the encrypted transport, and the clock.
+sendspin-proto = { path = "sendspin-proto", version = "0.3.6" }
+
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
 tokio-tungstenite = "0.29"

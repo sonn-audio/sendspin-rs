@@ -10,14 +10,20 @@
 
 #![warn(missing_docs)]
 
+// The three modules below live in `sendspin-proto` so the server crate can use them without
+// pulling in an audio stack, and are re-exported here at the paths they have always had.
+
+/// Error types for Sendspin operations.
+pub use sendspin_proto::error;
+/// The encrypted `KKpsk2` transport, and everything keyed to it.
+pub use sendspin_proto::noise;
+/// Clock synchronization.
+pub use sendspin_proto::sync;
+
 /// Audio types and processing
 pub mod audio;
-/// The Noise-encrypted transport every current Sendspin connection runs on
-pub mod noise;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
-/// Clock synchronization utilities
-pub mod sync;
 
 pub(crate) mod log_sampling;
 
@@ -32,32 +38,3 @@ pub use sync::raw_clock::{Clock, DefaultClock};
 
 /// Result type for sendspin operations
 pub type Result<T> = std::result::Result<T, error::Error>;
-
-/// Error types for sendspin
-pub mod error {
-    use thiserror::Error;
-
-    /// Error types for sendspin operations
-    #[derive(Error, Debug)]
-    pub enum Error {
-        /// WebSocket-related error
-        #[error("WebSocket error: {0}")]
-        WebSocket(String),
-
-        /// Protocol violation or parsing error
-        #[error("Protocol error: {0}")]
-        Protocol(String),
-
-        /// Invalid message format received
-        #[error("Invalid message format")]
-        InvalidMessage,
-
-        /// Connection-related error
-        #[error("Connection error: {0}")]
-        Connection(String),
-
-        /// Audio output error
-        #[error("Audio output error: {0}")]
-        Output(String),
-    }
-}

@@ -113,11 +113,9 @@ pub fn run_rehandshake_client(
     }
     session.into_transport_mode()?;
 
-    let reply = serde_json::to_vec(&crate::protocol::messages::Message::NoiseHandshake(
-        NoiseHandshake {
-            data: URL_SAFE_NO_PAD.encode(&msg2),
-        },
-    ))
+    let reply = serde_json::to_vec(&crate::messages::Message::NoiseHandshake(NoiseHandshake {
+        data: URL_SAFE_NO_PAD.encode(&msg2),
+    }))
     .map_err(|e| Error::Protocol(format!("could not encode noise/handshake: {e}")))?;
 
     Ok(RehandshakeResult {

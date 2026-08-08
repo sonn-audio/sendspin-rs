@@ -8,10 +8,10 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sendspin/sendspin-rs"
 
 [dependencies]
-# The protocol vocabulary, the Noise transport and the clock are the client crate's, and
-# every one of them is direction-agnostic: a server needs the same message types, the same
-# framing and the same handshake primitives, with the roles the other way round.
-sendspin = { path = "..", version = "0.3.6" }
+# The shared core, not the client crate. Depending on the client would have meant compiling
+# `cpal`, the audio decoders and the ALSA headers behind them for a server that plays nothing
+# locally — a non-optional dependency in Rust is built whether or not anything touches it.
+sendspin-proto = { path = "../sendspin-proto", version = "0.3.6" }
 
 tokio = { version = "1.52", features = ["full"] }
 tokio-tungstenite = "0.29"

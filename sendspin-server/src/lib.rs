@@ -29,8 +29,8 @@
 //!
 //! ```no_run
 //! # #[tokio::main]
-//! # async fn main() -> Result<(), sendspin::error::Error> {
-//! use sendspin::noise::Identity;
+//! # async fn main() -> Result<(), sendspin_proto::error::Error> {
+//! use sendspin_proto::noise::Identity;
 //! use sendspin_server::{SendspinServer, ServerConfig};
 //!
 //! let config = ServerConfig::new(Identity::generate()?, "Living Room".to_string());
@@ -43,9 +43,9 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use sendspin::error::Error;
-use sendspin::noise::keys::Identity;
-use sendspin::sync::raw_clock::{Clock, DefaultClock};
+use sendspin_proto::error::Error;
+use sendspin_proto::noise::keys::Identity;
+use sendspin_proto::sync::raw_clock::{Clock, DefaultClock};
 
 /// Where a server's audio comes from.
 ///
@@ -55,7 +55,7 @@ use sendspin::sync::raw_clock::{Clock, DefaultClock};
 /// knows the timeline rather than with whatever is producing samples.
 pub trait AudioSource: Send + Sync {
     /// The format the PCM is in. Fixed for the life of the source.
-    fn format(&self) -> sendspin::protocol::messages::StreamPlayerConfig;
+    fn format(&self) -> sendspin_proto::messages::StreamPlayerConfig;
 
     /// Fill `frames` worth of PCM, or return `None` when the source is finished.
     fn next_chunk(&self, frames: usize) -> Option<Vec<u8>>;

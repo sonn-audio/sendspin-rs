@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::trust_store::{psk_from_wire, PairingRecord, PairingStore};
 use crate::error::Error;
-use crate::protocol::messages::UnpairedAccess;
+use crate::messages::UnpairedAccess;
 
 /// `server/unpair` — a paired server drops its own record and the connection ends.
 ///

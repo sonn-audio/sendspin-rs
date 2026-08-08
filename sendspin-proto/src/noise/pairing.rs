@@ -7,7 +7,7 @@ use super::constants::KEY_LEN;
 use super::keys::PskCategory;
 use super::trust_store::{psk_to_wire, random_psk, PairingRecord, PairingStore};
 use crate::error::Error;
-use crate::protocol::messages::PairMethod;
+use crate::messages::PairMethod;
 
 /// `client/pair-finalize` — delivers the long-term PSK for this (client, server) pair.
 ///

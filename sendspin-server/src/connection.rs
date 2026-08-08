@@ -19,13 +19,13 @@ use tokio_tungstenite::WebSocketStream;
 use crate::handshake::ServerHandshake;
 use crate::stream::{PlayerStream, DEFAULT_SEND_AHEAD_US};
 use crate::ServerConfig;
-use sendspin::error::Error;
-use sendspin::noise::constants::MSG_TYPE_JSON_BODY;
-use sendspin::noise::keys::Psk;
-use sendspin::noise::wire::{frame, Reassembler};
-use sendspin::protocol::messages::{
+use sendspin_proto::error::Error;
+use sendspin_proto::messages::{
     Activity, Message, ServerActivate, ServerHelloEncrypted, ServerTime, StreamEnd,
 };
+use sendspin_proto::noise::constants::MSG_TYPE_JSON_BODY;
+use sendspin_proto::noise::keys::Psk;
+use sendspin_proto::noise::wire::{frame, Reassembler};
 
 /// What one connection learned about its client.
 pub struct ConnectionSummary {
@@ -310,7 +310,7 @@ async fn send_text(ws: &mut WebSocketStream<TcpStream>, bytes: Vec<u8>) -> Resul
 /// Encrypt, frame and send one JSON message.
 async fn send_json<T: serde::Serialize>(
     ws: &mut WebSocketStream<TcpStream>,
-    session: &mut sendspin::noise::session::NoiseSession,
+    session: &mut sendspin_proto::noise::session::NoiseSession,
     message: &T,
 ) -> Result<(), Error> {
     let json = serde_json::to_vec(message)
@@ -327,7 +327,7 @@ async fn send_json<T: serde::Serialize>(
 /// Encrypt, frame and send one binary message, already carrying its own type byte.
 async fn send_binary(
     ws: &mut WebSocketStream<TcpStream>,
-    session: &mut sendspin::noise::session::NoiseSession,
+    session: &mut sendspin_proto::noise::session::NoiseSession,
     body: &[u8],
 ) -> Result<(), Error> {
     // The audio frame's own type byte is the *inner* one, inside the framing layer's envelope;
@@ -349,7 +349,7 @@ async fn send_binary(
 /// `Ok(None)` means the client closed cleanly.
 async fn next_encrypted(
     ws: &mut WebSocketStream<TcpStream>,
-    session: &mut sendspin::noise::session::NoiseSession,
+    session: &mut sendspin_proto::noise::session::NoiseSession,
     reassembler: &mut Reassembler,
 ) -> Result<Option<Message>, Error> {
     while let Some(next) = ws.next().await {

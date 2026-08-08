@@ -487,7 +487,7 @@ pub struct ServerHelloEncrypted {
 /// A purpose a connection is currently serving.
 ///
 /// Ranked by how much it displaces, the same ladder the legacy [`ConnectionReason`] uses:
-/// see [`should_switch`](crate::protocol::should_switch).
+/// see `should_switch` in the `sendspin` crate's connection policy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Activity {
@@ -582,7 +582,7 @@ impl ServerActivate {
 
 /// Why a server opened this connection.
 ///
-/// Ordered by how much it displaces: see [`should_switch`](crate::protocol::should_switch).
+/// Ordered by how much it displaces: see `should_switch` in the `sendspin` crate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectionReason {

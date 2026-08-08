@@ -16,7 +16,7 @@
 //!    frame whose payload is a Noise transport ciphertext.
 //!
 //! The **server is the Noise initiator and the client the responder**, whichever side
-//! opened the socket. [`ClientHandshake`] is the client's half.
+//! opened the socket. [`ClientHandshake`](crate::noise::ClientHandshake) is the client's half.
 //!
 //! Two details are easy to get subtly wrong and are handled here rather than left to
 //! callers: the prologue is the *exact transmitted bytes* of the two init messages, so it
@@ -25,14 +25,14 @@
 //! makes PSK selection possible at all.
 //!
 //! ```no_run
-//! use sendspin::noise::{CipherSuite, ClientHandshake, Identity, Psk};
+//! use sendspin_proto::noise::{CipherSuite, ClientHandshake, Identity, Psk};
 //!
 //! let identity = Identity::generate()?;
 //! // A client that accepts an unpaired connection keeps the Sentinel PSK as a candidate.
 //! let (mut handshake, client_init) =
 //!     ClientHandshake::start(identity, CipherSuite::default(), vec![Psk::sentinel()])?;
 //! // Send `client_init` as a text frame, then feed each cleartext message back in.
-//! # Ok::<(), sendspin::error::Error>(())
+//! # Ok::<(), sendspin_proto::error::Error>(())
 //! ```
 
 /// Protocol constants: labels, the published Sentinel PSK, frame tags and size limits.

@@ -27,12 +27,12 @@
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 
-use sendspin::error::Error;
-use sendspin::noise::keys::{b64_decode, Identity, Psk};
-use sendspin::noise::models::{
+use sendspin_proto::error::Error;
+use sendspin_proto::noise::keys::{b64_decode, Identity, Psk};
+use sendspin_proto::noise::models::{
     ClientInit, InitMessage, NoiseHandshake, NoiseMsg1Payload, ServerInit, NOISE_MSG2_PAYLOAD,
 };
-use sendspin::noise::session::{CipherSuite, NoiseSession};
+use sendspin_proto::noise::session::{CipherSuite, NoiseSession};
 
 /// What a completed handshake leaves behind.
 pub struct ServerHandshakeResult {
@@ -85,7 +85,7 @@ impl ServerHandshake {
 
         let server_init = InitMessage::ServerInit(ServerInit {
             server_id: identity.client_id(),
-            version: sendspin::noise::constants::PROTOCOL_VERSION,
+            version: sendspin_proto::noise::constants::PROTOCOL_VERSION,
         });
         let server_init_bytes = serde_json::to_vec(&server_init)
             .map_err(|e| Error::Protocol(format!("could not encode server/init: {e}")))?;
