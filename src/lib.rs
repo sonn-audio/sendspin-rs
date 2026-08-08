@@ -16,10 +16,6 @@ pub mod audio;
 pub mod noise;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
-
-/// The server side of the protocol, behind the `server` feature.
-#[cfg(feature = "server")]
-pub mod server;
 /// Clock synchronization utilities
 pub mod sync;
 

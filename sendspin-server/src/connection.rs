@@ -16,13 +16,13 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::error::Error;
-use crate::noise::constants::MSG_TYPE_JSON_BODY;
-use crate::noise::keys::Psk;
-use crate::noise::wire::{frame, Reassembler};
-use crate::protocol::messages::{Message, ServerActivate, ServerHelloEncrypted, ServerTime};
-use crate::server::handshake::ServerHandshake;
-use crate::server::ServerConfig;
+use crate::handshake::ServerHandshake;
+use crate::ServerConfig;
+use sendspin::error::Error;
+use sendspin::noise::constants::MSG_TYPE_JSON_BODY;
+use sendspin::noise::keys::Psk;
+use sendspin::noise::wire::{frame, Reassembler};
+use sendspin::protocol::messages::{Message, ServerActivate, ServerHelloEncrypted, ServerTime};
 
 /// What one connection learned about its client.
 pub struct ConnectionSummary {
@@ -197,7 +197,7 @@ async fn send_text(ws: &mut WebSocketStream<TcpStream>, bytes: Vec<u8>) -> Resul
 /// Encrypt, frame and send one JSON message.
 async fn send_json<T: serde::Serialize>(
     ws: &mut WebSocketStream<TcpStream>,
-    session: &mut crate::noise::session::NoiseSession,
+    session: &mut sendspin::noise::session::NoiseSession,
     message: &T,
 ) -> Result<(), Error> {
     let json = serde_json::to_vec(message)
@@ -216,7 +216,7 @@ async fn send_json<T: serde::Serialize>(
 /// `Ok(None)` means the client closed cleanly.
 async fn next_encrypted(
     ws: &mut WebSocketStream<TcpStream>,
-    session: &mut crate::noise::session::NoiseSession,
+    session: &mut sendspin::noise::session::NoiseSession,
     reassembler: &mut Reassembler,
 ) -> Result<Option<Message>, Error> {
     while let Some(next) = ws.next().await {

@@ -3,8 +3,16 @@
 
 //! A Sendspin server.
 //!
-//! Behind the `server` feature, and off by default for the same reason `discovery` is: an
-//! embedded player has no use for a server and should not link one.
+//! A crate of its own rather than a feature of `sendspin`, because the two have genuinely
+//! different dependency appetites: a server grows resamplers, encoders and signal analysis
+//! that an embedded player has no use for, and a feature flag on one crate makes every one of
+//! those a decision the player's build has to carry.
+//!
+//! What it borrows from `sendspin` is everything that is direction-agnostic, and that turns
+//! out to be most of the protocol: the message vocabulary derives both `Serialize` and
+//! `Deserialize`, so the whole wire surface works in either direction, and the framing,
+//! fragmentation and Noise primitives do not care which end they are on. Nothing here reaches
+//! into the client crate's internals.
 //!
 //! # What works
 //!
@@ -23,7 +31,7 @@
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), sendspin::error::Error> {
 //! use sendspin::noise::Identity;
-//! use sendspin::server::{SendspinServer, ServerConfig};
+//! use sendspin_server::{SendspinServer, ServerConfig};
 //!
 //! let config = ServerConfig::new(Identity::generate()?, "Living Room".to_string());
 //! let server = SendspinServer::bind("0.0.0.0:8927", config).await?;
@@ -35,9 +43,9 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use crate::error::Error;
-use crate::noise::keys::Identity;
-use crate::sync::raw_clock::{Clock, DefaultClock};
+use sendspin::error::Error;
+use sendspin::noise::keys::Identity;
+use sendspin::sync::raw_clock::{Clock, DefaultClock};
 
 pub mod connection;
 pub mod handshake;

@@ -1,0 +1,32 @@
+[package]
+name = "sendspin-server"
+version = "0.3.6"
+edition = "2021"
+authors = ["Sendspin Contributors"]
+description = "Server implementation of the Sendspin Protocol for synchronized multi-room audio streaming"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Sendspin/sendspin-rs"
+
+[dependencies]
+# The protocol vocabulary, the Noise transport and the clock are the client crate's, and
+# every one of them is direction-agnostic: a server needs the same message types, the same
+# framing and the same handshake primitives, with the roles the other way round.
+sendspin = { path = "..", version = "0.3.6" }
+
+tokio = { version = "1.52", features = ["full"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+base64 = "0.22"
+parking_lot = "0.12"
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+[dev-dependencies]
+clap = { version = "4.6", features = ["derive"] }
+env_logger = "0.11"
+tokio-test = "0.4"
+
+[[example]]
+name = "server"

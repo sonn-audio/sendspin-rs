@@ -47,7 +47,7 @@ implementation's *client* against the Rust server, which is the only way to find
 the server half reads the spec the same way.
 
 ```bash
-cargo run --features server --example server -- --bind 127.0.0.1:8927 --seed 3
+cargo run -p sendspin-server --example server -- --bind 127.0.0.1:8927 --seed 3
 PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_client.py \
     ws://127.0.0.1:8927/sendspin
 SUITE=aes PYTHONPATH=./aiosendspin .venv/bin/python scripts/interop/reference_client.py \

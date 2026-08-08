@@ -4,7 +4,7 @@
 //! A minimal Sendspin server.
 //!
 //! ```text
-//! cargo run --features server --example server -- --port 8927
+//! cargo run -p sendspin-server --example server -- --bind 127.0.0.1:8927
 //! ```
 //!
 //! Then point `aiosendspin`'s own client at it — see `scripts/interop/reference_client.py`.
@@ -13,7 +13,7 @@
 
 use clap::Parser;
 use sendspin::noise::Identity;
-use sendspin::server::{SendspinServer, ServerConfig};
+use sendspin_server::{SendspinServer, ServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(about = "Run a Sendspin server", long_about = None)]

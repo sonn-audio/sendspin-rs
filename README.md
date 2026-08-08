@@ -67,7 +67,11 @@ application raises, and the dynamic PIN reaches the operator through
 `EncryptionSettings::emit_pin`, because only the host knows whether this device has a display,
 a speaker or a row of LEDs.
 
-**Not implemented:** the server side. This crate is a client.
+**The server** lives in [`sendspin-server`](sendspin-server), a crate of its own rather than a
+feature of this one: a server grows resamplers, encoders and signal analysis that an embedded
+player has no use for. It borrows this crate's message vocabulary, framing and Noise
+primitives, all of which are direction-agnostic, without reaching into anything private. It is
+early — see its README for what works.
 
 **Encryption is opt-in for now**, because turning it on changes which servers a client can
 reach. Pass it explicitly:
