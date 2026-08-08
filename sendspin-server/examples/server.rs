@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use clap::Parser;
 use parking_lot::Mutex;
-use sendspin_proto::messages::{MetadataState, StreamPlayerConfig};
+use sendspin_proto::messages::{
+    ControllerCommand, ControllerCommandType, MetadataState, StreamPlayerConfig,
+};
 use sendspin_proto::noise::Identity;
-use sendspin_server::{AudioSource, MetadataSource, SendspinServer, ServerConfig};
+use sendspin_server::{AudioSource, Controller, MetadataSource, SendspinServer, ServerConfig};
 
 /// A 440 Hz tone, for a server that has to play *something* to be worth pointing a client at.
 ///
@@ -29,6 +31,30 @@ struct Tone {
     /// Frames left to produce, or `None` for a tone that never ends.
     remaining: Mutex<Option<u64>>,
     phase: Mutex<f32>,
+}
+
+/// A controller that accepts a small, honest set of commands.
+///
+/// `Next` and `Previous` are deliberately *not* advertised: this example plays one generated
+/// tone and has nothing to skip to, and advertising a command it cannot honour is exactly the
+/// promise the server refuses to make elsewhere.
+struct ExampleController;
+
+impl Controller for ExampleController {
+    fn supported_commands(&self) -> Vec<ControllerCommandType> {
+        vec![
+            ControllerCommandType::Volume,
+            ControllerCommandType::Mute,
+            ControllerCommandType::Play,
+            ControllerCommandType::Pause,
+        ]
+    }
+
+    fn handle(&self, command: &ControllerCommand) {
+        // A real server would start or stop its pipeline here. The example has one endless
+        // tone, so saying what it was asked is the honest thing it can do.
+        println!("COMMAND={:?}", command.command);
+    }
 }
 
 /// The track the example claims to be playing.
@@ -146,7 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A fixed track, so a client that activated `metadata@v1` has something to display and the
     // interop harness has something to assert on. A real server reads this from whatever its
     // music comes from.
-    config = config.with_metadata(Arc::new(FixedTrack));
+    config = config
+        .with_metadata(Arc::new(FixedTrack))
+        .with_controller(Arc::new(ExampleController));
 
     let server = SendspinServer::bind(&args.bind, config).await?;
 

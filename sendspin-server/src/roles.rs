@@ -21,7 +21,7 @@ use crate::ServerConfig;
 ///
 /// Grows one entry at a time, and only when there is something behind it. Being listed here is
 /// necessary but not sufficient — see [`servable`].
-pub const IMPLEMENTED: &[&str] = &["player@v1", "metadata@v1"];
+pub const IMPLEMENTED: &[&str] = &["player@v1", "metadata@v1", "controller@v1"];
 
 /// The roles this particular server can keep a promise about.
 ///
@@ -34,6 +34,9 @@ pub fn servable(config: &ServerConfig) -> Vec<&'static str> {
     }
     if config.metadata.is_some() {
         roles.push("metadata@v1");
+    }
+    if config.controller.is_some() {
+        roles.push("controller@v1");
     }
     roles
 }

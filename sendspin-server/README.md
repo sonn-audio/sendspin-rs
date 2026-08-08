@@ -22,6 +22,11 @@ client joining mid-track is seated in the stream already playing rather than giv
 false` — its output taken by an HDMI input or a local app — stops being sent audio without
 losing its connection, its clock sync or its roles, and resumes when it says it is free.
 
+`controller@v1` is served too: volume and mute are the group's own state, applied here and
+pushed to every player as a `server/command`, while play, pause, next and seek are handed to the
+application — what "next track" means belongs to whatever produces the audio, not to this crate.
+A command outside the advertised `supported_commands` is refused rather than attempted.
+
 A role is only activated when this server can actually keep the promise. `metadata@v1` is not
 granted by a server started without a metadata source, because a client told it has the role
 and then sent nothing cannot tell that apart from a server that crashed.
@@ -35,16 +40,18 @@ Synchronization is checked with *two* reference clients on one server, because a
 cannot detect the failure that matters: it has no way to tell whether the audio it receives is
 its own stream or a shared one. `two_clients.py` starts a second client a second late and
 compares both by playback timestamp — 155 shared chunks, byte-identical, the late joiner
-entering exactly 1s into the existing timeline.
+entering exactly 1s into the existing timeline. `controller.py` covers the other direction: a
+reference controller sends a volume, sees the state come back changed, sends a command the
+server never advertised, and confirms nothing moved and the connection survived.
 
-**Not yet:** pairing, management, transcoding, resampling, playback control, and the
-`controller`, `artwork`, `visualizer`, `color` and `source` roles. Limits worth stating plainly rather than discovering:
+**Not yet:** pairing, management, transcoding, resampling, and the `artwork`, `visualizer`,
+`color` and `source` roles. Limits worth stating plainly rather than discovering:
 
 - **One group, and nothing can ask to be regrouped.** Every client lands in the same group.
   Moving a client between groups is a `controller@v1` request, and that role is not served yet.
-- **No playback control.** `client/command` is parsed and ignored; `server/command` and
-  `stream/clear` are never sent. A stream starts when someone joins and ends when the source
-  runs out — nothing can pause, seek or set a volume.
+- **The stream itself does not pause.** A controller's play/pause reaches the application, but
+  this crate does not yet stop and re-anchor the timeline for it, and `stream/clear` is never
+  sent. A stream still starts when a player joins and ends when the source runs out.
 - **PCM only.** The client's advertised formats are not honoured yet; a client that cannot
   decode PCM 16-bit will not get something it can.
 - **No pairing**, so every connection is keyed by the Sentinel PSK. A client whose

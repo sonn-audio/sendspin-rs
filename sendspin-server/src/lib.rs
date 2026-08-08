@@ -18,10 +18,11 @@
 //!
 //! # What does not
 //!
-//! Pairing, management, transcoding, playback control, and every role but `player@v1`. A role
-//! this server does not serve is not activated even when a client offers it: activating one is
-//! a promise, and a client granted a role that is then never served looks broken from the
-//! outside.
+//! Pairing, management, transcoding, and the `artwork`, `visualizer`, `color` and `source`
+//! roles. Playback control reaches the application but does not yet pause the timeline itself.
+//! A role this server cannot serve is not activated even when a client offers it: activating
+//! one is a promise, and a client granted a role that is then never served looks broken from
+//! the outside.
 //!
 //! ```no_run
 //! # #[tokio::main]
@@ -75,6 +76,35 @@ pub mod stream;
 
 use crate::group::Group;
 
+/// What a server does when a controller asks for something.
+///
+/// The split is deliberate and follows the reference implementation: volume and mute are the
+/// *group's* state and are applied by this crate, but what "next track", "pause" or "seek to
+/// 90s" mean belongs to whatever is producing the audio. A crate that guessed at those would be
+/// wrong for every server that keeps its queue somewhere else, so it hands them over instead.
+pub trait Controller: Send + Sync {
+    /// Which commands this server will honour.
+    ///
+    /// Sent to clients as `supported_commands`, and enforced: a command outside this list is
+    /// refused rather than attempted. Advertising less than is implemented is safe; advertising
+    /// more is a promise that breaks at the moment a user presses the button.
+    fn supported_commands(&self) -> Vec<sendspin_proto::messages::ControllerCommandType>;
+
+    /// How far into the current track a seek may go, in milliseconds.
+    ///
+    /// `None` means seeking is not possible — a live stream has no position to seek to — and a
+    /// seek is then refused whatever `supported_commands` says.
+    fn seek_max_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// Act on a command this crate does not handle itself.
+    ///
+    /// Called only for commands that passed validation, so an implementation does not have to
+    /// re-check what was advertised or whether a seek was in range.
+    fn handle(&self, command: &sendspin_proto::messages::ControllerCommand);
+}
+
 /// What a server is: an identity, a name, and a clock.
 pub struct ServerConfig {
     /// The static keypair whose public half is this server's `server_id`.
@@ -94,6 +124,11 @@ pub struct ServerConfig {
     /// `None` means the role is not offered at all, rather than offered and left empty: see
     /// [`roles::servable`].
     pub metadata: Option<Arc<dyn MetadataSource>>,
+    /// What acts on commands from clients that activated `controller@v1`.
+    ///
+    /// `None` means the role is not offered: a server that cannot be told to do anything should
+    /// not claim it can.
+    pub controller: Option<Arc<dyn Controller>>,
     /// The timebase the clock replies are stamped from.
     ///
     /// Must be monotonic and not NTP-conditioned: a clock that steps backwards puts a step
@@ -109,6 +144,7 @@ impl ServerConfig {
             name,
             audio: None,
             metadata: None,
+            controller: None,
             clock: Arc::new(DefaultClock::new()),
         }
     }
@@ -117,6 +153,15 @@ impl ServerConfig {
     #[must_use]
     pub fn with_audio(mut self, source: Arc<dyn AudioSource>) -> Self {
         self.audio = Some(source);
+        self
+    }
+
+    /// The same config, accepting commands from controllers.
+    ///
+    /// Setting this is what makes `controller@v1` servable.
+    #[must_use]
+    pub fn with_controller(mut self, controller: Arc<dyn Controller>) -> Self {
+        self.controller = Some(controller);
         self
     }
 

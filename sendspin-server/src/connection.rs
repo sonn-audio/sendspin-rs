@@ -16,7 +16,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::group::{Group, Outgoing};
+use crate::group::{Group, Membership, Outgoing};
 use crate::handshake::ServerHandshake;
 use crate::ServerConfig;
 use sendspin_proto::error::Error;
@@ -153,10 +153,17 @@ pub async fn serve(
     let mut chunks_sent = 0u64;
 
     // Joining the group is what replaced pulling audio here. A connection no longer owns a
-    // timeline: it owns a *seat* at one, and the group hands every seat the same bytes. Only a
-    // client that activated as a player takes one — a connection with no player role has no
-    // use for audio frames and should not be counted as a listener keeping the group awake.
-    let mut membership = if will_play { Some(group.join()) } else { None };
+    // timeline: it owns a *seat* at one, and the group hands every seat the same bytes.
+    //
+    // Every activated client takes a seat, not only players: a controller learns the group's
+    // volume this way and a display learns what is playing. Whether it *plays* is separate, and
+    // is what decides both if it receives audio frames and if it keeps the stream running — a
+    // group holding nothing but a controller has nobody to play to.
+    let mut membership = if active_roles.is_empty() {
+        None
+    } else {
+        Some(group.join(will_play))
+    };
 
     if let Some(member) = membership.as_mut() {
         send_json(
@@ -177,6 +184,21 @@ pub async fn serve(
     // Metadata is its own role, so it is sent to a client that activated it whether or not that
     // client also plays: a display in the hallway wants to know what is on without receiving a
     // single sample.
+    if active_roles.iter().any(|r| r == "controller@v1") {
+        if let Some(controller) = group.controller_state() {
+            send_json(
+                &mut ws,
+                &mut done.session,
+                &Message::ServerState(ServerState {
+                    metadata: None,
+                    controller: Some(controller),
+                    color: None,
+                }),
+            )
+            .await?;
+        }
+    }
+
     if active_roles.iter().any(|r| r == "metadata@v1") {
         if let Some(metadata) = config.metadata.as_ref().and_then(|source| source.current()) {
             send_json(
@@ -230,12 +252,17 @@ pub async fn serve(
                 continue;
             }
             Event::Outgoing(Some(Ok(out))) => {
+                let plays = membership.as_ref().is_some_and(Membership::plays);
                 match out.as_ref() {
                     Outgoing::Json(msg) => send_json(&mut ws, &mut done.session, msg).await?,
-                    Outgoing::Binary(bytes) => {
+                    // Control messages go to the whole group; samples do not. Sending audio to a
+                    // controller would be handing it bytes it has no format for and no way to
+                    // play.
+                    Outgoing::Binary(bytes) if plays => {
                         send_binary(&mut ws, &mut done.session, bytes).await?;
                         chunks_sent += 1;
                     }
+                    Outgoing::Binary(_) => {}
                 }
                 continue;
             }
@@ -272,7 +299,7 @@ pub async fn serve(
                     }
                     Some(true) if membership.is_none() && will_play => {
                         log::info!("{client_id} reports it is free again; resuming its audio");
-                        let mut member = group.join();
+                        let mut member = group.join(true);
                         send_json(
                             &mut ws,
                             &mut done.session,
@@ -286,6 +313,16 @@ pub async fn serve(
                         membership = Some(member);
                     }
                     _ => {}
+                }
+            }
+            Message::ClientCommand(command) => {
+                // Only from a client that was actually granted the role. Acting on a command
+                // from a client this server never activated as a controller would let any peer
+                // set the volume of a room it was not admitted to.
+                if !active_roles.iter().any(|r| r == "controller@v1") {
+                    log::warn!("{client_id} sent a command without the controller role");
+                } else if let Some(controller) = command.controller.as_ref() {
+                    group.handle_controller_command(controller);
                 }
             }
             Message::ClientGoodbye(goodbye) => {
