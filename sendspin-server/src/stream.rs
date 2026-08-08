@@ -20,10 +20,18 @@
 //! transcoding. The reference implementation's `PushStream` does all of that; what this pins
 //! down first is the part everything else sits on.
 
+use sendspin_proto::binary::pack_player_audio;
+// The same conversion a client uses to measure what it has queued. Shared so a server's idea of
+// how long a chunk lasts cannot drift from the player's.
 use sendspin_proto::messages::{StreamPlayerConfig, StreamStart};
+pub use sendspin_proto::sync::frames_to_micros;
 
 /// Binary message type for player audio, per the spec.
-pub const PLAYER_AUDIO: u8 = 0x04;
+///
+/// Re-exported from the core rather than restated: this used to be a second definition of a
+/// constant the client already had, which is exactly the kind of duplication that stays right
+/// until one copy moves.
+pub use sendspin_proto::binary::binary_types::PLAYER_AUDIO;
 
 /// How far ahead of playback the stream tries to stay.
 ///
@@ -86,9 +94,10 @@ impl PlayerStream {
 
     /// Wrap one chunk of PCM into the binary frame a player expects, and advance the timeline.
     ///
-    /// The header is one byte of message type and eight bytes of big-endian timestamp, then the
-    /// payload — the same shape this project's client parses, and the same one the reference
-    /// implementation writes.
+    /// The framing itself belongs to [`sendspin_proto::binary`], which is also what this
+    /// project's client parses with — so the writer and the reader cannot drift apart. What
+    /// stays here is the only part that is the *server's* decision: which timestamp the chunk
+    /// carries.
     ///
     /// Returns `None` for a chunk that is not a whole number of frames: sending it would put
     /// the stream permanently half a sample out, which is audible and never recovers.
@@ -98,10 +107,7 @@ impl PlayerStream {
         }
         let frames = pcm.len() / self.bytes_per_frame;
 
-        let mut framed = Vec::with_capacity(9 + pcm.len());
-        framed.push(PLAYER_AUDIO);
-        framed.extend_from_slice(&self.next_timestamp_us().to_be_bytes());
-        framed.extend_from_slice(pcm);
+        let framed = pack_player_audio(self.next_timestamp_us(), pcm);
 
         // Advanced by the running frame count rather than by adding each chunk's duration:
         // accumulating per-chunk durations accumulates their rounding too, and at 50 chunks a
@@ -117,19 +123,6 @@ impl PlayerStream {
     pub fn should_send(&self, now_us: i64, send_ahead_us: i64) -> bool {
         self.next_timestamp_us() - now_us < send_ahead_us
     }
-}
-
-/// Microseconds for a whole number of frames at `sample_rate`.
-///
-/// Done in `i128` because the intermediate product overflows `i64` after about six hours at
-/// 48 kHz, and a server that has been playing all day is the normal case rather than the
-/// exotic one.
-pub fn frames_to_micros(frames: u64, sample_rate: u32) -> i64 {
-    if sample_rate == 0 {
-        return 0;
-    }
-    let micros = i128::from(frames) * 1_000_000 / i128::from(sample_rate);
-    i64::try_from(micros).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
@@ -200,16 +193,5 @@ mod tests {
         assert!(!stream.should_send(400_000, DEFAULT_SEND_AHEAD_US));
         // Exactly at the target counts as ahead, so the boundary does not oscillate.
         assert!(!stream.should_send(500_000, DEFAULT_SEND_AHEAD_US));
-    }
-
-    /// A day of playback must not wrap the timestamp arithmetic.
-    #[test]
-    fn a_long_stream_does_not_overflow() {
-        // 24 hours at 48 kHz: the frame count times a million overflows i64 by a wide margin.
-        let frames = 48_000u64 * 60 * 60 * 24;
-        assert_eq!(frames_to_micros(frames, 48_000), 86_400_000_000);
-        assert_eq!(frames_to_micros(0, 48_000), 0);
-        // A degenerate rate is answered rather than dividing by zero.
-        assert_eq!(frames_to_micros(100, 0), 0);
     }
 }

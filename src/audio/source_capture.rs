@@ -151,7 +151,7 @@ impl SourceCapture {
                 // duration: the rounding error stays bounded by one microsecond instead of
                 // compounding once per chunk.
                 let offset_us =
-                    (self.samples_sent * 1_000_000 / u64::from(self.sample_rate)) as i64;
+                    sendspin_proto::sync::frames_to_micros(self.samples_sent, self.sample_rate);
                 self.samples_sent += frame_samples;
                 (anchor_us + offset_us - lookahead_us, frame)
             })

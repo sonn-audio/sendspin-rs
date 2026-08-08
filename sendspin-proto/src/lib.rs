@@ -37,6 +37,9 @@
 /// Every protocol message, in both directions.
 pub mod messages;
 
+/// The binary wire format: audio, artwork and visualizer frames.
+pub mod binary;
+
 /// The encrypted `KKpsk2` transport, and everything keyed to it.
 pub mod noise;
 
