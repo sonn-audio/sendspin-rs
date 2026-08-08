@@ -3,7 +3,7 @@
 > Fork-internal. Written at the end of a long session so the next one does not re-derive any
 > of this. Read the "Traps" section before writing code.
 
-State as of `848e770` on `claude/sendspin-rust-python-parity-m6ktw9` (35 commits ahead of
+State as of `684a998` on `claude/sendspin-rust-python-parity-m6ktw9` (40 commits ahead of
 `main`). CI-equivalent green throughout: `cargo test --workspace --all-features`,
 `cargo clippy --workspace --all-targets --all-features -- -D warnings`,
 `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items --workspace`,
@@ -19,32 +19,47 @@ State as of `848e770` on `claude/sendspin-rust-python-parity-m6ktw9` (35 commits
 | In-band re-handshake + hello restart | session swap, then `server/hello` → `client/hello` → `server/activate` |
 | Pairing PSK flow, end to end | server logs `PAIRING_OK`; client persists a bound record |
 | `source@v1`, end to end | role activates on the long-term PSK; 576000 bytes sent = 576000 decoded, both suites |
+| `management/*`, end to end | real management session: records, config patch read back, both negative outcomes |
+| Source encoders | pcm/flac/opus decoded by the reference server's ffmpeg, byte counts exact |
+| CPace | draft-21 vectors: generator, both shares, ISK, tags, low-order table both ways |
+| PIN bindings | sid, PIN, commitment and wrapped PSK byte-exact against `aiosendspin` |
+| Both PIN flows | driven end to end against a server side; both peers finish on one PSK |
 | Playback sync bounds | ±0.5 ms steady state, ±0.5% speed, asserted by tests |
 
 ## Left to do
 
-**1. `management/*` — seven messages.** `server/unpair`, `management/list-records`,
-`management/add-record`, `management/remove-record`, `management/get-pairing-config`,
-`management/set-pairing-config`, `management/result`. Mechanical on top of the `PairingStore`
-that already exists. Reference: `aiosendspin/client/management.py` (six handlers) and
-`tests/integration/test_management_flow.py`. Two rules worth reading in `management.md` first:
-a shared-PSK record must **not** be removed by `server/unpair` (only by
-`management/remove-record`), and `server/unpair` on a `trust_level: none` connection is ignored
-rather than obeyed.
+**Drive the PIN flows from the router.** This is the only thing standing between the client
+and full wire parity, and it is wiring rather than research: `noise::pin_flow` is complete
+and tested, `plan_pairing` already routes an offered method into it, and the router has an
+arm that declines because it cannot yet finish the exchange.
 
-**2. CPace, and the two PIN pairing methods.** The real work.
+Three things the router does not currently carry, and each is small on its own:
 
-- The suite is `CPACE-X25519-SHA512`, `draft-irtf-cfrg-cpace` **revision 21**, with the
-  draft's optional explicit mutual key confirmation.
-- No usable Rust crate: the only `cpace` on crates.io is a single 0.1.0 from May 2020, years
-  before rev 21. Assume wire-incompatible.
-- Two independent checks are available, and both should be used: the draft ships
-  `testvectors.json` (the Python `cpace` package passes all of it including invalid-point
-  rejection), **and** `aiosendspin` implements both PIN flows on both sides, so a real
-  exchange is testable. Vectors prove the arithmetic; an exchange proves the binding — `sid`,
-  the `ad` labels, the MCF tags, and the PSK wrapped under the CPace output.
-- `plan_pairing` already declines both PIN methods with `pair/abort(method_not_supported)`,
-  which leaves the connection open, so nothing breaks while they are unimplemented.
+- **The Noise handshake hash.** The PAKE's `sid` binds to it. `snow` exposes it as the
+  handshake hash once transport mode begins; it has to be captured there and kept in
+  `SecurityContext` alongside `psk_id`, and it changes on a re-handshake like the rest.
+- **A pairing-index counter.** The number of pairing `server/activate` messages since the
+  last handshake. `client/pair-pending` and `client/pair-init` both carry it, and the server
+  discards a lower value silently and treats a higher one as a protocol error.
+- **An attempt held across several inbound messages.** Today `handle_pairing_activation`
+  runs to completion inside one message; a PIN attempt spans four. It wants a
+  `Option<PinPairing>` next to `pending_pairing`, fed from the router's match arms.
+
+Two client-side obligations that go with it and have decision functions waiting in
+`noise::pin`, but no persistence yet:
+
+- **The failure counter.** `PinPairing::counts_as_failure` reports the one event that
+  increments it — this side's own `server_kc` verification failing. It resets on success,
+  persists across reboots, and is not partitioned by server or source address. It lives in
+  `PairingConfig::dynamic_pin_failures`; nothing writes it yet.
+- **The pairing window.** `dynamic_pin_needs_gesture` decides when an attempt is gated.
+  Opening the window is an operator gesture the host application owns, so this needs an API
+  on the builder rather than a policy in the crate — and `management/open-pairing-window`
+  should stop answering `invalid` once one exists.
+
+After that: advertise the methods in `client/hello`. The descriptor needs `min_pin_length`
+on `dynamic_pin` and the `locations` hint on the others, derived from the store the way
+`supported_pair_methods` already is.
 
 ## Traps
 
@@ -97,6 +112,13 @@ that no `server/command {command: start}` asked for.
 **A role a client *can* fill is not a role it *has*.** `server/activate` decides, and
 `client/state` reports only what it granted. This is what `ClientState::retain_active_roles`
 is for; anything new that reports per-role state has to go through it.
+
+**CPace's low-order point table is not "reject everything".** The draft is precise: `u0`-`u5`
+and `u7` MUST abort, and the other five are unusual encodings that still multiply to a value
+it publishes. The first attempt here asserted that all twelve were rejected and was wrong —
+refusing them all would turn away peers the draft considers conformant. The test now pins each
+expected output. Note also that the Python `cpace` package accepts those five too, so
+"the reference passes the vectors" does not mean what it sounds like.
 
 **Do not hand-roll crypto, and do not let a key generator degrade.** Two corrections in one
 session: a hand-written X25519 montgomery ladder (replaced with `x25519-dalek`), and a
