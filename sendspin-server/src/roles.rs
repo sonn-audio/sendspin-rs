@@ -15,7 +15,29 @@
 //! one decides whether the promise can be kept. A server compiled with the metadata role but
 //! started without a metadata source has nothing to send, so it does not claim the role.
 
+use sendspin_proto::messages::{AudioFormatSpec, StreamPlayerConfig};
+
 use crate::ServerConfig;
+
+/// Whether a client that advertised `offered` can play what this server would send.
+///
+/// The last unchecked promise on the activation path. Every other role this server grants is
+/// backed by something it can produce, but `player@v1` was granted to any client that asked and
+/// then fed PCM regardless — so a client that cannot decode PCM 16-bit was told it was a player
+/// and handed bytes it has no way to render. Silence out of a speaker that reported itself
+/// healthy is among the hardest faults to trace, and it is entirely avoidable here.
+///
+/// A client that advertises *no* formats is taken at its word rather than assumed flexible: an
+/// empty list says it can play nothing, and guessing on its behalf is what this function exists
+/// to stop.
+pub fn can_play(offered: &[AudioFormatSpec], sending: &StreamPlayerConfig) -> bool {
+    offered.iter().any(|format| {
+        format.codec.eq_ignore_ascii_case(&sending.codec)
+            && format.channels == sending.channels
+            && format.sample_rate == sending.sample_rate
+            && format.bit_depth == sending.bit_depth
+    })
+}
 
 /// Roles this build implements at all.
 ///
@@ -110,6 +132,60 @@ mod tests {
     fn the_clients_own_order_is_kept() {
         let offered = roles(&["metadata@v1", "player@v1"]);
         assert_eq!(negotiate(&offered, &["player@v1"]), roles(&["player@v1"]));
+    }
+
+    fn pcm(sample_rate: u32, channels: u8, bit_depth: u8) -> AudioFormatSpec {
+        AudioFormatSpec {
+            codec: "pcm".to_string(),
+            channels,
+            sample_rate,
+            bit_depth,
+        }
+    }
+
+    fn sending() -> StreamPlayerConfig {
+        StreamPlayerConfig {
+            codec: "pcm".to_string(),
+            sample_rate: 48_000,
+            channels: 2,
+            bit_depth: 16,
+            codec_header: None,
+        }
+    }
+
+    /// Every part of the format has to match. A client that can do 44.1 kHz is not a client that
+    /// can do 48 kHz, and handing it the wrong rate produces audio at the wrong pitch rather
+    /// than an error anyone would notice in a test.
+    #[test]
+    fn a_format_matches_only_when_every_field_does() {
+        assert!(can_play(&[pcm(48_000, 2, 16)], &sending()));
+        assert!(!can_play(&[pcm(44_100, 2, 16)], &sending()));
+        assert!(!can_play(&[pcm(48_000, 1, 16)], &sending()));
+        assert!(!can_play(&[pcm(48_000, 2, 24)], &sending()));
+    }
+
+    /// One usable entry among several is enough: a client lists everything it can do, and the
+    /// server only needs the one it is actually sending.
+    #[test]
+    fn one_matching_format_among_many_is_enough() {
+        let offered = vec![pcm(44_100, 2, 16), pcm(48_000, 2, 24), pcm(48_000, 2, 16)];
+        assert!(can_play(&offered, &sending()));
+    }
+
+    /// A client that advertises nothing is taken at its word rather than assumed flexible.
+    /// Guessing on its behalf is exactly what this check exists to stop.
+    #[test]
+    fn a_client_that_offers_no_formats_is_not_a_player() {
+        assert!(!can_play(&[], &sending()));
+    }
+
+    /// Codec names are compared without case, because the wire has seen both spellings and a
+    /// client writing `PCM` means the same thing as one writing `pcm`.
+    #[test]
+    fn the_codec_name_is_compared_without_case() {
+        let mut shouted = pcm(48_000, 2, 16);
+        shouted.codec = "PCM".to_string();
+        assert!(can_play(&[shouted], &sending()));
     }
 
     /// The distinction this module exists for: a role this build implements is still not

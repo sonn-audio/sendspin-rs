@@ -120,11 +120,37 @@ pub async fn serve(
 
     // Only what this server actually implements, and only what the client offered. Activating
     // a role is a promise to serve it.
-    let active_roles = if unpaired_ok {
+    let mut active_roles = if unpaired_ok {
         crate::roles::negotiate(&hello.supported_roles, &crate::roles::servable(&config))
     } else {
         Vec::new()
     };
+
+    // The last promise on this path that was being made blind. This server sends one fixed
+    // format and does not transcode, so a client that cannot decode it is not a player here —
+    // whatever it offered. Granting the role anyway would hand it bytes it cannot render, and
+    // silence from a speaker that reported itself healthy is a fault nobody can trace.
+    if let Some(source) = config.audio.as_ref() {
+        let sending = source.format();
+        let offered = hello
+            .player_v1_support
+            .as_ref()
+            .map(|support| support.supported_formats.as_slice())
+            .unwrap_or(&[]);
+        if active_roles.iter().any(|r| r == "player@v1")
+            && !crate::roles::can_play(offered, &sending)
+        {
+            log::warn!(
+                "{client_id} cannot play {} {}Hz {}ch {}bit, so it is not activated as a player",
+                sending.codec,
+                sending.sample_rate,
+                sending.channels,
+                sending.bit_depth
+            );
+            active_roles.retain(|r| r != "player@v1");
+        }
+    }
+    let active_roles = active_roles;
     // No `audio.is_some()` here any more: `servable` already refused to offer `player@v1`
     // without a source, so a granted player role is by construction one this server can feed.
     let will_play = active_roles.iter().any(|r| r == "player@v1");

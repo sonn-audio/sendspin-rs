@@ -51,6 +51,8 @@ entering exactly 1s into the existing timeline. `controller.py` covers the other
 reference controller sends a volume, sees the state come back changed, sends a command the
 server never advertised, and confirms nothing moved and the connection survived. `pause.py` runs a player and a controller
 together and counts chunks in windows — 88 flowing, 0 while paused, 75 after resuming.
+`format_refusal.py` offers 44.1 kHz against a 48 kHz server and confirms it is given no player
+role and no audio, while the connection survives.
 
 **Not yet:** pairing, management, transcoding, resampling, and the `artwork`, `visualizer`,
 `color` and `source` roles. Limits worth stating plainly rather than discovering:
@@ -59,8 +61,9 @@ together and counts chunks in windows — 88 flowing, 0 while paused, 75 after r
   Moving a client between groups is a `controller@v1` request, and that role is not served yet.
 - **No seeking in the stream.** Pause and play hold and release the timeline, but a seek only
   reaches the application — this crate cannot move the source's position for it.
-- **PCM only.** The client's advertised formats are not honoured yet; a client that cannot
-  decode PCM 16-bit will not get something it can.
+- **PCM only, but honestly.** This server sends one fixed format and does not transcode. A
+  client that cannot decode it is no longer activated as a player — it stays connected and keeps
+  any other role, it is simply not promised playback this server cannot deliver.
 - **No pairing**, so every connection is keyed by the Sentinel PSK. A client whose
   `unpaired_access` is off is correctly given no roles at all — that field is the client
   telling the server up front whether it may be used without a pairing, and the reference
