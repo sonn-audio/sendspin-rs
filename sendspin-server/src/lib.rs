@@ -3,29 +3,25 @@
 
 //! A Sendspin server.
 //!
-//! A crate of its own rather than a feature of `sendspin`, because the two have genuinely
-//! different dependency appetites: a server grows resamplers, encoders and signal analysis
-//! that an embedded player has no use for, and a feature flag on one crate makes every one of
-//! those a decision the player's build has to carry.
-//!
-//! What it borrows from `sendspin` is everything that is direction-agnostic, and that turns
-//! out to be most of the protocol: the message vocabulary derives both `Serialize` and
-//! `Deserialize`, so the whole wire surface works in either direction, and the framing,
-//! fragmentation and Noise primitives do not care which end they are on. Nothing here reaches
-//! into the client crate's internals.
+//! Built on `sendspin-proto`, the shared core holding everything direction-agnostic. It does
+//! not depend on the `sendspin` client: that would mean compiling `cpal`, the audio decoders
+//! and the ALSA headers behind them for a server that plays nothing locally.
 //!
 //! # What works
 //!
-//! Enough to bring a real client up, keep it there and play to it: the WebSocket upgrade, the
-//! encrypted `KKpsk2` handshake with this side as the Noise initiator, `server/hello` →
-//! `client/hello` → `server/activate`, `client/time` answered so the client's filter can
-//! converge, and `player@v1` fed with paced PCM on the server's own timeline.
+//! Enough to bring real clients up, keep them there and play to all of them at once: the
+//! WebSocket upgrade, the encrypted `KKpsk2` handshake with this side as the Noise initiator,
+//! `server/hello` → `client/hello` → `server/activate`, `client/time` answered so a client's
+//! filter can converge, and [synchronized group playback](group) — every `player@v1` client
+//! shares one timeline and receives byte-identical chunks, which is what makes two speakers in
+//! two rooms one system rather than two.
 //!
 //! # What does not
 //!
-//! Groups, pairing, management, and every role but `player@v1`. A role this server does not
-//! serve is not activated even when a client offers it: activating one is a promise, and a
-//! client granted a role that is then never served looks broken from the outside.
+//! Pairing, management, transcoding, playback control, and every role but `player@v1`. A role
+//! this server does not serve is not activated even when a client offers it: activating one is
+//! a promise, and a client granted a role that is then never served looks broken from the
+//! outside.
 //!
 //! ```no_run
 //! # #[tokio::main]
@@ -62,9 +58,12 @@ pub trait AudioSource: Send + Sync {
 }
 
 pub mod connection;
+pub mod group;
 pub mod handshake;
 pub mod roles;
 pub mod stream;
+
+use crate::group::Group;
 
 /// What a server is: an identity, a name, and a clock.
 pub struct ServerConfig {
@@ -115,6 +114,13 @@ impl ServerConfig {
 pub struct SendspinServer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
+    /// The group every client joins.
+    ///
+    /// One group rather than a registry because nothing can yet *ask* to be regrouped — the
+    /// controller role is what carries that request. What matters already is that the timeline
+    /// lives here rather than in a connection: two clients now share one, which is the whole
+    /// difference between two speakers and multi-room.
+    group: Arc<Group>,
 }
 
 impl SendspinServer {
@@ -123,10 +129,22 @@ impl SendspinServer {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Connection(format!("could not bind {addr}: {e}")))?;
+        let config = Arc::new(config);
+        let group = Group::spawn(
+            Arc::clone(&config),
+            uuid::Uuid::new_v4().to_string(),
+            Some(config.name.clone()),
+        );
         Ok(Self {
             listener,
-            config: Arc::new(config),
+            config,
+            group,
         })
+    }
+
+    /// The group clients are placed in.
+    pub fn group(&self) -> &Arc<Group> {
+        &self.group
     }
 
     /// The address actually bound, which is what to advertise when port 0 was requested.
@@ -153,8 +171,9 @@ impl SendspinServer {
                 .await
                 .map_err(|e| Error::Connection(format!("accept failed: {e}")))?;
             let config = Arc::clone(&self.config);
+            let group = Arc::clone(&self.group);
             tokio::spawn(async move {
-                match connection::serve(stream, config).await {
+                match connection::serve(stream, config, group).await {
                     Ok(summary) => log::info!(
                         "{peer} ({}) disconnected after {} clock exchanges",
                         summary.name,

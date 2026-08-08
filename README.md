@@ -67,11 +67,16 @@ application raises, and the dynamic PIN reaches the operator through
 `EncryptionSettings::emit_pin`, because only the host knows whether this device has a display,
 a speaker or a row of LEDs.
 
-**The server** lives in [`sendspin-server`](sendspin-server), a crate of its own rather than a
-feature of this one: a server grows resamplers, encoders and signal analysis that an embedded
-player has no use for. It borrows this crate's message vocabulary, framing and Noise
-primitives, all of which are direction-agnostic, without reaching into anything private. It is
-early — see its README for what works.
+**The workspace has three crates.** [`sendspin-proto`](sendspin-proto) holds what is
+direction-agnostic — the message vocabulary, the `KKpsk2` transport and the clock. This crate
+is the client, [`sendspin-server`](sendspin-server) the server; both build on the core and
+neither depends on the other. That shape exists so a server does not compile `cpal` and the
+audio decoders to get message types, and so an embedded player never links a resampler. The
+`noise`, `sync`, `error` and `protocol::messages` paths here are re-exports of the core, so
+nothing using this crate has to know.
+
+The server plays synchronized audio to a group of clients and is still early otherwise — see
+its README for what works.
 
 **Encryption is opt-in for now**, because turning it on changes which servers a client can
 reach. Pass it explicitly:

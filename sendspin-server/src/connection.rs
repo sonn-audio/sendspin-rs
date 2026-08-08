@@ -16,12 +16,12 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::group::{Group, Outgoing};
 use crate::handshake::ServerHandshake;
-use crate::stream::{PlayerStream, DEFAULT_SEND_AHEAD_US};
 use crate::ServerConfig;
 use sendspin_proto::error::Error;
 use sendspin_proto::messages::{
-    Activity, Message, ServerActivate, ServerHelloEncrypted, ServerTime, StreamEnd,
+    Activity, Message, ServerActivate, ServerHelloEncrypted, ServerTime,
 };
 use sendspin_proto::noise::constants::MSG_TYPE_JSON_BODY;
 use sendspin_proto::noise::keys::Psk;
@@ -45,6 +45,7 @@ pub struct ConnectionSummary {
 pub async fn serve(
     stream: TcpStream,
     config: Arc<ServerConfig>,
+    group: Arc<Group>,
 ) -> Result<ConnectionSummary, Error> {
     let mut ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -147,96 +148,82 @@ pub async fn serve(
 
     // --- steady state --------------------------------------------------------------------
     let mut time_syncs = 0u64;
-    let mut player: Option<PlayerStream> = None;
     let mut chunks_sent = 0u64;
 
-    if will_play {
-        let source = config.audio.as_ref().expect("checked by will_play");
-        // The first sample plays one send-ahead from now, so the client has the whole lead to
-        // receive, decode and schedule it rather than being handed audio that is already due.
-        let start = config.clock.now_micros() + DEFAULT_SEND_AHEAD_US;
-        let stream = PlayerStream::new(source.format(), start);
+    // Joining the group is what replaced pulling audio here. A connection no longer owns a
+    // timeline: it owns a *seat* at one, and the group hands every seat the same bytes. Only a
+    // client that activated as a player takes one — a connection with no player role has no
+    // use for audio frames and should not be counted as a listener keeping the group awake.
+    let mut membership = if will_play { Some(group.join()) } else { None };
+
+    if let Some(member) = membership.as_mut() {
         send_json(
             &mut ws,
             &mut done.session,
-            &Message::StreamStart(stream.stream_start(config.clock.now_micros())),
+            &Message::GroupUpdate(member.group_update()),
         )
         .await?;
-        log::info!(
-            "{client_id} stream starting: {} {}Hz {}ch {}bit",
-            stream.format().codec,
-            stream.format().sample_rate,
-            stream.format().channels,
-            stream.format().bit_depth
-        );
-        player = Some(stream);
+        // A client that arrived mid-track gets the `stream/start` for the stream already in
+        // flight. Without it the binary frames that follow are undecodable: it would know when
+        // to play them but not what they are.
+        if let Some(start) = member.catch_up() {
+            log::info!("{client_id} joined a stream already in progress");
+            send_json(&mut ws, &mut done.session, &Message::StreamStart(start)).await?;
+        }
     }
 
-    // 20 ms of audio per chunk, which is what the reference implementation sends and small
-    // enough that a stop is not heard long after it was asked for.
-    const CHUNK_MS: u32 = 20;
+    /// Whichever came first: something to read from the client, or something to send it.
+    enum Event {
+        // Boxed because a `Message` is an order of magnitude larger than the other variant,
+        // and every poll of this loop would otherwise carry the widest payload the protocol
+        // has on the stack whether or not one arrived.
+        Incoming(Option<Box<Message>>),
+        Outgoing(Option<Result<Arc<Outgoing>, u64>>),
+    }
 
     loop {
-        // Sending is driven by the timeline rather than by a timer: the stream says when it is
-        // behind its lead, and the wait is only ever long enough to get back to that point.
-        let sleep_until = match (&player, &config.audio) {
-            (Some(stream), Some(_)) => {
-                let now = config.clock.now_micros();
-                if stream.should_send(now, DEFAULT_SEND_AHEAD_US) {
-                    None
-                } else {
-                    Some(std::time::Duration::from_micros(
-                        (stream.next_timestamp_us() - now - DEFAULT_SEND_AHEAD_US).max(0) as u64,
-                    ))
+        // Racing the read against the group's feed keeps both responsive: a client's message is
+        // answered while audio is pending, and audio does not wait on a quiet client. The
+        // select produces a value rather than acting in its arms, so the borrows of the socket
+        // and the feed do not overlap.
+        let event = match membership.as_mut() {
+            Some(member) => tokio::select! {
+                incoming = next_encrypted(&mut ws, &mut done.session, &mut reassembler) => {
+                    Event::Incoming(incoming?.map(Box::new))
                 }
-            }
-            _ => None,
+                outgoing = member.next() => Event::Outgoing(outgoing),
+            },
+            None => Event::Incoming(
+                next_encrypted(&mut ws, &mut done.session, &mut reassembler)
+                    .await?
+                    .map(Box::new),
+            ),
         };
 
-        if let (Some(stream), Some(source)) = (player.as_mut(), config.audio.as_ref()) {
-            if sleep_until.is_none() {
-                let frames = (stream.format().sample_rate * CHUNK_MS / 1000) as usize;
-                match source.next_chunk(frames) {
-                    Some(pcm) => match stream.chunk(&pcm) {
-                        Some(framed) => {
-                            send_binary(&mut ws, &mut done.session, &framed).await?;
-                            chunks_sent += 1;
-                        }
-                        None => {
-                            log::error!("{client_id}: the source produced a partial frame");
-                            player = None;
-                        }
-                    },
-                    None => {
-                        log::info!("{client_id} stream ended after {chunks_sent} chunks");
-                        send_json(
-                            &mut ws,
-                            &mut done.session,
-                            &Message::StreamEnd(StreamEnd {
-                                roles: None,
-                                server_transmitted: Some(config.clock.now_micros()),
-                            }),
-                        )
-                        .await?;
-                        player = None;
+        let message = match event {
+            Event::Outgoing(None) => break,
+            Event::Outgoing(Some(Err(missed))) => {
+                // This client could not keep up. Saying so is the whole point: audio is
+                // realtime, so the group drops what it could not deliver rather than letting
+                // one stalled socket delay everybody else's playback.
+                log::warn!("{client_id} fell behind and missed {missed} frame(s)");
+                continue;
+            }
+            Event::Outgoing(Some(Ok(out))) => {
+                match out.as_ref() {
+                    Outgoing::Json(msg) => send_json(&mut ws, &mut done.session, msg).await?,
+                    Outgoing::Binary(bytes) => {
+                        send_binary(&mut ws, &mut done.session, bytes).await?;
+                        chunks_sent += 1;
                     }
                 }
                 continue;
             }
-        }
-
-        let message = match sleep_until {
-            // Racing the read against the next send keeps both responsive: a client's message
-            // is answered while audio is pending, and audio does not wait on a quiet client.
-            Some(wait) => tokio::select! {
-                incoming = next_encrypted(&mut ws, &mut done.session, &mut reassembler) => incoming?,
-                () = tokio::time::sleep(wait) => continue,
-            },
-            None => next_encrypted(&mut ws, &mut done.session, &mut reassembler).await?,
+            Event::Incoming(incoming) => incoming,
         };
         let Some(message) = message else { break };
 
-        match message {
+        match *message {
             Message::ClientTime(request) => {
                 // Both stamps come off this server's own monotonic clock, and the reply goes
                 // out immediately: the client subtracts them to remove the server's own
