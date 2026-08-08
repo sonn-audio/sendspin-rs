@@ -21,6 +21,7 @@ use sendspin::protocol::messages::{
 use sendspin::ProtocolClientBuilder;
 
 use crate::cli::{default_product_name, hostname, DaemonArgs};
+use crate::hooks::{HookContext, Hooks};
 
 /// What this daemon presents to a server, resolved once so both directions cannot drift.
 struct Device {
@@ -34,6 +35,8 @@ struct Device {
     static_delay: u16,
     /// The chosen output device, or `None` for the platform default.
     device: Option<cpal::Device>,
+    /// The operator's external scripts.
+    hooks: Hooks,
     /// The single format offered to the server, when `--audio-format` pinned one.
     ///
     /// Pinning narrows `client/hello` to one entry rather than reordering a list, because a
@@ -66,6 +69,14 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?;
     if let (Some(device), Some(format)) = (device.as_ref(), format.as_ref()) {
         crate::audio::verify_device_supports(device, format)?;
+    }
+    let hooks = Hooks::new(
+        args.hook_start.clone(),
+        args.hook_stop.clone(),
+        args.hook_set_volume.as_deref(),
+    )?;
+    if hooks.volume_is_external() {
+        log::info!("Volume is the --hook-set-volume script's; the audio path stays at unity");
     }
     if let Some(format) = format.as_ref() {
         log::info!(
@@ -145,6 +156,7 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         static_delay,
         device,
         format,
+        hooks,
     };
 
     match args.url.clone() {
@@ -232,14 +244,22 @@ async fn run_outbound(
         hello.active_roles
     );
 
+    let context = HookContext {
+        server_id: Some(hello.server_id.clone()),
+        server_name: Some(hello.name.clone()),
+        server_url: Some(url.to_string()),
+        client_id: device.client_id.clone(),
+        client_name: device.name.clone(),
+    };
+
     let conn = client.split();
     play(
         conn.messages,
         conn.audio,
         conn.clock_sync,
         conn.sender,
-        device.static_delay,
-        device.device.clone(),
+        device,
+        context,
     )
     .await;
     log::info!("Server closed the connection");
@@ -283,13 +303,21 @@ async fn run_inbound(args: &DaemonArgs, device: &Device) -> Result<(), Box<dyn s
             conn.peer,
             conn.server_hello.connection_reason
         );
+        let context = HookContext {
+            server_id: Some(server_id.clone()),
+            server_name: Some(conn.server_hello.name.clone()),
+            // No URL to report: this server dialled us, so there is none to hand a script.
+            server_url: None,
+            client_id: device.client_id.clone(),
+            client_name: device.name.clone(),
+        };
         let played = play(
             conn.messages,
             conn.audio,
             conn.clock_sync,
             conn.sender,
-            device.static_delay,
-            device.device.clone(),
+            device,
+            context,
         )
         .await;
         // A server this client actually played for wins a later discovery tie, which is what
@@ -312,9 +340,14 @@ async fn play(
     mut audio: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
     clock_sync: Arc<parking_lot::Mutex<sendspin::sync::ClockSync>>,
     sender: WsSender,
-    static_delay: u16,
-    output_device: Option<cpal::Device>,
+    device: &Device,
+    context: HookContext,
 ) -> bool {
+    let hooks = &device.hooks;
+    let output_device = device.device.clone();
+    let static_delay = device.static_delay;
+    // Whether a stream is live, so the stop hook fires once and only after a start did.
+    let mut streaming = false;
     let mut decoder: Option<Box<dyn Decoder>> = None;
     let mut format: Option<AudioFormat> = None;
     let mut player: Option<SyncedPlayer> = None;
@@ -350,11 +383,29 @@ async fn play(
                             Ok((built, fmt)) => {
                                 decoder = Some(built);
                                 format = Some(fmt);
+                                // Only once per stream: a server may re-send `stream/start` to
+                                // change format mid-stream, and an amplifier does not want
+                                // waking twice.
+                                if !streaming {
+                                    streaming = true;
+                                    hooks.on_stream_start(&context);
+                                }
                             }
                             Err(e) => log::error!("Cannot play this stream: {e}"),
                         }
                     }
-                    Message::StreamEnd(_) | Message::StreamClear(_) => {
+                    Message::StreamEnd(_) => {
+                        if let Some(player) = &player {
+                            player.clear();
+                        }
+                        if streaming {
+                            streaming = false;
+                            hooks.on_stream_stop(&context);
+                        }
+                    }
+                    // A clear drops what is buffered without ending the stream, so it is not a
+                    // stop: firing the hook here would shut down an amplifier mid-track.
+                    Message::StreamClear(_) => {
                         if let Some(player) = &player {
                             player.clear();
                         }
@@ -365,18 +416,12 @@ async fn play(
                             PlayerCommandType::Volume => {
                                 if let Some(level) = player_command.volume {
                                     volume = level;
-                                    if let Some(player) = &player {
-                                        player.set_volume(level);
-                                    }
                                     log::info!("Volume set to {level}");
                                 }
                             }
                             PlayerCommandType::Mute => {
                                 if let Some(state) = player_command.mute {
                                     muted = state;
-                                    if let Some(player) = &player {
-                                        player.set_mute(state);
-                                    }
                                     log::info!("Mute set to {state}");
                                 }
                             }
@@ -391,6 +436,22 @@ async fn play(
                             }
                             PlayerCommandType::Unknown => {}
                         }
+                        // Applied after the match rather than inside it, because volume and
+                        // mute reach the same place: either the operator's script owns the
+                        // level, or this process's gain does. Never both — that would apply
+                        // the setting twice.
+                        if matches!(
+                            player_command.command,
+                            PlayerCommandType::Volume | PlayerCommandType::Mute
+                        ) {
+                            if hooks.volume_is_external() {
+                                hooks.set_volume(volume, muted).await;
+                            } else if let Some(player) = &player {
+                                player.set_volume(volume);
+                                player.set_mute(muted);
+                            }
+                        }
+
                         // A command is only obeyed if the server can see it was: the spec has
                         // the client report its own state rather than the server assuming.
                         let state = ClientState {
@@ -443,8 +504,10 @@ async fn play(
                             fmt.clone(),
                             Arc::clone(&clock_sync),
                             SyncedPlayerConfig {
-                                volume,
-                                muted,
+                                // Unity when a script owns the level, or the attenuation
+                                // would land twice.
+                                volume: if hooks.volume_is_external() { 100 } else { volume },
+                                muted: !hooks.volume_is_external() && muted,
                                 device: output_device.clone(),
                                 ..SyncedPlayerConfig::new()
                             },
@@ -474,6 +537,11 @@ async fn play(
             }
             else => break,
         }
+    }
+    // A server that disappears mid-stream never sends `stream/end`, and an amplifier left
+    // powered because the network dropped is exactly what the stop hook is for.
+    if streaming {
+        hooks.on_stream_stop(&context);
     }
     played_anything
 }

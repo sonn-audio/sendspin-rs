@@ -172,10 +172,22 @@ async def _drive_player(client: object, loop: asyncio.AbstractEventLoop) -> None
         f"{SAMPLE_RATE}Hz 16bit {CHANNELS}ch",
         flush=True,
     )
+    # Volume and mute part-way through, so a client's command handling — and any external
+    # volume hook behind it — is exercised rather than assumed.
+    role = client.role("player@v1")  # type: ignore[attr-defined]
+    volume_at = chunks // 3
+    mute_at = (chunks * 2) // 3
+
     phase = 0.0
     pushed_frames = 0
     try:
-        for _ in range(chunks):
+        for index in range(chunks):
+            if role is not None and index == volume_at:
+                print("PLAYER_SET_VOLUME=40", flush=True)
+                role.set_volume(40)
+            if role is not None and index == mute_at:
+                print("PLAYER_SET_MUTE=True", flush=True)
+                role.set_mute(True)
             pcm, phase = _tone(phase, frames_per_chunk)
             stream.prepare_audio(pcm, fmt)
             await stream.commit_audio()

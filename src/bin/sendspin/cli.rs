@@ -130,6 +130,29 @@ pub struct DaemonArgs {
     #[arg(long)]
     pub audio_format: Option<String>,
 
+    /// Command to run when an audio stream starts.
+    ///
+    /// Run through a shell, so it can be written as typed, and given the connection's details
+    /// in `SENDSPIN_EVENT`, `SENDSPIN_SERVER_ID`, `SENDSPIN_SERVER_NAME`, `SENDSPIN_SERVER_URL`,
+    /// `SENDSPIN_CLIENT_ID` and `SENDSPIN_CLIENT_NAME`. For waking an amplifier or closing a
+    /// relay the protocol knows nothing about.
+    #[arg(long)]
+    pub hook_start: Option<String>,
+
+    /// Command to run when an audio stream stops. Same environment as `--hook-start`.
+    #[arg(long)]
+    pub hook_stop: Option<String>,
+
+    /// Script that applies volume externally, given the effective volume 0-100 as its last
+    /// argument.
+    ///
+    /// Setting this moves attenuation out of this process entirely: the audio path stays at
+    /// unity gain and the script owns the level, so it is not applied twice. Mute arrives as
+    /// zero. Run without a shell and split at startup, because it takes a value from the
+    /// network on every change.
+    #[arg(long)]
+    pub hook_set_volume: Option<String>,
+
     /// IP address of the network interface to bind the listener to.
     ///
     /// Only affects the listening socket. Unlike `sendspin-cli`, this does not yet restrict

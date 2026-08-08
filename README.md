@@ -169,11 +169,23 @@ activates no roles and nothing plays. That is the conservative reading of the pr
 unpaired session is authenticated by nothing — so it is the operator's call, made once and
 saved. The daemon says so at startup rather than looking broken.
 
+`--hook-start` and `--hook-stop` run a command line through a shell when a stream begins and
+ends, with the connection's details in `SENDSPIN_EVENT`, `SENDSPIN_SERVER_ID`,
+`SENDSPIN_SERVER_NAME`, `SENDSPIN_SERVER_URL`, `SENDSPIN_CLIENT_ID` and `SENDSPIN_CLIENT_NAME`
+— for waking an amplifier or closing a relay the protocol knows nothing about. The stop hook
+also fires when a server disappears mid-stream, since an amplifier left powered by a dropped
+network is exactly what it is for.
+
+`--hook-set-volume` hands the effective volume (0-100, and 0 when muted) to a script as its
+last argument. Setting it moves attenuation out of this process: the audio path stays at unity
+gain and the script owns the level, so it is never applied twice. That one runs without a
+shell and is split at startup, because it takes a value from the network on every change.
+
 One limit worth knowing: **`--interface` binds the listening socket only.** It does not yet
 restrict which interface mDNS advertises on, because the advertisement API takes no
 interface.
 
-Still to come, in the order they are being built: hooks, hardware volume and MPRIS.
+Still to come: hardware volume via ALSA/PulseAudio, and MPRIS.
 
 ## Quick start
 

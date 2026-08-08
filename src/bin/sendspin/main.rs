@@ -10,6 +10,7 @@
 mod audio;
 mod cli;
 mod daemon;
+mod hooks;
 
 use clap::Parser;
 
