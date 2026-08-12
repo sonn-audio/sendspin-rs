@@ -118,6 +118,57 @@ pub struct PlayerConfig {
     /// [`crate::audio::devices::output_rates`] reads these from the chosen card, which is what
     /// lets a server that resamples only when it must leave a matching source alone.
     pub rates: Vec<u32>,
+    /// The codecs to offer, most wanted first, crossed with [`rates`](Self::rates).
+    ///
+    /// Defaults to every decoder this crate implements. An application whose server transcodes
+    /// cheaply to one codec, or that wants PCM because the path after it is bit-perfect, names
+    /// only that one — a server picks from what it is offered, so narrowing the list decides
+    /// rather than merely prefers.
+    pub codecs: Vec<CodecOffer>,
+    /// The level to start at, before any server command.
+    ///
+    /// An application restoring what a user last set says so here. Ignored when a mixer or a
+    /// volume hook owns the level, because then the level is read from where it actually lives
+    /// rather than assumed.
+    pub initial_volume: u8,
+    /// The mute state to start at, on the same terms as [`initial_volume`](Self::initial_volume).
+    pub initial_muted: bool,
+    /// How much audio to ask a server to keep this client supplied with, in milliseconds.
+    ///
+    /// `None` says nothing, which leaves the server its own default. A per-installation fact:
+    /// a wireless card that loses a few hundred milliseconds to contention wants more than a
+    /// wired one that never does.
+    pub buffer_ms: Option<u32>,
+    /// How far ahead of playback this client needs its audio to arrive, in milliseconds.
+    ///
+    /// `None` says nothing. Also per-installation, and for the same reason.
+    pub required_lead_time_ms: Option<u32>,
+}
+
+/// A codec this player will accept, at the depth it wants it in.
+///
+/// The sample rate is not here: it comes from [`PlayerConfig::rates`], because what a card can
+/// open and what a decoder can read are two different questions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodecOffer {
+    /// Wire name of the codec: `pcm`, `flac` or `opus`.
+    pub codec: String,
+    /// Bits per sample to ask for.
+    pub bit_depth: u8,
+}
+
+impl CodecOffer {
+    /// Every codec this crate can decode, in the order a client would rather have them: Opus
+    /// for bandwidth, then FLAC for lossless at half the bytes, then PCM.
+    pub fn all() -> Vec<Self> {
+        [("opus", 16), ("flac", 24), ("pcm", 24), ("pcm", 16)]
+            .into_iter()
+            .map(|(codec, bit_depth)| Self {
+                codec: codec.to_string(),
+                bit_depth,
+            })
+            .collect()
+    }
 }
 
 impl PlayerConfig {
@@ -141,6 +192,11 @@ impl PlayerConfig {
             mixer: None,
             format: None,
             rates: crate::audio::devices::output_rates(None),
+            codecs: CodecOffer::all(),
+            initial_volume: 100,
+            initial_muted: false,
+            buffer_ms: None,
+            required_lead_time_ms: None,
         }
     }
 }
@@ -149,16 +205,35 @@ impl PlayerConfig {
 pub struct Player {
     config: PlayerConfig,
     status: watch::Sender<PlayerStatus>,
+    static_delay: watch::Sender<u16>,
 }
 
 impl Player {
     /// Build a player. Nothing happens until it is run.
     pub fn new(config: PlayerConfig) -> Self {
         let status = watch::Sender::new(PlayerStatus {
-            volume: 100,
+            volume: config.initial_volume,
+            muted: config.initial_muted,
             ..PlayerStatus::default()
         });
-        Self { config, status }
+        let static_delay = watch::Sender::new(config.static_delay);
+        Self {
+            config,
+            status,
+            static_delay,
+        }
+    }
+
+    /// Change the extra playback delay while the player is running.
+    ///
+    /// For a room whose amplifier is swapped, or a screen whose lip-sync is being dialled in:
+    /// the alternative is dropping the session to change one number, which drops the audio with
+    /// it. Takes effect on the running stream, and is reported to the server — a client reports
+    /// state it changed itself.
+    pub fn set_static_delay(&self, milliseconds: u16) {
+        // `send` fails only when nothing is listening, which is a player that is not running:
+        // the value is kept regardless, so the next session starts with it.
+        let _ = self.static_delay.send(milliseconds);
     }
 
     /// Watch what this player is doing.
@@ -190,13 +265,13 @@ impl Player {
         reconnect: Option<Duration>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(base) = reconnect else {
-            return run_outbound(&self.config, &self.status, url).await;
+            return run_outbound(&self.config, &self.status, &self.static_delay, url).await;
         };
 
         let ceiling = Duration::from_secs(60);
         let mut wait = base;
         loop {
-            match run_outbound(&self.config, &self.status, url).await {
+            match run_outbound(&self.config, &self.status, &self.static_delay, url).await {
                 // A connection that came up and then ended is ordinary; start over at the short
                 // delay rather than carrying a backoff earned by an earlier outage.
                 Ok(()) => wait = base,
@@ -219,7 +294,7 @@ impl Player {
     /// holding two connections that each believe they arbitrated correctly.
     #[cfg(feature = "discovery")]
     pub async fn run_inbound(&self, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-        run_inbound(&self.config, &self.status, bind).await
+        run_inbound(&self.config, &self.status, &self.static_delay, bind).await
     }
 }
 
@@ -229,7 +304,11 @@ fn template(config: &PlayerConfig) -> ProtocolClientBuilder {
     ProtocolClientBuilder::builder()
         .client_id(config.client_id.clone())
         .name(config.name.clone())
-        .player_v1_support(player_support(config.format.as_ref(), &config.rates))
+        .player_v1_support(player_support(
+            config.format.as_ref(),
+            &config.rates,
+            &config.codecs,
+        ))
         .product_name(Some(config.product_name.clone()))
         // Passed unconditionally rather than behind an `if`: each setter moves the builder to
         // a new type, so a conditional one would need both branches to agree on it.
@@ -252,20 +331,18 @@ fn template(config: &PlayerConfig) -> ProtocolClientBuilder {
 fn player_support(
     pinned: Option<&crate::protocol::messages::AudioFormatSpec>,
     rates: &[u32],
+    codecs: &[CodecOffer],
 ) -> crate::protocol::messages::PlayerV1Support {
     use crate::protocol::messages::{AudioFormatSpec, PlayerV1Support};
 
-    // (codec, bit depth), most wanted first.
-    const CODECS: [(&str, u8); 4] = [("opus", 16), ("flac", 24), ("pcm", 24), ("pcm", 16)];
-
     let supported_formats = match pinned {
         Some(format) => vec![format.clone()],
-        None => CODECS
-            .into_iter()
-            .flat_map(|(codec, bit_depth)| {
+        None => codecs
+            .iter()
+            .flat_map(|offer| {
                 // Opus is defined at 48kHz, so offering it at the card's other rates would
                 // invite a stream this client's own decoder refuses.
-                let codec_rates: Vec<u32> = if codec == "opus" {
+                let codec_rates: Vec<u32> = if offer.codec == "opus" {
                     rates
                         .iter()
                         .copied()
@@ -277,10 +354,10 @@ fn player_support(
                 codec_rates
                     .into_iter()
                     .map(move |sample_rate| AudioFormatSpec {
-                        codec: codec.to_string(),
+                        codec: offer.codec.clone(),
                         channels: 2,
                         sample_rate,
-                        bit_depth,
+                        bit_depth: offer.bit_depth,
                     })
             })
             .collect(),
@@ -296,6 +373,7 @@ fn player_support(
 async fn run_outbound(
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
+    static_delay: &watch::Sender<u16>,
     url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Connecting to {url}");
@@ -319,12 +397,15 @@ async fn run_outbound(
 
     let conn = client.split();
     play(
-        conn.messages,
-        conn.audio,
-        conn.clock_sync,
-        conn.sender,
+        SessionChannels {
+            messages: conn.messages,
+            audio: conn.audio,
+            clock_sync: conn.clock_sync,
+            sender: conn.sender,
+        },
         config,
         status,
+        static_delay.subscribe(),
         context,
     )
     .await;
@@ -340,6 +421,7 @@ async fn run_outbound(
 async fn run_inbound(
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
+    static_delay: &watch::Sender<u16>,
     bind: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = template(config).listen(bind).await?;
@@ -374,12 +456,15 @@ async fn run_inbound(
             client_name: config.name.clone(),
         };
         let played = play(
-            conn.messages,
-            conn.audio,
-            conn.clock_sync,
-            conn.sender,
+            SessionChannels {
+                messages: conn.messages,
+                audio: conn.audio,
+                clock_sync: conn.clock_sync,
+                sender: conn.sender,
+            },
             config,
             status,
+            static_delay.subscribe(),
             context,
         )
         .await;
@@ -398,19 +483,33 @@ async fn run_inbound(
 ///
 /// Returns whether any audio was actually played, which is what decides if this server counts
 /// as "last played" for a later arbitration.
-async fn play(
-    mut messages: tokio::sync::mpsc::UnboundedReceiver<Message>,
-    mut audio: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+/// The four halves of one connection the session reads and writes.
+///
+/// Together rather than as four parameters, because they are one connection: a session handed
+/// three of them and someone else's fourth would be a bug nothing would catch.
+struct SessionChannels {
+    messages: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    audio: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
     clock_sync: Arc<parking_lot::Mutex<crate::sync::ClockSync>>,
     sender: WsSender,
+}
+
+async fn play(
+    channels: SessionChannels,
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
+    mut static_delay: watch::Receiver<u16>,
     context: HookContext,
 ) -> bool {
+    let SessionChannels {
+        mut messages,
+        mut audio,
+        clock_sync,
+        sender,
+    } = channels;
     let hooks = &config.hooks;
     let external_volume = volume_is_elsewhere(config);
     let output_device = config.device.clone();
-    let static_delay = config.static_delay;
     status.send_modify(|status| {
         status.connection = ConnectionState::Connected;
         status.server_id = context.server_id.clone();
@@ -434,7 +533,7 @@ async fn play(
     // where there is one, so a daemon on a card sitting at 30% reports 30 rather than
     // announcing 100 and then being wrong until someone changes it.
     let (mut volume, mut muted) = starting_volume(config);
-    let mut delay = static_delay;
+    let mut delay = *static_delay.borrow_and_update();
     status.send_modify(|status| {
         status.volume = volume;
         status.muted = muted;
@@ -449,6 +548,10 @@ async fn play(
             volume: Some(volume),
             muted: Some(muted),
             static_delay_ms: Some(delay),
+            // Only said when the application had something to say: a `None` leaves the server
+            // its own default rather than replacing it with one this crate invented.
+            min_buffer_ms: config.buffer_ms,
+            required_lead_time_ms: config.required_lead_time_ms,
             ..PlayerState::default()
         }),
         source: None,
@@ -669,6 +772,26 @@ async fn play(
                     }
                 }
             }
+            // A delay changed by the application rather than by the server. Reported, because
+            // the server schedules against it: a client that quietly moves its own playback
+            // and lets the server keep the old number is a client in a room that drifts.
+            Ok(()) = static_delay.changed() => {
+                delay = *static_delay.borrow_and_update();
+                if let Some(player) = &player {
+                    player.set_static_delay(delay);
+                }
+                log::info!("Static delay set to {delay} ms by the application");
+                let state = ClientState {
+                    player: Some(PlayerState {
+                        static_delay_ms: Some(delay),
+                        ..PlayerState::default()
+                    }),
+                    ..ClientState::default()
+                };
+                if let Err(e) = sender.send_message(Message::ClientState(state)).await {
+                    log::warn!("Could not report the new static delay: {e}");
+                }
+            }
             else => break,
         }
     }
@@ -700,8 +823,7 @@ fn starting_volume(config: &PlayerConfig) -> (u8, bool) {
             Err(e) => log::warn!("Could not read the hardware volume: {e}"),
         }
     }
-    let _ = config;
-    (100, false)
+    (config.initial_volume, config.initial_muted)
 }
 
 /// Whether something other than this process's own gain owns the level.
@@ -798,4 +920,83 @@ fn build_decoder(
             codec_header: header,
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> PlayerConfig {
+        PlayerConfig {
+            rates: vec![44_100, 48_000, 96_000],
+            ..PlayerConfig::new("id".to_string(), "name".to_string())
+        }
+    }
+
+    /// Narrowing the codec list decides what a server sends rather than merely preferring it,
+    /// which is the whole reason an application would want to set it.
+    #[test]
+    fn offering_one_codec_offers_it_at_every_rate_and_nothing_else() {
+        let config = PlayerConfig {
+            codecs: vec![CodecOffer {
+                codec: "pcm".to_string(),
+                bit_depth: 24,
+            }],
+            ..config()
+        };
+        let support = player_support(None, &config.rates, &config.codecs);
+        assert_eq!(support.supported_formats.len(), 3);
+        assert!(support
+            .supported_formats
+            .iter()
+            .all(|format| format.codec == "pcm" && format.bit_depth == 24));
+    }
+
+    /// Opus exists at 48kHz, so offering it at a card's other rates would invite a stream this
+    /// client's own decoder refuses.
+    #[test]
+    fn opus_is_offered_at_one_rate_however_many_the_card_has() {
+        let config = PlayerConfig {
+            codecs: vec![CodecOffer {
+                codec: "opus".to_string(),
+                bit_depth: 16,
+            }],
+            ..config()
+        };
+        let support = player_support(None, &config.rates, &config.codecs);
+        assert_eq!(support.supported_formats.len(), 1);
+        assert_eq!(support.supported_formats[0].sample_rate, 48_000);
+    }
+
+    /// A pinned format is the whole offer: an application that names one wants that one, not a
+    /// preference among the rest.
+    #[test]
+    fn a_pinned_format_is_offered_alone() {
+        let pinned = AudioFormatSpec {
+            codec: "flac".to_string(),
+            channels: 2,
+            sample_rate: 88_200,
+            bit_depth: 24,
+        };
+        let config = config();
+        let support = player_support(Some(&pinned), &config.rates, &config.codecs);
+        assert_eq!(support.supported_formats.len(), 1);
+        let offered = &support.supported_formats[0];
+        assert_eq!(offered.codec, pinned.codec);
+        assert_eq!(offered.sample_rate, pinned.sample_rate);
+        assert_eq!(offered.bit_depth, pinned.bit_depth);
+        assert_eq!(offered.channels, pinned.channels);
+    }
+
+    /// Where nothing else owns the level, the session starts at what the application restored
+    /// rather than at full volume.
+    #[test]
+    fn the_session_starts_at_the_level_the_application_asked_for() {
+        let config = PlayerConfig {
+            initial_volume: 35,
+            initial_muted: true,
+            ..config()
+        };
+        assert_eq!(starting_volume(&config), (35, true));
+    }
 }

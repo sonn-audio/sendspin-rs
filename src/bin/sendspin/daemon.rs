@@ -15,7 +15,7 @@ use std::time::Duration;
 use sendspin::hooks::Hooks;
 use sendspin::noise::file_store::{load_or_create_identity, FilePairingStore};
 use sendspin::noise::trust_store::{PairingConfig, PairingStore};
-use sendspin::player::{Player, PlayerConfig};
+use sendspin::player::{CodecOffer, Player, PlayerConfig};
 use sendspin::protocol::client::EncryptionSettings;
 
 use crate::cli::{default_product_name, hostname, DaemonArgs};
@@ -151,6 +151,16 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         hooks,
         #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
         mixer: _mixer,
+        // Spelled out rather than taken from `PlayerConfig::new`, whose defaults probe the
+        // default output device — which this daemon has already done, for the device the
+        // operator actually named. These five are settings an embedding application needs and
+        // an operator has not asked for; giving them flags is a separate decision from making
+        // them reachable.
+        codecs: CodecOffer::all(),
+        initial_volume: 100,
+        initial_muted: false,
+        buffer_ms: None,
+        required_lead_time_ms: None,
     };
     let player = Player::new(config);
 
