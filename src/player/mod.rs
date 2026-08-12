@@ -9,7 +9,8 @@
 //! wherever the level actually lives, and fires the host's hooks at the right moments.
 //!
 //! It exists as a library module because otherwise every application embedding this crate
-//! writes it again. Build a [`PlayerConfig`], hand it to [`Player`], and either dial a server
+//! writes it again. Build a [`PlayerConfig`](crate::player::PlayerConfig), hand it to
+//! [`Player`](crate::player::Player), and either dial a server
 //! or wait for one:
 //!
 //! ```no_run
