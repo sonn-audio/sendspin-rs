@@ -17,6 +17,7 @@ pub mod gain;
 /// Driving a card's own volume control instead of attenuating in software.
 #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
 pub mod mixer;
+
 /// Buffer pool for reusing audio sample buffers
 pub mod pool;
 /// Capture helper for the source role: encode and stamp in server time.
@@ -27,6 +28,12 @@ pub mod sync_correction;
 pub mod synced_player;
 /// Core audio type definitions (Sample, Codec, AudioFormat, AudioBuffer)
 pub mod types;
+/// Turning a percentage into a level a hardware mixer understands.
+///
+/// Not Linux-gated, unlike the binding that uses it: the arithmetic has no platform, and
+/// keeping it here is what lets it be tested on a machine with no ALSA at all.
+#[cfg(feature = "hardware-volume")]
+pub mod volume_scale;
 
 pub use gain::GainControl;
 pub use pool::BufferPool;
