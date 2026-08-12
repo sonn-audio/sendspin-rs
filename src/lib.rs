@@ -24,6 +24,8 @@ pub use sendspin_proto::sync;
 pub mod audio;
 /// External commands run on stream lifecycle and volume changes.
 pub mod hooks;
+/// Being a player: the session between the protocol and a sound card.
+pub mod player;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
 
