@@ -466,6 +466,9 @@ async fn play(
     // once per stream rather than once per chunk. Fifty chunks a second is a log flood, and it
     // buries the one line that says what actually went wrong.
     let mut output_unavailable = false;
+    // Reopens spent on this stream after the card reported a fault. Bounded, because a device
+    // that fails the moment it opens would otherwise be reopened once per chunk forever.
+    let mut output_restarts = 0_u8;
     let mut played_anything = false;
     // Held outside the player: a volume command can arrive before a stream does, and the
     // setting has to survive until there is something to apply it to. Seeded from the card
@@ -508,6 +511,7 @@ async fn play(
                         format = None;
                         player = None;
                         output_unavailable = false;
+                        output_restarts = 0;
                         match build_decoder(&config) {
                             Ok((built, fmt)) => {
                                 decoder = Some(built);
@@ -619,44 +623,67 @@ async fn play(
                 if output_unavailable {
                     continue;
                 }
-                let player = match player.as_ref() {
-                    Some(player) => player,
-                    None => {
-                        // Built on the first chunk rather than on `stream/start`, so a stream
-                        // that is announced but never carries audio does not open the device.
-                        match SyncedPlayer::new(
-                            fmt.clone(),
-                            Arc::clone(&clock_sync),
-                            SyncedPlayerConfig {
-                                // Unity whenever something else owns the level — a script or
-                                // the card's own mixer — or the attenuation would land twice.
-                                volume: if external_volume { 100 } else { volume },
-                                muted: !external_volume && muted,
-                                device: output_device.clone(),
-                                ..SyncedPlayerConfig::new()
-                            },
-                        ) {
-                            Ok(built) => {
-                                built.set_static_delay(delay);
-                                log::info!("Audio output open");
-                                player.insert(built)
-                            }
-                            Err(e) => {
-                                log::error!("Could not open the audio output: {e}");
-                                output_unavailable = true;
-                                continue;
-                            }
+                if player.is_none() {
+                    // Built on the first chunk rather than on `stream/start`, so a stream that
+                    // is announced but never carries audio does not open the device.
+                    match SyncedPlayer::new(
+                        fmt.clone(),
+                        Arc::clone(&clock_sync),
+                        SyncedPlayerConfig {
+                            // Unity whenever something else owns the level — a script or the
+                            // card's own mixer — or the attenuation would land twice.
+                            volume: if external_volume { 100 } else { volume },
+                            muted: !external_volume && muted,
+                            device: output_device.clone(),
+                            ..SyncedPlayerConfig::new()
+                        },
+                    ) {
+                        Ok(built) => {
+                            built.set_static_delay(delay);
+                            log::info!("Audio output open");
+                            player = Some(built);
+                        }
+                        Err(e) => {
+                            log::error!("Could not open the audio output: {e}");
+                            output_unavailable = true;
+                            continue;
                         }
                     }
+                }
+                let Some(active) = player.as_ref() else {
+                    continue;
                 };
                 played_anything = true;
-                player.enqueue(AudioBuffer {
+                active.enqueue(AudioBuffer {
                     timestamp: chunk.timestamp,
                     samples,
                     format: fmt.clone(),
                 });
-                if let Some(e) = player.take_error() {
-                    log::error!("Audio output error: {e}");
+                let failure = active.take_error();
+
+                // A card that reports a fault has stopped: everything enqueued after it is
+                // played by nobody, so this reopens rather than only complaining. CoreAudio
+                // raises "Device sample rate changed" the first time a device is opened at a
+                // rate it was not already running — our own change, handed back as a fault —
+                // and the reopen then succeeds against a card already at the new rate.
+                if let Some(e) = failure {
+                    const MAX_OUTPUT_RESTARTS: u8 = 3;
+                    player = None;
+                    if output_restarts < MAX_OUTPUT_RESTARTS {
+                        output_restarts += 1;
+                        log::warn!(
+                            "Audio output error: {e}. Reopening the device \
+                             ({output_restarts}/{MAX_OUTPUT_RESTARTS})"
+                        );
+                    } else {
+                        // Repeated failure is a card that cannot play this stream, not a rate
+                        // change settling. Stop until the next `stream/start` offers a new one.
+                        output_unavailable = true;
+                        log::error!(
+                            "Audio output error: {e}. Reopened {MAX_OUTPUT_RESTARTS} times \
+                             without it holding; staying silent until the next stream"
+                        );
+                    }
                 }
             }
             else => break,
