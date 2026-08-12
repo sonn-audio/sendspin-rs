@@ -545,26 +545,38 @@ async fn play(
                     }
                     Message::ServerCommand(command) => {
                         let Some(player_command) = command.player else { continue };
+                        // Only a real change counts. A server that re-sends the level it
+                        // already set is saying nothing new, and acting on it would re-ramp
+                        // the gain and log a line for a setting nobody moved.
+                        let mut changed = false;
                         match player_command.command {
                             PlayerCommandType::Volume => {
                                 if let Some(level) = player_command.volume {
-                                    volume = level;
-                                    log::info!("Volume set to {level}");
+                                    if level != volume {
+                                        volume = level;
+                                        changed = true;
+                                        log::info!("Volume set to {level}");
+                                    }
                                 }
                             }
                             PlayerCommandType::Mute => {
                                 if let Some(state) = player_command.mute {
-                                    muted = state;
-                                    log::info!("Mute set to {state}");
+                                    if state != muted {
+                                        muted = state;
+                                        changed = true;
+                                        log::info!("Mute set to {state}");
+                                    }
                                 }
                             }
                             PlayerCommandType::SetStaticDelay => {
                                 if let Some(ms) = player_command.static_delay_ms {
-                                    delay = ms;
-                                    if let Some(player) = &player {
-                                        player.set_static_delay(ms);
+                                    if ms != delay {
+                                        delay = ms;
+                                        if let Some(player) = &player {
+                                            player.set_static_delay(ms);
+                                        }
+                                        log::info!("Static delay set to {ms} ms");
                                     }
-                                    log::info!("Static delay set to {ms} ms");
                                 }
                             }
                             PlayerCommandType::Unknown => {}
@@ -573,29 +585,22 @@ async fn play(
                         // mute reach the same place: either the operator's script owns the
                         // level, or this process's gain does. Never both — that would apply
                         // the setting twice.
-                        if matches!(
-                            player_command.command,
-                            PlayerCommandType::Volume | PlayerCommandType::Mute
-                        ) {
+                        if changed
+                            && matches!(
+                                player_command.command,
+                                PlayerCommandType::Volume | PlayerCommandType::Mute
+                            )
+                        {
                             apply_volume(device, player.as_ref(), volume, muted).await;
                         }
 
-                        // A command is only obeyed if the server can see it was: the spec has
-                        // the client report its own state rather than the server assuming.
-                        let state = ClientState {
-                            available: None,
-                            state: None,
-                            player: Some(PlayerState {
-                                volume: Some(volume),
-                                muted: Some(muted),
-                                static_delay_ms: Some(delay),
-                                ..PlayerState::default()
-                            }),
-                            source: None,
-                        };
-                        if let Err(e) = sender.send_message(Message::ClientState(state)).await {
-                            log::warn!("Could not report player state: {e}");
-                        }
+                        // Deliberately no `client/state` in reply. The server already knows
+                        // what it asked for, and a server that reconciles the state it
+                        // receives by commanding again turns an echo into a loop: this client
+                        // reported 100 on connect while the group sat at 12, and the two
+                        // chased each other hundreds of times a second. The reference client
+                        // does not answer a command either — a client reports state it
+                        // changed itself, not state it was told to have.
                     }
                     Message::GroupUpdate(group)
                         if group.playback_state == Some(PlaybackState::Playing) =>
