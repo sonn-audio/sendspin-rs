@@ -656,6 +656,14 @@ async fn play(
                             streaming = false;
                             hooks.on_stream_stop(&context);
                         }
+                        // Back to connected, because that is what this now is. Leaving it on
+                        // `Playing` until the connection happens to drop makes the status say a
+                        // speaker is busy for the rest of the evening -- and an application that
+                        // waits for a quiet moment, to install something or to power an amplifier
+                        // down, would wait for one that never comes.
+                        status.send_modify(|status| {
+                            status.connection = ConnectionState::Connected;
+                        });
                     }
                     // A clear drops what is buffered without ending the stream, so it is not a
                     // stop: firing the hook here would shut down an amplifier mid-track.
