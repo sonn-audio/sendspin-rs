@@ -252,6 +252,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut playback_started = false; // Track if we've started playback
     let mut first_chunk_logged = false; // Track if we've logged the first chunk
     let mut synced_player: Option<SyncedPlayer> = None;
+    // The format the output device is currently open for, which is not always
+    // the format of the newest stream.
+    let mut output_format: Option<AudioFormat> = None;
     let mut format_requested = false; // One-shot guard for the request-format demo
                                       // Retained so a command arriving before the player exists still applies.
     let mut static_delay_ms: u16 = 0;
@@ -525,7 +528,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
 
-                            if synced_player.is_none() {
+                            // The card is opened for one specific format, so a
+                            // stream that changes rate, depth or channel count
+                            // needs it reopened. Feeding 96kHz frames to a
+                            // device still open at 44.1kHz plays them at 46%
+                            // speed — audibly slow and low, not a dropout.
+                            let output_matches_stream = output_format.as_ref().is_some_and(|open| {
+                                open.sample_rate == fmt.sample_rate
+                                    && open.channels == fmt.channels
+                                    && open.bit_depth == fmt.bit_depth
+                            });
+
+                            if !output_matches_stream {
+                                if let Some(open) = output_format.take() {
+                                    println!(
+                                        "Format changed ({}Hz {}ch {}bit -> {}Hz {}ch {}bit), reopening output",
+                                        open.sample_rate, open.channels, open.bit_depth,
+                                        fmt.sample_rate, fmt.channels, fmt.bit_depth,
+                                    );
+                                }
+                                // Close the old stream before claiming the
+                                // device again, so the two never run at once.
+                                synced_player = None;
+
                                 let player_config = SyncedPlayerConfig {
                                     device: device.as_ref().cloned(),
                                     volume: 100,
@@ -538,9 +563,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     player_config,
                                 ) {
                                     Ok(player) => {
-                                        println!("Synced audio output initialized");
+                                        println!(
+                                            "Synced audio output initialized ({}Hz {}ch {}bit)",
+                                            fmt.sample_rate, fmt.channels, fmt.bit_depth
+                                        );
                                         player.set_static_delay(static_delay_ms);
                                         synced_player = Some(player);
+                                        output_format = Some(fmt.clone());
                                     }
                                     Err(e) => {
                                         eprintln!("Failed to create synced output: {}", e);
