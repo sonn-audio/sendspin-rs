@@ -37,12 +37,38 @@ pub enum Command {
         #[command(subcommand)]
         command: AudioDevicesCommand,
     },
+
+    /// Server discovery utilities.
+    Servers {
+        #[command(subcommand)]
+        command: DiscoveryCommand,
+    },
+
+    /// Client discovery utilities.
+    Clients {
+        #[command(subcommand)]
+        command: DiscoveryCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
 pub enum AudioDevicesCommand {
     /// List the output devices this machine can play through, and exit.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DiscoveryCommand {
+    /// Discover what is on the network over mDNS, and exit.
+    List {
+        /// Seconds to listen for answers.
+        ///
+        /// A browse cannot know it has heard everything, so this is a window rather than a
+        /// timeout: it always waits the full time, and a device that answers slowly is still
+        /// one worth listing.
+        #[arg(long, default_value_t = 3)]
+        seconds: u64,
+    },
 }
 
 #[derive(Parser, Debug)]

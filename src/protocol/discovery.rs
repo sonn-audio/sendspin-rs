@@ -18,12 +18,17 @@
 //! Requires the `discovery` feature: an appliance whose address is configured has no use for
 //! an mDNS daemon, and should not link one.
 
-use mdns_sd::{ServiceDaemon, ServiceInfo};
+use std::time::{Duration, Instant};
+
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 
 use crate::error::Error;
 
 /// The service type a Sendspin client advertises.
 const SERVICE_TYPE: &str = "_sendspin._tcp.local.";
+
+/// The service type a Sendspin server advertises.
+const SERVER_SERVICE_TYPE: &str = "_sendspin-server._tcp.local.";
 
 /// The port the spec recommends for a listening client.
 pub const RECOMMENDED_PORT: u16 = 8928;
@@ -112,5 +117,146 @@ impl Drop for ClientAdvertisement {
         if let Err(e) = self.unregister() {
             log::debug!("mDNS withdrawal on drop: {e}");
         }
+    }
+}
+
+/// A Sendspin server or client found on the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    /// The friendly name from the `name` TXT record, or the instance name when it said none.
+    pub name: String,
+    /// The mDNS instance name, unique on the network.
+    pub instance: String,
+    /// The address to reach it on, preferring IPv4 because that is what a `ws://` URL is
+    /// most likely to be dialled with.
+    pub address: String,
+    /// The TCP port the WebSocket is served on.
+    pub port: u16,
+    /// The WebSocket path from the `path` TXT record, defaulting to the recommended one.
+    pub path: String,
+}
+
+impl Discovered {
+    /// The WebSocket URL this record points at.
+    pub fn url(&self) -> String {
+        // A bare IPv6 address has to be bracketed or the port reads as part of it.
+        let host = if self.address.contains(':') {
+            format!("[{}]", self.address)
+        } else {
+            self.address.clone()
+        };
+        format!("ws://{host}:{}{}", self.port, self.path)
+    }
+}
+
+/// Browse for Sendspin servers for `duration`.
+///
+/// Blocks for the whole window rather than returning on the first answer: the point of a
+/// listing is to show everything on the network, and a server that is slow to respond is
+/// still one an operator wants to see.
+pub fn browse_servers(duration: Duration) -> Result<Vec<Discovered>, Error> {
+    browse(SERVER_SERVICE_TYPE, duration)
+}
+
+/// Browse for Sendspin clients for `duration`.
+///
+/// These are the clients waiting to be connected to — the direction
+/// [`ClientAdvertisement`] advertises. A client that dials a server itself is invisible here,
+/// and correctly so: it is not offering anything to find.
+pub fn browse_clients(duration: Duration) -> Result<Vec<Discovered>, Error> {
+    browse(SERVICE_TYPE, duration)
+}
+
+fn browse(service_type: &str, duration: Duration) -> Result<Vec<Discovered>, Error> {
+    let daemon = ServiceDaemon::new()
+        .map_err(|e| Error::Connection(format!("could not start the mDNS daemon: {e}")))?;
+    let receiver = daemon
+        .browse(service_type)
+        .map_err(|e| Error::Connection(format!("could not browse for {service_type}: {e}")))?;
+
+    let deadline = Instant::now() + duration;
+    let mut found: Vec<Discovered> = Vec::new();
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        let Ok(event) = receiver.recv_timeout(remaining) else {
+            break;
+        };
+        let ServiceEvent::ServiceResolved(service) = event else {
+            continue;
+        };
+        // An unresolved record has no address to dial, so listing it would offer the operator
+        // a name they cannot use.
+        if !service.is_valid() {
+            continue;
+        }
+
+        // IPv4 first: link-local IPv6 carries a scope that a URL cannot express.
+        let address = match service.get_addresses_v4().into_iter().next() {
+            Some(v4) => v4.to_string(),
+            None => match service.get_addresses().iter().next() {
+                Some(any) => any.to_string(),
+                None => continue,
+            },
+        };
+        let instance = service
+            .get_fullname()
+            .strip_suffix(&format!(".{service_type}"))
+            .unwrap_or(service.get_fullname())
+            .to_string();
+        let entry = Discovered {
+            name: service
+                .get_property_val_str("name")
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&instance)
+                .to_string(),
+            address,
+            port: service.get_port(),
+            path: service
+                .get_property_val_str("path")
+                .filter(|path| !path.is_empty())
+                .unwrap_or(RECOMMENDED_PATH)
+                .to_string(),
+            instance,
+        };
+        // A record is re-announced as its TTL is refreshed, and each announcement resolves
+        // again. Listing one device three times would read as three devices.
+        if !found.iter().any(|seen| seen.instance == entry.instance) {
+            found.push(entry);
+        }
+    }
+
+    // Best effort: the daemon stops when it drops, and a browse that cannot be cancelled
+    // cleanly has still returned everything it saw.
+    let _ = daemon.shutdown();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_url_is_built_from_the_address_port_and_path() {
+        let found = Discovered {
+            name: "Kitchen".to_string(),
+            instance: "kitchen-1".to_string(),
+            address: "192.168.1.20".to_string(),
+            port: 8927,
+            path: "/sendspin".to_string(),
+        };
+        assert_eq!(found.url(), "ws://192.168.1.20:8927/sendspin");
+    }
+
+    /// An unbracketed IPv6 address would make the port read as another hextet.
+    #[test]
+    fn an_ipv6_address_is_bracketed() {
+        let found = Discovered {
+            name: "Loft".to_string(),
+            instance: "loft-1".to_string(),
+            address: "fe80::1".to_string(),
+            port: 8928,
+            path: "/sendspin".to_string(),
+        };
+        assert_eq!(found.url(), "ws://[fe80::1]:8928/sendspin");
     }
 }
