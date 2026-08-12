@@ -574,6 +574,11 @@ async fn play(
     // where there is one, so a daemon on a card sitting at 30% reports 30 rather than
     // announcing 100 and then being wrong until someone changes it.
     let (mut volume, mut muted) = starting_volume(config);
+    // Only worth doing where a card owns the level. A second of lag is what the reference client
+    // accepts too, and it costs one mixer read: far cheaper than being wrong about the volume.
+    let watching_mixer = mixer_is_driven(config);
+    let mut mixer_tick = tokio::time::interval(MIXER_POLL_INTERVAL);
+    mixer_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut delay = *static_delay.borrow_and_update();
     status.send_modify(|status| {
         status.volume = volume;
@@ -833,6 +838,34 @@ async fn play(
                     log::warn!("Could not report the new static delay: {e}");
                 }
             }
+            // The card itself was turned -- by the speaker's own remote, or a knob on its front.
+            // Nothing tells us, so the mixer is read on a tick, which is what the reference client
+            // does. Reported like any other local change: a level the server does not know about is
+            // a slider that lies, and on hardware that shows its own volume it lies visibly.
+            _ = mixer_tick.tick(), if watching_mixer => {
+                if let Some((level, mute)) = read_mixer(config) {
+                    if (level, mute) != (volume, muted) {
+                        log::debug!("Hardware volume changed on the card: {level}% (muted: {mute})");
+                        volume = level;
+                        muted = mute;
+                        status.send_modify(|status| {
+                            status.volume = volume;
+                            status.muted = muted;
+                        });
+                        let state = ClientState {
+                            player: Some(PlayerState {
+                                volume: Some(volume),
+                                muted: Some(muted),
+                                ..PlayerState::default()
+                            }),
+                            ..ClientState::default()
+                        };
+                        if let Err(e) = sender.send_message(Message::ClientState(state)).await {
+                            log::warn!("Could not report the level the card was set to: {e}");
+                        }
+                    }
+                }
+            }
             // The application's own control moved -- a remote, a knob, a panel. Unlike a server
             // command this is news to the server, so it is reported: a client that changes its own
             // level and lets the server keep the old number shows a slider that is not the sound.
@@ -877,6 +910,39 @@ async fn play(
 }
 
 /// The level to start from: the card's, where a mixer is driving it, and full otherwise.
+/// How often the card is asked whether someone turned it. The reference client uses the same.
+const MIXER_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Whether a card's own mixer is the thing holding this player's level.
+#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+fn mixer_is_driven(config: &PlayerConfig) -> bool {
+    config.mixer.is_some()
+}
+
+#[cfg(not(all(feature = "hardware-volume", target_os = "linux")))]
+fn mixer_is_driven(_config: &PlayerConfig) -> bool {
+    false
+}
+
+/// The level the card is at now, or nothing when there is no mixer or it cannot be read.
+#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+fn read_mixer(config: &PlayerConfig) -> Option<(u8, bool)> {
+    match config.mixer.as_ref()?.read() {
+        Ok(state) => Some(state),
+        Err(e) => {
+            // Not fatal, and not at warn level: a card that has gone away takes the whole session
+            // with it soon enough, through a path that says so properly.
+            log::debug!("Could not read the hardware volume: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "hardware-volume", target_os = "linux")))]
+fn read_mixer(_config: &PlayerConfig) -> Option<(u8, bool)> {
+    None
+}
+
 fn starting_volume(config: &PlayerConfig) -> (u8, bool) {
     #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
     if let Some(mixer) = &config.mixer {
