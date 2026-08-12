@@ -62,7 +62,14 @@ impl InputStream {
         let config = cpal::StreamConfig {
             channels: u16::from(channels),
             sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+            // Asked for, not left to the driver.
+            //
+            // The default period ALSA picks is tuned for the smallest frame it might be asked for,
+            // and a 24-bit capture moves half again as many bytes per period as a 16-bit one. On a
+            // Pi that shows up as "A buffer underrun or overrun occurred" every few seconds, heard
+            // as a stutter. Twenty milliseconds is far more than the callback needs and still far
+            // below anything a line input has to answer for.
+            buffer_size: buffer_frames(&supported, sample_rate),
         };
 
         // Unbounded, and the one allocation this path makes per callback. A capture callback
@@ -168,6 +175,22 @@ fn from_f32(data: &[f32], bit_depth: u8) -> Vec<u8> {
 }
 
 /// Convert cpal's 16-bit samples, widening when the wire carries more than the card gives.
+/// A capture period of roughly [`CAPTURE_BUFFER_MS`], within what the device allows.
+fn buffer_frames(
+    supported: &cpal::SupportedStreamConfigRange,
+    sample_rate: u32,
+) -> cpal::BufferSize {
+    let wanted = sample_rate / 1000 * u32::from(CAPTURE_BUFFER_MS);
+    match supported.buffer_size() {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            cpal::BufferSize::Fixed(wanted.clamp(*min, *max))
+        }
+        // The device will not say, so neither do we: asking for a size it cannot give is worse than
+        // taking what it offers.
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+    }
+}
+
 /// Which of the formats a device offers to record in.
 ///
 /// The one that matches what is being sent wins; after that, deeper beats shallower. Recording 16
@@ -190,6 +213,10 @@ fn capture_format_rank(candidate: cpal::SampleFormat, bit_depth: u8) -> u8 {
         _ => 4,
     }
 }
+
+/// How much audio one capture callback carries. Comfortably above what any of these devices need,
+/// and still a fraction of the buffering the stream itself has downstream.
+const CAPTURE_BUFFER_MS: u16 = 20;
 
 /// A 32-bit frame from a 24-bit converter: the sample is in the top 24 bits.
 fn from_i32(data: &[i32], bit_depth: u8) -> Vec<u8> {
