@@ -5,7 +5,20 @@ use super::raw_clock::{Clock, DefaultClock};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const ADAPTIVE_FORGETTING_CUTOFF: f64 = 0.75;
+/// Residual threshold, as a multiple of `max_error`, past which a sample is treated as an
+/// outlier and the filter forgets rather than believes.
+///
+/// The reference implementation's value, and it has to be this loose. Set too tight, ordinary
+/// network jitter is classified as an outlier, and since an outlier inflates covariance rather
+/// than correcting the estimate, the filter stops tracking the very thing it is for.
+const ADAPTIVE_FORGETTING_CUTOFF: f64 = 3.0;
+
+/// Scale applied to `max_error` before it is used as the measurement standard deviation.
+///
+/// Half the round-trip time overestimates the real measurement noise — the two legs are rarely
+/// both as slow as the round trip suggests — so believing it whole makes the filter trust every
+/// sample less than it should and converge slower than it can.
+const MAX_ERROR_SCALE: f64 = 0.5;
 
 #[derive(Debug, Clone, Copy)]
 struct TimeElement {
@@ -30,6 +43,16 @@ struct TimeFilter {
 }
 
 impl TimeFilter {
+    /// The filter as the reference implementation configures it.
+    ///
+    /// Zero process noise and a forgetting factor of two are `aiosendspin`'s own defaults, and
+    /// that is itself a 1:1 port of the ESPHome client — the two implementations a Sendspin
+    /// server has actually been tuned against. Named once here rather than spelled at each call
+    /// site, so a test cannot quietly exercise a filter production does not use.
+    fn reference() -> Self {
+        Self::new(0.0, 2.0)
+    }
+
     fn new(process_std_dev: f64, forget_factor: f64) -> Self {
         let process_variance = process_std_dev * process_std_dev;
         let forget_variance_factor = forget_factor * forget_factor;
@@ -64,7 +87,7 @@ impl TimeFilter {
         let dt = (time_added - self.last_update) as f64;
         self.last_update = time_added;
 
-        let update_std_dev = max_error as f64;
+        let update_std_dev = max_error as f64 * MAX_ERROR_SCALE;
         let measurement_variance = update_std_dev * update_std_dev;
 
         if self.count == 0 {
@@ -109,7 +132,10 @@ impl TimeFilter {
         let predicted_offset = self.offset + self.drift * dt;
         let dt_squared = dt * dt;
 
-        let drift_process_variance = 0.0;
+        // Small but not zero: with no process noise at all, drift covariance can only shrink,
+        // and a filter certain of a drift it measured an hour ago cannot follow a clock that
+        // has since been slewed.
+        let drift_process_variance = Self::DRIFT_PROCESS_STD_DEV * Self::DRIFT_PROCESS_STD_DEV;
         let mut new_drift_covariance = self.drift_covariance + drift_process_variance;
 
         let offset_drift_process_variance = 0.0;
@@ -158,6 +184,9 @@ impl TimeFilter {
             use_drift: Self::drift_has_sufficient_snr(self.drift, self.drift_covariance),
         };
     }
+
+    /// Process noise on the drift estimate, in the reference implementation's units.
+    const DRIFT_PROCESS_STD_DEV: f64 = 1e-11;
 
     /// Minimum baseline for estimating drift from the first two samples.
     /// The fast-start pair can arrive bunched to near-zero spacing, so it
@@ -282,7 +311,7 @@ impl ClockSync {
         Self {
             rtt_micros: None,
             last_update: None,
-            filter: TimeFilter::new(0.01, 1.001),
+            filter: TimeFilter::reference(),
             clock,
         }
     }
@@ -457,7 +486,7 @@ mod tests {
     /// and put the filter into the steady-state Kalman branch, where negative
     /// `dt` would actually corrupt the prediction/covariance math.
     fn primed_filter() -> TimeFilter {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::reference();
         f.update(100, 10, 1_000);
         f.update(120, 10, 2_000);
         f.update(140, 10, 3_000);
@@ -479,6 +508,50 @@ mod tests {
             f.drift_covariance,
             f.offset_drift_covariance,
         )
+    }
+
+    /// A server whose clock is being slewed — an NTP correction, which is ordinary —
+    /// must be followed, not rejected forever.
+    ///
+    /// The failure this pins down was silent in exactly the way that matters. A tight outlier
+    /// cutoff plus a forgetting factor near one meant every sample after the step was discarded
+    /// as an outlier while the estimate stayed on its old trajectory. Playback sounded perfect,
+    /// because the audio timestamps were converted with the same wrong offset; only a *second*
+    /// client, whose filter had followed, would have revealed it — as an echo between rooms.
+    #[test]
+    fn a_slewed_server_clock_is_followed_rather_than_rejected_forever() {
+        // A steady millisecond of round-trip, sampled once a second like the real thing.
+        const MAX_ERROR: i64 = 500;
+        const SECOND: i64 = 1_000_000;
+
+        let mut f = TimeFilter::reference();
+        let mut t = SECOND;
+        for _ in 0..150 {
+            f.update(0, MAX_ERROR, t);
+            t += SECOND;
+        }
+        assert!(
+            f.offset.abs() < 100.0,
+            "settled filter should sit near zero, got {}",
+            f.offset
+        );
+
+        // The server's clock is now being slewed: 350µs per second, which is what an NTP
+        // daemon correcting a large offset actually does, and what this client saw in the
+        // field. A ramp, not a step — the filter has a drift term precisely for this.
+        const RATE_PER_SECOND: f64 = 350.0;
+        let mut offset = 0.0;
+        for _ in 0..60 {
+            offset += RATE_PER_SECOND;
+            f.update(offset as i64, MAX_ERROR, t);
+            t += SECOND;
+        }
+
+        let error = (f.offset - offset).abs();
+        assert!(
+            error < 2_000.0,
+            "filter never caught the slew: {error:.0}µs behind after a minute of it"
+        );
     }
 
     #[test]
@@ -520,8 +593,8 @@ mod tests {
     fn backwards_sample_does_not_affect_later_predictions() {
         // End-to-end: a rejected backwards sample must leave future
         // conversions identical to a filter that never saw it at all.
-        let mut with_bad = TimeFilter::new(0.01, 1.001);
-        let mut without_bad = TimeFilter::new(0.01, 1.001);
+        let mut with_bad = TimeFilter::reference();
+        let mut without_bad = TimeFilter::reference();
 
         for (m, t) in [(100, 1_000), (120, 2_000), (140, 3_000)] {
             with_bad.update(m, 10, t);
@@ -549,7 +622,7 @@ mod tests {
 
     #[test]
     fn bunched_first_pair_seeds_zero_drift_and_keeps_conversions() {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::reference();
         // Fast-start pair arriving 190µs apart with a large offset delta:
         // pre-fix, this computed drift = -6037/190 ≈ -31.8 and then blocked
         // all conversions on implausibility for a full sample interval.
@@ -566,7 +639,7 @@ mod tests {
 
     #[test]
     fn long_baseline_pair_still_estimates_drift() {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::reference();
         f.update(1_000, 10, 1_000);
         // dt = 200ms, at/above the baseline floor: quotient drift applies.
         f.update(1_200, 10, 201_000);
@@ -603,7 +676,7 @@ mod tests {
 
     #[test]
     fn settles_after_minimum_samples() {
-        let mut f = TimeFilter::new(0.01, 1.001);
+        let mut f = TimeFilter::reference();
         for i in 0..i64::from(TimeFilter::SETTLE_MIN_SAMPLES) {
             assert!(!f.is_settled(), "must not settle before sample {}", i + 1);
             f.update(1_000 + i, 10, 1_000 + i * 1_000_000);
