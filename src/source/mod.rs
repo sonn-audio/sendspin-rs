@@ -36,6 +36,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// How often a start the clock was not ready for is retried.
+const START_RETRY_INTERVAL: Duration = Duration::from_millis(200);
+
 use tokio::sync::watch;
 
 use crate::audio::SourceCapture;
@@ -264,9 +267,10 @@ fn template(config: &SourceConfig) -> ProtocolClientBuilder {
                 line_sense: Some(true),
             }),
         })
-        // Absent until something senses the input: a source that reports `absent` before it has
-        // looked is asserting something it does not know.
-        .initial_source_state(SourceState { signal: None })
+        // No source object in the first `client/state`. There is nothing to put in one until
+        // something has sensed the input, and an empty object is a message the reference client
+        // does not send — the availability the handshake already reports is what a server reads
+        // to know a client has stated itself.
         .product_name(Some(config.product_name.clone()))
         .manufacturer(config.manufacturer.clone())
         .encryption(match &config.encryption {
@@ -373,6 +377,9 @@ async fn capture(
     // input nothing else on the machine can use, and a server may never ask for audio at all.
     let mut input: Option<crate::audio::capture::InputStream> = None;
     let mut encoder: Option<SourceCapture> = None;
+    // A start the server has asked for and this client has not been able to honour yet.
+    let mut start_requested = false;
+    let mut start_tick = tokio::time::interval(START_RETRY_INTERVAL);
 
     loop {
         tokio::select! {
@@ -384,20 +391,20 @@ async fn capture(
                     // Both commands are idempotent by spec: a start while the stream is open
                     // must not restart it, and a stop while stopped is ignored.
                     SourceCommandType::Start if input.is_none() => {
-                        match start(config, &sender, status).await {
-                            Ok((stream, capture)) => {
-                                input = Some(stream);
-                                encoder = Some(capture);
-                            }
-                            Err(e) => {
-                                log::error!("Could not start capturing: {e}");
-                                status.send_modify(|status| status.last_error = Some(e));
-                            }
-                        }
+                        // Held rather than acted on, because the clock may not be ready. The
+                        // start is attempted on the next tick and every tick after it.
+                        start_requested = true;
                     }
-                    SourceCommandType::Stop if input.is_some() => {
+                    SourceCommandType::Stop if start_requested || input.is_some() => {
+                        let announced = input.is_some();
+                        start_requested = false;
                         // Dropped first, so nothing new arrives while the tail is flushed.
                         input = None;
+                        if !announced {
+                            // Asked to stop a stream that was never announced, because the
+                            // clock was not ready to stamp it. There is nothing to end.
+                            continue;
+                        }
                         if let Some(mut capture) = encoder.take() {
                             flush(&mut capture, &sender).await;
                         }
@@ -411,6 +418,30 @@ async fn capture(
                         });
                     }
                     _ => {}
+                }
+            }
+            // A stream is announced only once its frames can be stamped in the server's clock.
+            // Announcing earlier hands the server a stream it cannot place in time, and then
+            // silence until the filter settles; the reference client refuses to start for the
+            // same reason.
+            _ = start_tick.tick(), if start_requested && input.is_none() => {
+                let ready = {
+                    let clock = clock_sync.lock();
+                    let now = clock.clock().now_micros();
+                    clock.client_to_server_micros(now).is_some()
+                };
+                if ready {
+                    match start(config, &sender, status).await {
+                        Ok((stream, capture)) => {
+                            input = Some(stream);
+                            encoder = Some(capture);
+                        }
+                        Err(e) => {
+                            log::error!("Could not start capturing: {e}");
+                            status.send_modify(|status| status.last_error = Some(e));
+                            start_requested = false;
+                        }
+                    }
                 }
             }
             Ok(()) = signal.changed() => {
