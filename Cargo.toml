@@ -11,7 +11,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Sendspin/sendspin-rs"
 
 [features]
-default = []
+# Both roles, because a crate that plays nothing and captures nothing is not a useful default.
+# An embedder that wants one of them builds with `default-features = false`.
+default = ["player", "source"]
+# Being a player: the session that ties the protocol to an output device.
+player = []
+# Being a source: the session that captures an input and streams it upstream.
+source = []
 native-tls = [
     "tokio-tungstenite/native-tls",
     "dep:tokio-native-tls",
@@ -22,7 +28,7 @@ native-tls = [
 discovery = ["dep:mdns-sd"]
 # The `sendspin` command-line player. Off by default, and for the same reason `discovery` is:
 # a device embedding this crate should not link an argument parser or a logger to get a player.
-cli = ["dep:clap", "dep:env_logger", "discovery"]
+cli = ["dep:clap", "dep:env_logger", "discovery", "player"]
 # `sendspin serve`: the command-line server. Separate from `cli` rather than part of it, so a
 # player appliance does not link a server to get a player — which is the same reason the server
 # is its own crate.
@@ -126,3 +132,11 @@ codegen-units = 1
 [[example]]
 name = "secure_socket"
 required-features = ["native-tls"]
+
+[[example]]
+name = "embedded_player"
+required-features = ["player"]
+
+[[example]]
+name = "embedded_source"
+required-features = ["source"]

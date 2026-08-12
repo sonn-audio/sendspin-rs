@@ -23,11 +23,30 @@ pub struct DeviceInfo {
     pub device: cpal::Device,
 }
 
+/// Which way audio travels through a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Playback: a player's output.
+    Output,
+    /// Capture: a source's input.
+    Input,
+}
+
 /// Every device that can play audio, in a stable enumeration order.
 ///
 /// Devices with no output configuration are skipped rather than listed and rejected later:
 /// they are inputs, and offering one as a playback target is an invitation to a typo.
 pub fn output_devices() -> Result<Vec<DeviceInfo>, String> {
+    devices(Direction::Output)
+}
+
+/// Every device that can capture audio, on the same terms.
+pub fn input_devices() -> Result<Vec<DeviceInfo>, String> {
+    devices(Direction::Input)
+}
+
+/// Every device that can carry audio in `direction`.
+pub fn devices(direction: Direction) -> Result<Vec<DeviceInfo>, String> {
     let mut found = Vec::new();
     for host_id in cpal::available_hosts() {
         let host = cpal::host_from_id(host_id)
@@ -36,11 +55,17 @@ pub fn output_devices() -> Result<Vec<DeviceInfo>, String> {
             .devices()
             .map_err(|e| format!("could not enumerate audio devices: {e}"))?;
         for device in devices {
-            let has_output = device
-                .supported_output_configs()
-                .map(|configs| configs.count() > 0)
-                .unwrap_or(false);
-            if !has_output {
+            let usable = match direction {
+                Direction::Output => device
+                    .supported_output_configs()
+                    .map(|configs| configs.count() > 0)
+                    .unwrap_or(false),
+                Direction::Input => device
+                    .supported_input_configs()
+                    .map(|configs| configs.count() > 0)
+                    .unwrap_or(false),
+            };
+            if !usable {
                 continue;
             }
             found.push(DeviceInfo {
@@ -62,7 +87,17 @@ pub fn output_devices() -> Result<Vec<DeviceInfo>, String> {
 /// case-insensitive prefix — so a query of `1` cannot be stolen by a card whose name happens
 /// to start with a digit, and a full id always beats a partial one.
 pub fn find_device(query: &str) -> Result<cpal::Device, String> {
-    let devices = output_devices()?;
+    find_device_in(query, Direction::Output)
+}
+
+/// Resolve `query` to a capture device.
+pub fn find_input_device(query: &str) -> Result<cpal::Device, String> {
+    find_device_in(query, Direction::Input)
+}
+
+/// Resolve `query` to a device carrying audio in `direction`.
+pub fn find_device_in(query: &str, direction: Direction) -> Result<cpal::Device, String> {
+    let devices = devices(direction)?;
 
     if let Ok(index) = query.parse::<usize>() {
         return devices

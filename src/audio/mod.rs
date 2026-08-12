@@ -1,6 +1,9 @@
 // ABOUTME: Audio types and processing for sendspin-rs
 // ABOUTME: Contains Sample type, AudioFormat, Buffer, and codec definitions
 
+/// Opening a capture device for the source role.
+#[cfg(feature = "source")]
+pub mod capture;
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
 

@@ -25,9 +25,13 @@ pub mod audio;
 /// External commands run on stream lifecycle and volume changes.
 pub mod hooks;
 /// Being a player: the session between the protocol and a sound card.
+#[cfg(feature = "player")]
 pub mod player;
 /// Protocol implementation for WebSocket communication
 pub mod protocol;
+/// Being a source: capturing a local input and streaming it to a server.
+#[cfg(feature = "source")]
+pub mod source;
 
 pub(crate) mod log_sampling;
 
