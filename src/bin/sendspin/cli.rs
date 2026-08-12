@@ -250,10 +250,19 @@ impl DaemonArgs {
 ///
 /// Used for both the default name and the default id, so an operator who sets neither still
 /// gets something a server can tell apart from the box next to it.
+///
+/// Asked of the system rather than only of the environment. `$HOSTNAME` is a shell
+/// convention that zsh does not export and `/etc/hostname` is a Linux one, so a Mac with
+/// neither would introduce itself to every server on the network as `unknown` — and so would
+/// the box beside it.
 pub fn hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
-        .filter(|h| !h.is_empty())
+        // Windows spells it differently, and spells it in the environment.
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(system_hostname)
         .or_else(|| {
             std::fs::read_to_string("/etc/hostname")
                 .ok()
@@ -261,6 +270,34 @@ pub fn hostname() -> String {
                 .filter(|h| !h.is_empty())
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The name the kernel knows this machine by, via `gethostname(2)`.
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    // Long enough for HOST_NAME_MAX on every Unix that matters, plus the terminator.
+    let mut buffer = [0_u8; 256];
+    // SAFETY: the pointer and the length describe a buffer this frame owns, and the call
+    // writes at most `len` bytes into it.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    if result != 0 {
+        return None;
+    }
+    // A name that filled the buffer may not be terminated, so the end is the terminator or
+    // the buffer, whichever comes first.
+    let end = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    std::str::from_utf8(&buffer[..end])
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 /// The platform name reported in `client/hello` when the operator names none.
