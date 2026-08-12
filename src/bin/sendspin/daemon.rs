@@ -21,7 +21,7 @@ use sendspin::protocol::messages::{
 use sendspin::ProtocolClientBuilder;
 
 use crate::cli::{default_product_name, hostname, DaemonArgs};
-use crate::hooks::{HookContext, Hooks};
+use sendspin::hooks::{HookContext, Hooks};
 
 /// What this daemon presents to a server, resolved once so both directions cannot drift.
 struct Device {
@@ -39,7 +39,7 @@ struct Device {
     hooks: Hooks,
     /// The card's own volume control, when `--hardware-volume` named one and it opened.
     #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
-    mixer: Option<Arc<crate::mixer::Mixer>>,
+    mixer: Option<Arc<sendspin::audio::mixer::Mixer>>,
     /// The single format offered to the server, when `--audio-format` pinned one.
     ///
     /// Pinning narrows `client/hello` to one entry rather than reordering a list, because a
@@ -254,7 +254,7 @@ fn template(device: &Device) -> ProtocolClientBuilder {
 fn open_mixer(
     args: &DaemonArgs,
     volume_is_external: bool,
-) -> Result<Option<Arc<crate::mixer::Mixer>>, String> {
+) -> Result<Option<Arc<sendspin::audio::mixer::Mixer>>, String> {
     let Some(card) = args.hardware_volume.as_deref() else {
         return Ok(None);
     };
@@ -262,7 +262,7 @@ fn open_mixer(
         log::warn!("--hardware-volume is ignored: --hook-set-volume already owns the level");
         return Ok(None);
     }
-    match crate::mixer::Mixer::open(card) {
+    match sendspin::audio::mixer::Mixer::open(card) {
         Ok(mixer) => {
             log::info!("Hardware volume: {} on {}", mixer.element(), mixer.card());
             Ok(Some(Arc::new(mixer)))

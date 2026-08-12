@@ -22,7 +22,7 @@ native-tls = [
 discovery = ["dep:mdns-sd"]
 # The `sendspin` command-line player. Off by default, and for the same reason `discovery` is:
 # a device embedding this crate should not link an argument parser or a logger to get a player.
-cli = ["dep:clap", "dep:env_logger", "dep:shlex", "discovery"]
+cli = ["dep:clap", "dep:env_logger", "discovery"]
 # `sendspin serve`: the command-line server. Separate from `cli` rather than part of it, so a
 # player appliance does not link a server to get a player — which is the same reason the server
 # is its own crate.
@@ -82,7 +82,7 @@ aes-gcm = "0.11"
 # Command-line only, and optional so a library consumer never pulls them in.
 clap = { version = "4.6", features = ["derive"], optional = true }
 env_logger = { version = "0.11", optional = true }
-shlex = { version = "2.0.1", optional = true }
+shlex = "2.0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = { version = "0.11", optional = true }

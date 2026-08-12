@@ -25,10 +25,15 @@ use tokio::process::Command;
 /// What a lifecycle hook is told about the connection it is firing for.
 #[derive(Clone, Debug, Default)]
 pub struct HookContext {
+    /// The connected server's identity, absent before a connection exists.
     pub server_id: Option<String>,
+    /// The connected server's friendly name.
     pub server_name: Option<String>,
+    /// The URL this client dialled, absent when the server dialled instead.
     pub server_url: Option<String>,
+    /// This client's identity.
     pub client_id: String,
+    /// This client's friendly name.
     pub client_name: String,
 }
 

@@ -11,9 +11,7 @@ mod audio;
 mod cli;
 mod daemon;
 mod discovery;
-mod hooks;
-#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
-mod mixer;
+
 #[cfg(feature = "serve")]
 mod serve;
 

@@ -7,6 +7,10 @@ pub mod decode;
 pub mod encode;
 /// Lock-free volume/mute control
 pub mod gain;
+
+/// Driving a card's own volume control instead of attenuating in software.
+#[cfg(all(feature = "hardware-volume", target_os = "linux"))]
+pub mod mixer;
 /// Buffer pool for reusing audio sample buffers
 pub mod pool;
 /// Capture helper for the source role: encode and stamp in server time.
