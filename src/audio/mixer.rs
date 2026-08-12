@@ -13,8 +13,17 @@
 //! the HiFiBerry DAC+ and most I2S DAC HATs expose, `Master` what generic cards and USB
 //! interfaces use, `PCM` what the Raspberry Pi's own headphone output calls it.
 //!
+//! How a percentage becomes a level is [`crate::audio::volume_scale`], which is separate and
+//! not Linux-gated: the arithmetic is the part that can be tested without a sound card, and it
+//! is where the difference between the two kinds of mixer lives.
+//!
 //! Not compiled in unless the `hardware-volume` feature is on, and Linux-only: this is an
 //! ALSA binding, and a daemon on a card with no mixer should not carry it.
+
+use crate::audio::volume_scale::{
+    millibel_to_percent, percent_to_millibel, percent_to_raw, raw_to_percent, ChosenScale,
+    VolumeScale,
+};
 
 /// Mixer elements to prefer, in order, when a card exposes more than one with playback volume.
 const PREFERRED_ELEMENTS: &[&str] = &["Digital", "Master", "PCM"];
@@ -23,6 +32,7 @@ const PREFERRED_ELEMENTS: &[&str] = &["Digital", "Master", "PCM"];
 pub struct Mixer {
     card: String,
     element: String,
+    scale: ChosenScale,
 }
 
 impl Mixer {
@@ -31,7 +41,11 @@ impl Mixer {
     /// `card` is an ALSA card name such as `default`, `hw:0`, or the `plughw:1` form a device
     /// id carries. A card with no playback element is not an error worth failing a daemon
     /// over — plenty of DACs have no gain stage at all — so the caller decides what to do.
-    pub fn open(card: &str) -> Result<Self, String> {
+    /// `scale` decides how a percentage is mapped. [`VolumeScale::Automatic`] reads the answer
+    /// off the card and is right for hardware that describes itself honestly; the other two are
+    /// for hardware that does not, which an application is better placed to know than this
+    /// crate is.
+    pub fn open(card: &str, scale: VolumeScale) -> Result<Self, String> {
         let mixer = alsa::mixer::Mixer::new(card, false)
             .map_err(|e| format!("could not open the mixer on {card}: {e}"))?;
 
@@ -60,10 +74,36 @@ impl Mixer {
             .map(|preferred| (*preferred).to_string())
             .unwrap_or_else(|| candidates[0].clone());
 
+        // Asked once, at open, and from the card's own description rather than from the level
+        // it happens to sit at: at maximum every mixer reads zero dB below maximum, so a card
+        // that is merely turned up would be misread as having no range at all.
+        let db_range = mixer
+            .find_selem(&alsa::mixer::SelemId::new(&element, 0))
+            .map(|selem| {
+                let (min, max) = selem.get_playback_db_range();
+                (min.0, max.0)
+            })
+            .unwrap_or((0, 0));
+        let scale = ChosenScale::choose(scale, db_range);
+        // Logged once, with the numbers behind it, so a card that behaves oddly can be
+        // diagnosed from a log rather than by ear.
+        log::info!(
+            "Volume on {card}/{element}: {} (card reports {}..{} mB)",
+            scale.describe(),
+            db_range.0,
+            db_range.1
+        );
+
         Ok(Self {
             card: card.to_string(),
             element,
+            scale,
         })
+    }
+
+    /// The scale this mixer maps percentages through.
+    pub fn scale(&self) -> ChosenScale {
+        self.scale
     }
 
     /// The card this drives.
@@ -89,11 +129,23 @@ impl Mixer {
             .find_selem(&selem_id)
             .ok_or_else(|| format!("{} is gone from {}", self.element, self.card))?;
 
-        let (min, max) = selem.get_playback_volume_range();
-        let value = scale_to_range(percent, min, max);
-        selem
-            .set_playback_volume_all(value)
-            .map_err(|e| format!("could not set the volume on {}: {e}", self.element))?;
+        match self.scale {
+            ChosenScale::Decibel { min, max } => {
+                let target = percent_to_millibel(percent, min, max);
+                // Rounded down where the card cannot hit the value exactly: erring quiet is the
+                // safe direction when the alternative is a step louder than was asked for.
+                selem
+                    .set_playback_db_all(alsa::mixer::MilliBel(target), alsa::Round::Floor)
+                    .map_err(|e| format!("could not set the volume on {}: {e}", self.element))?;
+            }
+            ChosenScale::Raw => {
+                let (min, max) = selem.get_playback_volume_range();
+                let value = percent_to_raw(percent, min, max);
+                selem
+                    .set_playback_volume_all(value)
+                    .map_err(|e| format!("could not set the volume on {}: {e}", self.element))?;
+            }
+        }
 
         // Not every card has a mute switch. Where there is none, zero volume is the mute, and
         // the caller has already passed the muted level in.
@@ -117,10 +169,23 @@ impl Mixer {
             .find_selem(&selem_id)
             .ok_or_else(|| format!("{} is gone from {}", self.element, self.card))?;
 
-        let (min, max) = selem.get_playback_volume_range();
-        let raw = selem
-            .get_playback_volume(alsa::mixer::SelemChannelId::mono())
-            .map_err(|e| format!("could not read the volume on {}: {e}", self.element))?;
+        // Read back on the same scale it was written on. A client that writes 40 and reads 27
+        // reports a level nobody set, and every controller watching it shows the wrong number.
+        let percent = match self.scale {
+            ChosenScale::Decibel { min, max } => {
+                let millibel = selem
+                    .get_playback_vol_db(alsa::mixer::SelemChannelId::mono())
+                    .map_err(|e| format!("could not read the volume on {}: {e}", self.element))?;
+                millibel_to_percent(millibel.0, min, max)
+            }
+            ChosenScale::Raw => {
+                let (min, max) = selem.get_playback_volume_range();
+                let raw = selem
+                    .get_playback_volume(alsa::mixer::SelemChannelId::mono())
+                    .map_err(|e| format!("could not read the volume on {}: {e}", self.element))?;
+                raw_to_percent(raw, min, max)
+            }
+        };
         let muted = if selem.has_playback_switch() {
             selem
                 .get_playback_switch(alsa::mixer::SelemChannelId::mono())
@@ -129,120 +194,6 @@ impl Mixer {
         } else {
             false
         };
-        Ok((scale_from_range(raw, min, max), muted))
-    }
-}
-
-/// Map 0-100 onto the card's own range.
-///
-/// Kept as a free function so the arithmetic is testable without a sound card, which is the
-/// only part of this that can be tested without one.
-fn scale_to_range(percent: u8, min: i64, max: i64) -> i64 {
-    let percent = i64::from(percent.min(100));
-    if max <= min {
-        return min;
-    }
-    // Rounded, not truncated. A card with only 87 steps — and coarse ranges are common on
-    // hardware mixers — would otherwise send 1% to step 0, which is silence, and then report
-    // 1% back to the server. The level a client states has to be the level the card is at.
-    min + ((max - min) * percent + 50) / 100
-}
-
-/// The inverse of [`scale_to_range`], rounded to the nearest percent.
-fn scale_from_range(value: i64, min: i64, max: i64) -> u8 {
-    if max <= min {
-        return 0;
-    }
-    let clamped = value.clamp(min, max);
-    // Rounded rather than truncated: a card whose range is 0-87 would otherwise report 99%
-    // for the value this code writes for 100%.
-    let percent = ((clamped - min) * 100 + (max - min) / 2) / (max - min);
-    u8::try_from(percent.clamp(0, 100)).unwrap_or(100)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The endpoints have to be exact: 100 must reach the card's maximum, not one below it.
-    #[test]
-    fn the_ends_of_the_range_map_exactly() {
-        assert_eq!(scale_to_range(0, 0, 65536), 0);
-        assert_eq!(scale_to_range(100, 0, 65536), 65536);
-        // A range that does not start at zero, which is what a card with dB scaling reports.
-        assert_eq!(scale_to_range(0, -10239, 400), -10239);
-        assert_eq!(scale_to_range(100, -10239, 400), 400);
-    }
-
-    /// A round trip lands within one of the card's own steps, which is the most that can be
-    /// asked of it.
-    ///
-    /// Exactness is not available and claiming it would be a lie: a card with 87 steps cannot
-    /// represent 101 distinct percentages, so two percentages share a step and the step maps
-    /// back to one of them. What matters is that the error is bounded by the hardware's own
-    /// resolution rather than by a rounding mistake — a client reporting 51 when the knob is
-    /// one step off 50 is honest; reporting 1 when the card is silent is not.
-    #[test]
-    fn a_percentage_survives_the_round_trip_to_within_one_step() {
-        for (min, max) in [(0i64, 65536i64), (0, 87), (-10239, 400), (0, 100), (0, 20)] {
-            let steps = max - min;
-            // One step, in percent, rounded up.
-            let tolerance = (100 + steps - 1) / steps;
-            for percent in 0..=100u8 {
-                let raw = scale_to_range(percent, min, max);
-                let back = scale_from_range(raw, min, max);
-                let drift = (i64::from(back) - i64::from(percent)).abs();
-                assert!(
-                    drift <= tolerance,
-                    "{percent}% on a {min}..{max} card came back as {back}%                      (drift {drift} > one step of {tolerance}%)"
-                );
-            }
-        }
-    }
-
-    /// The ends are exact on every card, whatever its resolution: 0 is the card's minimum and
-    /// 100 its maximum, and both read back as themselves. A player that cannot reach silence
-    /// or full scale is broken in a way no tolerance excuses.
-    #[test]
-    fn the_ends_of_the_range_round_trip_exactly() {
-        for (min, max) in [(0i64, 65536i64), (0, 87), (-10239, 400), (0, 100), (0, 20)] {
-            assert_eq!(scale_to_range(0, min, max), min);
-            assert_eq!(scale_to_range(100, min, max), max);
-            assert_eq!(scale_from_range(min, min, max), 0);
-            assert_eq!(scale_from_range(max, min, max), 100);
-        }
-    }
-
-    /// Turning the volume up must never turn the card down.
-    #[test]
-    fn the_mapping_never_goes_backwards() {
-        for (min, max) in [(0i64, 65536i64), (0, 87), (-10239, 400), (0, 20)] {
-            let mut previous = i64::MIN;
-            for percent in 0..=100u8 {
-                let raw = scale_to_range(percent, min, max);
-                assert!(
-                    raw >= previous,
-                    "{percent}% on a {min}..{max} card went down to {raw}"
-                );
-                previous = raw;
-            }
-        }
-    }
-
-    /// A card with a degenerate range must not divide by zero or report nonsense.
-    #[test]
-    fn a_card_with_no_usable_range_is_handled_rather_than_dividing_by_zero() {
-        assert_eq!(scale_to_range(50, 5, 5), 5);
-        assert_eq!(scale_from_range(5, 5, 5), 0);
-        assert_eq!(scale_to_range(50, 10, 0), 10);
-        assert_eq!(scale_from_range(3, 10, 0), 0);
-    }
-
-    /// Values outside the range are clamped rather than wrapped into something loud.
-    #[test]
-    fn values_beyond_the_range_are_clamped() {
-        assert_eq!(scale_to_range(200, 0, 100), 100, "percent is capped at 100");
-        assert_eq!(scale_from_range(-5000, 0, 100), 0);
-        assert_eq!(scale_from_range(5000, 0, 100), 100);
+        Ok((percent, muted))
     }
 }

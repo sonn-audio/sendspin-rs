@@ -202,7 +202,13 @@ fn open_mixer(
         log::warn!("--hardware-volume is ignored: --hook-set-volume already owns the level");
         return Ok(None);
     }
-    match sendspin::audio::mixer::Mixer::open(card) {
+    // The scale is left to the card's own description here. An application that has measured a
+    // card whose dB information is wrong passes a different one; a flag for that would be asking
+    // an operator to know something the hardware should have said.
+    match sendspin::audio::mixer::Mixer::open(
+        card,
+        sendspin::audio::volume_scale::VolumeScale::Automatic,
+    ) {
         Ok(mixer) => {
             log::info!("Hardware volume: {} on {}", mixer.element(), mixer.card());
             Ok(Some(Arc::new(mixer)))
