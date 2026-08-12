@@ -43,16 +43,21 @@ impl InputStream {
                 .ok_or_else(|| "no default input device".to_string())?,
         };
 
-        let supported = device
+        // The best of what fits, not the first. Taking the first is how a 24-bit ADC ended up
+        // recorded as 16-bit: the device advertises several formats and the order they come in says
+        // nothing about which one to want.
+        let mut usable: Vec<_> = device
             .supported_input_configs()
             .map_err(|e| format!("could not read the device's input configurations: {e}"))?
-            .find(|range| {
+            .filter(|range| {
                 u32::from(range.channels()) == u32::from(channels)
                     && (range.min_sample_rate()..=range.max_sample_rate()).contains(&sample_rate)
             })
-            .ok_or_else(|| {
-                format!("the capture device cannot record {channels}ch at {sample_rate}Hz")
-            })?;
+            .collect();
+        usable.sort_by_key(|range| capture_format_rank(range.sample_format(), bit_depth));
+        let supported = usable.into_iter().next().ok_or_else(|| {
+            format!("the capture device cannot record {channels}ch at {sample_rate}Hz")
+        })?;
         let sample_format = supported.sample_format();
         let config = cpal::StreamConfig {
             channels: u16::from(channels),
@@ -81,6 +86,15 @@ impl InputStream {
                 config,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let _ = sender.send(from_i16(data, bit_depth));
+                },
+                on_error,
+                None,
+            ),
+            // What a 24-bit ADC delivers: the sample sits in the top bits of a 32-bit frame.
+            cpal::SampleFormat::I32 => device.build_input_stream(
+                config,
+                move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                    let _ = sender.send(from_i32(data, bit_depth));
                 },
                 on_error,
                 None,
@@ -154,6 +168,41 @@ fn from_f32(data: &[f32], bit_depth: u8) -> Vec<u8> {
 }
 
 /// Convert cpal's 16-bit samples, widening when the wire carries more than the card gives.
+/// Which of the formats a device offers to record in.
+///
+/// The one that matches what is being sent wins; after that, deeper beats shallower. Recording 16
+/// bits off a converter that offers 24 throws away the headroom a line input is set up with -- the
+/// level is kept low so peaks cannot clip, and what is left then has fewer bits than it looks.
+fn capture_format_rank(candidate: cpal::SampleFormat, bit_depth: u8) -> u8 {
+    let exact = match bit_depth {
+        16 => candidate == cpal::SampleFormat::I16,
+        24 => candidate == cpal::SampleFormat::I24,
+        32 => candidate == cpal::SampleFormat::I32,
+        _ => false,
+    };
+    if exact {
+        return 0;
+    }
+    match candidate {
+        cpal::SampleFormat::F32 | cpal::SampleFormat::F64 => 1,
+        cpal::SampleFormat::I24 | cpal::SampleFormat::I32 | cpal::SampleFormat::I64 => 2,
+        cpal::SampleFormat::I16 => 3,
+        _ => 4,
+    }
+}
+
+/// A 32-bit frame from a 24-bit converter: the sample is in the top 24 bits.
+fn from_i32(data: &[i32], bit_depth: u8) -> Vec<u8> {
+    let mut pcm = Vec::with_capacity(data.len() * usize::from(bit_depth) / 8);
+    for sample in data {
+        match bit_depth {
+            16 => pcm.extend_from_slice(&((sample >> 16) as i16).to_le_bytes()),
+            _ => pcm.extend_from_slice(&(sample >> 8).to_le_bytes()[..3]),
+        }
+    }
+    pcm
+}
+
 fn from_i16(data: &[i16], bit_depth: u8) -> Vec<u8> {
     let mut pcm = Vec::with_capacity(data.len() * usize::from(bit_depth) / 8);
     for sample in data {
@@ -163,6 +212,42 @@ fn from_i16(data: &[i16], bit_depth: u8) -> Vec<u8> {
         }
     }
     pcm
+}
+
+#[cfg(test)]
+mod format_choice_tests {
+    use super::*;
+    use cpal::SampleFormat;
+
+    #[test]
+    fn the_format_that_matches_what_is_sent_wins() {
+        assert_eq!(capture_format_rank(SampleFormat::I24, 24), 0);
+        assert_eq!(capture_format_rank(SampleFormat::I16, 16), 0);
+        assert_eq!(capture_format_rank(SampleFormat::I32, 32), 0);
+    }
+
+    #[test]
+    fn deeper_beats_shallower_when_nothing_matches() {
+        // A 24-bit converter offering both must not be recorded as 16-bit, which is what taking the
+        // first format on offer used to do.
+        let deep = capture_format_rank(SampleFormat::I32, 24);
+        let shallow = capture_format_rank(SampleFormat::I16, 24);
+        assert!(deep < shallow, "{deep} should sort before {shallow}");
+        assert!(capture_format_rank(SampleFormat::F32, 24) < shallow);
+    }
+
+    #[test]
+    fn a_32_bit_frame_keeps_the_top_bits() {
+        // Full scale positive, as a converter delivers it in the top 24 bits of a 32-bit frame.
+        let frames = [0x7FFF_FF00u32 as i32, i32::MIN];
+        let packed = from_i32(&frames, 24);
+        assert_eq!(packed.len(), 6);
+        assert_eq!(&packed[..3], &[0xFF, 0xFF, 0x7F]);
+        // ...and the same input asked for as 16-bit takes the top two bytes.
+        let narrow = from_i32(&frames, 16);
+        assert_eq!(narrow.len(), 4);
+        assert_eq!(&narrow[..2], &[0xFF, 0x7F]);
+    }
 }
 
 #[cfg(test)]
