@@ -11,6 +11,12 @@ for synchronized multi-room audio streaming.
 A client library. You bring the application; this crate speaks the protocol, keeps your
 clock locked to the server's, and drives the audio device.
 
+Being a player or a source is a library entry point rather than something to reassemble from
+the parts: [`Player`](#being-a-player) captures the whole session from the first hello to the
+last chunk, and [`Source`](#sources-sourcev1) does the same in reverse. The command-line
+program is a thin layer over exactly that, so an application embedding the crate gets the
+player the daemon has rather than a second copy of it.
+
 - **Lock-free audio path** — decode and playback communicate over lock-free queues, so a
   slow network task cannot stall the audio callback. The callback never allocates, never
   blocks, and never takes a contended lock: clock reads use `try_lock` and skip rather than
@@ -141,8 +147,11 @@ dnf install alsa-lib-devel
 
 ## The `sendspin` command
 
-A headless player, behind the `cli` feature so a device embedding this crate as a library
-never links an argument parser or a logger to get one:
+Behind the `cli` feature, so a device embedding this crate as a library never links an
+argument parser or a logger to get a player. Five subcommands: `daemon` plays, `serve`
+serves, and `audio-devices`, `servers` and `clients` list what a machine and a network have.
+
+The daemon is the main one:
 
 ```bash
 cargo run --features cli --bin sendspin -- daemon --name "Kitchen"
@@ -199,9 +208,50 @@ respectively put theirs, and reads the card's current level at startup so the fi
 `client/state` reports what is actually set. A card with no gain stage falls back to software
 volume with a warning rather than refusing to start.
 
+How a percentage becomes a level depends on the card, and the card is asked rather than
+guessed at. One that reports a dB range gets a logarithmic mapping over it, because that is
+what makes 50% sound like half; one that reports no dB information at all gets its raw range,
+because nothing here can discover what its steps are worth. Mapping a percentage straight onto
+the register of a card calibrated in dB puts 30% around 60 dB down, which is inaudible where
+the listener asked for "a bit quiet". The choice is logged once with the numbers behind it, and
+an application embedding the crate can overrule it for a card whose dB information is wrong.
+
+A card whose level is turned by something else — a knob, another program — is noticed within a
+second and reported, rather than being overwritten the next time this client writes a level.
+
 Exactly one thing owns the level at a time: the `--hook-set-volume` script, the card's mixer,
 or this process's gain, in that order of precedence. Applying it in two places would attenuate
 twice.
+
+### `sendspin serve`
+
+The other half of the workspace, behind the `serve` feature so a player build does not compile
+a server to be a player:
+
+```bash
+cargo run --features serve --bin sendspin -- serve --demo --name "Study"
+```
+
+It binds a port, persists an identity so its `server_id` survives a restart, advertises
+`_sendspin-server._tcp.local.`, and plays either a 440 Hz test tone (`--demo`) or a file
+(`--source track.flac`). WAV and FLAC only, and it says so when handed anything else: a
+general-purpose decoder means ffmpeg, and every player build would carry it for a server
+feature it can live without.
+
+`--client`, which dials a listening client, and `--workers` are not covered — the first needs
+the server crate to open a connection rather than only accept one, the second is a process
+model this does not share.
+
+### Finding things
+
+```bash
+sendspin servers list     # Sendspin servers on the network
+sendspin clients list     # clients waiting to be connected to
+```
+
+Both browse mDNS for a window (`--seconds`, three by default) rather than returning on the
+first answer, because a browse cannot know it has heard everything. The URL is printed on its
+own line, since that line is exactly what `--url` takes.
 
 ### As a dedicated player
 
@@ -227,7 +277,50 @@ sendspin = "0.3"
 tokio = { version = "1", features = ["full"] }
 ```
 
-Connect and complete the handshake:
+### Being a player
+
+Describe the client, run it, and watch what it does. Everything between the first hello and
+the last chunk — negotiating a format, opening the right output for it, following the server's
+timeline, honouring volume wherever the level actually lives — is the session's job, not
+yours:
+
+```rust
+use sendspin::player::{Player, PlayerConfig};
+
+let mut config = PlayerConfig::new(client_id, "Kitchen".to_string());
+config.device = Some(sendspin::audio::devices::find_device("0")?);
+config.rates = sendspin::audio::devices::output_rates(config.device.as_ref());
+
+let player = Player::new(config);
+let mut status = player.status();
+tokio::spawn(async move {
+    while status.changed().await.is_ok() {
+        println!("{:?}", status.borrow().connection);
+    }
+});
+player.run_outbound("ws://server:8927/sendspin", None).await?;
+```
+
+`status()` is a `watch` of connection state, negotiated format, volume, mute and the last
+error — a slow observer can never hold up the session that produced it. `set_volume` and
+`set_static_delay` move what the application owns, and both are reported to the server, because
+a client that quietly moves its own level or its own timing leaves the server showing something
+that is not the sound.
+
+`PlayerConfig` also carries what only an application can know: a starting volume to restore,
+which codecs to offer and in what order, and the buffer and lead time a particular installation
+needs. Nothing there is a flag on the command line; the library taking them is the point.
+
+Waiting to be dialled instead of dialling is `run_inbound`, behind the `discovery` feature.
+
+### Being a source
+
+The same shape in reverse — see [Sources](#sources-sourcev1).
+
+### Underneath
+
+Both of the above are built on the protocol layer, which is there when an application wants
+something neither role covers:
 
 ```rust
 use sendspin::ProtocolClientBuilder;
@@ -250,20 +343,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 A client that wants audio declares `player@v1_support` and an initial `PlayerState` on the
-builder; `examples/player.rs` is the end-to-end version, including handing decoded buffers
-to `SyncedPlayer`.
+builder; `examples/player.rs` is the end-to-end version at this level, including handing
+decoded buffers to `SyncedPlayer` yourself.
+
+## Features
+
+| Feature | Default | What it adds |
+| --- | --- | --- |
+| `player` | yes | Being a player: the session that ties the protocol to an output device |
+| `source` | yes | Being a source: the session that captures an input and streams it up |
+| `discovery` | no | mDNS — advertising a listening client, and browsing for either side |
+| `cli` | no | The `sendspin` command: daemon, device and discovery listings |
+| `serve` | no | `sendspin serve`, and with it the server crate |
+| `hardware-volume` | no | Driving the card's own mixer instead of attenuating in software (Linux/ALSA) |
+| `native-tls` | no | `wss://` transport |
+
+An appliance that only plays builds with `default-features = false, features = ["player"]`.
+Worth saying plainly: `player` and `source` gate code, not dependencies — cpal and the codecs
+are compiled either way — so dropping one buys compile time and a smaller API, not a smaller
+binary. `cli`, `serve` and `hardware-volume` do keep real dependencies out.
 
 ## Examples
 
 ```bash
+cargo run --example embedded_player       # be a player, using the library alone
+cargo run --example embedded_source       # capture a real input and stream it up
 cargo run --example basic_client          # connect and handshake
-cargo run --example player                # full synchronized player
+cargo run --example player                # a player built from the protocol layer
 cargo run --example controller_only       # send transport commands, no audio
-cargo run --example source                # capture a local input and stream it up
+cargo run --example source                # a source built from the protocol layer, on a test tone
 cargo run --example server_initiated_metadata  # accept inbound connections, print metadata
 cargo run --example minimal_test          # smallest possible client
 cargo run --example secure_socket --features native-tls   # wss:// transport
+cargo run --example noise_interop         # drive the encrypted handshake and report on it
 ```
+
+The first two are the ones to read when embedding this crate; the rest work a layer down, at
+the protocol itself. `embedded_source` also carries a signal-detection policy — a threshold
+with hysteresis — which lives there rather than in the library on purpose: see
+[Sources](#sources-sourcev1).
 
 All of them take `--server`; pass `--help` for the rest. `RUST_LOG=debug` turns on protocol
 tracing, and `RUST_LOG=trace` adds the per-callback sync detail.
@@ -273,45 +391,63 @@ tracing, and `RUST_LOG=trace` adds the per-callback sync detail.
 A source is a player in reverse: it captures a local input — line-in, a turntable preamp, an
 HDMI capture card — and streams it to the server, which resamples, mixes and distributes it.
 
-The role is deliberately small. A source advertises at most that it can sense signal; there
-is no format negotiation, because the server transcodes centrally and takes whatever a source
-announces:
+The role is deliberately small. A source advertises at most that it can sense signal; there is
+no format negotiation, because the server transcodes centrally and takes whatever a source
+announces. `Source` mirrors `Player`, so an application that has embedded one recognises the
+other:
 
 ```rust
-let client = ProtocolClientBuilder::builder()
-    .client_id("kitchen-linein".to_string())
-    .name("Kitchen Line-In".to_string())
-    .source_v1_support(SourceV1Support {
-        features: Some(SourceFeatures { line_sense: Some(true) }),
-    })
-    .initial_source_state(SourceState { signal: Some(SourceSignal::Absent) })
-    .build()
-    .connect(url)
-    .await?;
+use sendspin::source::{Source, SourceConfig};
+
+let mut config = SourceConfig::new(client_id, "Kitchen Line-In".to_string());
+config.device = Some(sendspin::audio::devices::find_input_device("0")?);
+config.sample_rate = 48_000;
+
+let source = Source::new(config);
+source.run_outbound("ws://server:8927/sendspin", None).await?;
 ```
 
-The server drives capture with `server/command` (`start` / `stop`, both idempotent). Each
-stream is announced with `client_stream/start` before its first frame, so a format change is
-a stream boundary rather than something the server has to infer:
+The server drives capture with `server/command` (`start` / `stop`, both idempotent), and the
+session does the rest: opening the input only while a server wants audio — an input held open
+is one nothing else on the machine can use — announcing the format in `client_stream/start`
+before the first frame, stamping each block in the *server's* clock, and flushing what the
+encoder was still holding when the stream ends.
+
+**Signal presence is the application's.** `line_sense` says whether anything is actually
+playing into the input, and only that end can know. This crate does not decide it, and neither
+does the reference implementation's source client — it reports what its application tells it.
+A threshold chosen here would be an invention wearing the protocol's name. What the library
+does instead is publish the fact: `levels()` carries the peak of each captured block, on its
+own channel so an application watching for a format change is not woken fifty times a second
+by a number it is not reading.
 
 ```rust
-sender.send_message(Message::ClientStreamStart(ClientStreamStart { source: format })).await?;
-
-// Capture timestamps go out in the *server's* clock.
-let server_us = clock_sync.lock().client_to_server_micros(capture_us).unwrap();
-sender.send_source_audio(server_us, &pcm_frame).await?;
+let mut levels = source.levels();
+let signals = source.signal_reporter();   // usable from another task
 ```
 
-See `examples/source.rs` for a complete client.
+`examples/embedded_source.rs` shows one policy over that: two thresholds rather than one, so a
+passage sitting near the line does not flap; and a wait before declaring silence, because music
+has rests and a source that reports one invites a server to drop it mid-track. Every number in
+it is an installation's business, which is exactly why they are not in the library.
+
+`examples/source.rs` works a layer down, driving the protocol directly on a synthesised tone.
 
 ## Architecture
 
 See [docs/rust-thoughts.md](docs/rust-thoughts.md) for design notes.
 
-The short version: `ProtocolClient` owns the WebSocket and, on `split()`, hands back a
-`Connection` of independent parts — a message stream, a decoded-audio channel, a shared
-`ClockSync`, a `WsSender`, and a `ConnectionGuard` that says goodbye on drop. `SyncedPlayer`
-owns the output device and the correction loop, and is fed decoded `AudioBuffer`s.
+The short version, from the bottom up. `ProtocolClient` owns the WebSocket and, on `split()`,
+hands back a `Connection` of independent parts — a message stream, a decoded-audio channel, a
+shared `ClockSync`, a `WsSender`, and a `ConnectionGuard` that says goodbye on drop.
+`SyncedPlayer` owns the output device and the correction loop, and is fed decoded
+`AudioBuffer`s; `SourceCapture` does the arithmetic for the other direction.
+
+`player` and `source` are the layer above, and are what most applications want: the session
+that ties those pieces together, from the first hello to the last chunk. `src/bin/sendspin`
+is a thin command-line layer over the same modules — it resolves flags and reports what could
+not be honoured, and implements no protocol of its own. If something a player needs is only
+reachable from the binary, that is a bug in the split.
 
 ## Development
 
