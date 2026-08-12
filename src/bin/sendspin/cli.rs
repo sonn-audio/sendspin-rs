@@ -38,6 +38,10 @@ pub enum Command {
         command: AudioDevicesCommand,
     },
 
+    /// Run a Sendspin server.
+    #[cfg(feature = "serve")]
+    Serve(Box<ServeArgs>),
+
     /// Server discovery utilities.
     Servers {
         #[command(subcommand)]
@@ -238,13 +242,20 @@ impl DaemonArgs {
 
 impl DaemonArgs {
     /// Where the identity and the pairing records live.
-    ///
-    /// Follows the XDG base directory spec, because an operator who has set `XDG_CONFIG_HOME`
-    /// meant it, and falls back to `~/.config` rather than the working directory — secrets
-    /// should not land wherever the service happened to be started from.
     pub fn settings_dir(&self) -> Result<std::path::PathBuf, String> {
-        if let Some(dir) = &self.settings_dir {
-            return Ok(dir.clone());
+        settings_dir(self.settings_dir.as_deref())
+    }
+}
+
+/// Where a client's or server's persistent state lives.
+///
+/// Follows the XDG base directory spec, because an operator who has set `XDG_CONFIG_HOME`
+/// meant it, and falls back to `~/.config` rather than the working directory — secrets should
+/// not land wherever the service happened to be started from.
+pub fn settings_dir(explicit: Option<&std::path::Path>) -> Result<std::path::PathBuf, String> {
+    {
+        if let Some(dir) = explicit {
+            return Ok(dir.to_path_buf());
         }
         // systemd sets this from `StateDirectory=` and creates it with the right owner. It
         // comes first because a system service usually has no HOME at all, and a daemon that
@@ -269,6 +280,60 @@ impl DaemonArgs {
         Ok(std::path::PathBuf::from(home)
             .join(".config")
             .join("sendspin"))
+    }
+}
+
+/// Arguments for `sendspin serve`.
+#[cfg(feature = "serve")]
+#[derive(Parser, Debug)]
+pub struct ServeArgs {
+    /// Port to listen on.
+    #[arg(long, default_value_t = 8927)]
+    pub port: u16,
+
+    /// Friendly name sent in `server/hello` and advertised over mDNS.
+    #[arg(long, default_value = "Sendspin Server")]
+    pub name: String,
+
+    /// Audio to play: a WAV or FLAC file, looped.
+    ///
+    /// Only those two formats. Anything else needs a general-purpose decoder, and linking one
+    /// in would cost every player build a dependency it has no use for; convert the file
+    /// first. The track's name is served to clients that activate `metadata@v1`.
+    #[arg(long)]
+    pub source: Option<String>,
+
+    /// Play a 440 Hz test tone instead of a file.
+    ///
+    /// For proving a client's clock sync and playback path without needing any audio to hand.
+    #[arg(long)]
+    pub demo: bool,
+
+    /// Do not advertise over mDNS.
+    ///
+    /// For a server that is reached at a configured address, on a network where an extra
+    /// multicast responder is unwelcome.
+    #[arg(long)]
+    pub no_discovery: bool,
+
+    /// Directory holding the server's identity key.
+    ///
+    /// The `server_id` is the public half of that key, so it has to outlive a restart: a
+    /// server that generates a new one is a new server to every client that paired with it.
+    #[arg(long)]
+    pub settings_dir: Option<std::path::PathBuf>,
+
+    /// Logging level.
+    #[arg(long, default_value = "info",
+          value_parser = ["trace", "debug", "info", "warn", "error"])]
+    pub log_level: String,
+}
+
+#[cfg(feature = "serve")]
+impl ServeArgs {
+    /// Where the identity lives.
+    pub fn settings_dir(&self) -> Result<std::path::PathBuf, String> {
+        settings_dir(self.settings_dir.as_deref())
     }
 }
 

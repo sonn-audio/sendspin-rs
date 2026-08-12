@@ -14,6 +14,8 @@ mod discovery;
 mod hooks;
 #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
 mod mixer;
+#[cfg(feature = "serve")]
+mod serve;
 
 use clap::Parser;
 
@@ -25,6 +27,8 @@ async fn main() -> std::process::ExitCode {
     // filtering, which is the thing a level alone cannot express.
     let level = match &args.command {
         cli::Command::Daemon(daemon) => daemon.log_level.clone(),
+        #[cfg(feature = "serve")]
+        cli::Command::Serve(serve) => serve.log_level.clone(),
         // A one-shot listing should print its list, not a log; anything it has to say it says
         // on stdout.
         cli::Command::AudioDevices { .. }
@@ -35,6 +39,8 @@ async fn main() -> std::process::ExitCode {
 
     let result = match args.command {
         cli::Command::Daemon(daemon_args) => daemon::run(*daemon_args).await,
+        #[cfg(feature = "serve")]
+        cli::Command::Serve(serve_args) => serve::run(*serve_args).await,
         cli::Command::AudioDevices { command } => match command {
             cli::AudioDevicesCommand::List => audio::list_devices().map_err(Into::into),
         },

@@ -120,6 +120,59 @@ impl Drop for ClientAdvertisement {
     }
 }
 
+/// An mDNS advertisement for a server.
+///
+/// The mirror of [`ClientAdvertisement`], and separate from it because the two are opposite
+/// halves of the same protocol: a server advertises so clients can find it, a listening client
+/// advertises so servers can. Registered on construction and withdrawn on drop, for the same
+/// reason — a stale record sends someone to an address that no longer answers.
+pub struct ServerAdvertisement {
+    daemon: ServiceDaemon,
+    fullname: String,
+}
+
+impl ServerAdvertisement {
+    /// Advertise a server on `port`, at the recommended path.
+    ///
+    /// `instance` must be unique on the network; a server's `server_id` is unique by
+    /// construction and is the natural choice.
+    pub fn new(instance: &str, name: &str, port: u16) -> Result<Self, Error> {
+        let daemon = ServiceDaemon::new()
+            .map_err(|e| Error::Connection(format!("could not start the mDNS daemon: {e}")))?;
+        let service = ServiceInfo::new(
+            SERVER_SERVICE_TYPE,
+            instance,
+            &format!("{instance}.local."),
+            "",
+            port,
+            &[("path", RECOMMENDED_PATH), ("name", name)][..],
+        )
+        .map_err(|e| Error::Connection(format!("invalid mDNS service description: {e}")))?
+        .enable_addr_auto();
+
+        let fullname = service.get_fullname().to_string();
+        daemon
+            .register(service)
+            .map_err(|e| Error::Connection(format!("could not advertise over mDNS: {e}")))?;
+        log::info!("Advertising {fullname} on port {port}");
+
+        Ok(Self { daemon, fullname })
+    }
+
+    /// The full mDNS name this advertisement registered under.
+    pub fn fullname(&self) -> &str {
+        &self.fullname
+    }
+}
+
+impl Drop for ServerAdvertisement {
+    fn drop(&mut self) {
+        if let Err(e) = self.daemon.unregister(&self.fullname) {
+            log::debug!("mDNS withdrawal on drop: {e}");
+        }
+    }
+}
+
 /// A Sendspin server or client found on the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {

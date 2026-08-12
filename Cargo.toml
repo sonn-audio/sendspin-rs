@@ -23,6 +23,10 @@ discovery = ["dep:mdns-sd"]
 # The `sendspin` command-line player. Off by default, and for the same reason `discovery` is:
 # a device embedding this crate should not link an argument parser or a logger to get a player.
 cli = ["dep:clap", "dep:env_logger", "dep:shlex", "discovery"]
+# `sendspin serve`: the command-line server. Separate from `cli` rather than part of it, so a
+# player appliance does not link a server to get a player — which is the same reason the server
+# is its own crate.
+serve = ["cli", "dep:sendspin-server"]
 # Drive the system mixer instead of attenuating in software. Linux/ALSA only, and separate
 # from `cli` so a daemon on a card with no mixer does not carry the binding.
 hardware-volume = ["dep:alsa"]
@@ -30,6 +34,8 @@ hardware-volume = ["dep:alsa"]
 [dependencies]
 # The shared protocol core: messages, the encrypted transport, and the clock.
 sendspin-proto = { path = "sendspin-proto", version = "0.3.6" }
+# Only the `serve` subcommand needs the server, so a player build does not compile it.
+sendspin-server = { path = "sendspin-server", version = "0.3.6", optional = true }
 
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
