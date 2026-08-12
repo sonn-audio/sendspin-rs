@@ -206,6 +206,7 @@ pub struct Player {
     config: PlayerConfig,
     status: watch::Sender<PlayerStatus>,
     static_delay: watch::Sender<u16>,
+    volume: watch::Sender<(u8, bool)>,
 }
 
 impl Player {
@@ -217,10 +218,12 @@ impl Player {
             ..PlayerStatus::default()
         });
         let static_delay = watch::Sender::new(config.static_delay);
+        let volume = watch::Sender::new((config.initial_volume, config.initial_muted));
         Self {
             config,
             status,
             static_delay,
+            volume,
         }
     }
 
@@ -234,6 +237,17 @@ impl Player {
         // `send` fails only when nothing is listening, which is a player that is not running:
         // the value is kept regardless, so the next session starts with it.
         let _ = self.static_delay.send(milliseconds);
+    }
+
+    /// Set the level from the application's own control.
+    ///
+    /// For a device with a volume of its own -- a remote, a knob, a panel -- which is not the same
+    /// thing as a server command: the server does not know this happened, so unlike a command it is
+    /// reported back over `client/state`. Where a script or a mixer owns the level, it goes there,
+    /// exactly as a server command would.
+    pub fn set_volume(&self, volume: u8, muted: bool) {
+        // Kept even with nothing listening, so a player that is not running starts here.
+        let _ = self.volume.send((volume.min(100), muted));
     }
 
     /// Watch what this player is doing.
@@ -265,13 +279,28 @@ impl Player {
         reconnect: Option<Duration>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(base) = reconnect else {
-            return run_outbound(&self.config, &self.status, &self.static_delay, url).await;
+            return run_outbound(
+                &self.config,
+                &self.status,
+                &self.static_delay,
+                &self.volume,
+                url,
+            )
+            .await;
         };
 
         let ceiling = Duration::from_secs(60);
         let mut wait = base;
         loop {
-            match run_outbound(&self.config, &self.status, &self.static_delay, url).await {
+            match run_outbound(
+                &self.config,
+                &self.status,
+                &self.static_delay,
+                &self.volume,
+                url,
+            )
+            .await
+            {
                 // A connection that came up and then ended is ordinary; start over at the short
                 // delay rather than carrying a backoff earned by an earlier outage.
                 Ok(()) => wait = base,
@@ -294,7 +323,14 @@ impl Player {
     /// holding two connections that each believe they arbitrated correctly.
     #[cfg(feature = "discovery")]
     pub async fn run_inbound(&self, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-        run_inbound(&self.config, &self.status, &self.static_delay, bind).await
+        run_inbound(
+            &self.config,
+            &self.status,
+            &self.static_delay,
+            &self.volume,
+            bind,
+        )
+        .await
     }
 }
 
@@ -374,6 +410,7 @@ async fn run_outbound(
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
     static_delay: &watch::Sender<u16>,
+    volume: &watch::Sender<(u8, bool)>,
     url: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Connecting to {url}");
@@ -406,6 +443,7 @@ async fn run_outbound(
         config,
         status,
         static_delay.subscribe(),
+        volume.subscribe(),
         context,
     )
     .await;
@@ -422,6 +460,7 @@ async fn run_inbound(
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
     static_delay: &watch::Sender<u16>,
+    volume: &watch::Sender<(u8, bool)>,
     bind: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = template(config).listen(bind).await?;
@@ -465,6 +504,7 @@ async fn run_inbound(
             config,
             status,
             static_delay.subscribe(),
+            volume.subscribe(),
             context,
         )
         .await;
@@ -499,6 +539,7 @@ async fn play(
     config: &PlayerConfig,
     status: &watch::Sender<PlayerStatus>,
     mut static_delay: watch::Receiver<u16>,
+    mut local_volume: watch::Receiver<(u8, bool)>,
     context: HookContext,
 ) -> bool {
     let SessionChannels {
@@ -790,6 +831,32 @@ async fn play(
                 };
                 if let Err(e) = sender.send_message(Message::ClientState(state)).await {
                     log::warn!("Could not report the new static delay: {e}");
+                }
+            }
+            // The application's own control moved -- a remote, a knob, a panel. Unlike a server
+            // command this is news to the server, so it is reported: a client that changes its own
+            // level and lets the server keep the old number shows a slider that is not the sound.
+            Ok(()) = local_volume.changed() => {
+                let (level, mute) = *local_volume.borrow_and_update();
+                if (level, mute) != (volume, muted) {
+                    volume = level;
+                    muted = mute;
+                    apply_volume(config, player.as_ref(), volume, muted).await;
+                    status.send_modify(|status| {
+                        status.volume = volume;
+                        status.muted = muted;
+                    });
+                    let state = ClientState {
+                        player: Some(PlayerState {
+                            volume: Some(volume),
+                            muted: Some(muted),
+                            ..PlayerState::default()
+                        }),
+                        ..ClientState::default()
+                    };
+                    if let Err(e) = sender.send_message(Message::ClientState(state)).await {
+                        log::warn!("Could not report the new level: {e}");
+                    }
                 }
             }
             else => break,
