@@ -93,6 +93,51 @@ fn find_device(device_query: &str) -> Result<Option<cpal::Device>, Box<dyn std::
     Ok(None)
 }
 
+/// Sample rates worth asking a server for, lowest first.
+const CANDIDATE_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
+/// The rates the output device can open natively.
+///
+/// A player that advertises one fixed rate makes the server resample to it, so
+/// a 44.1kHz source arrives altered even when the card would have played it
+/// untouched. Advertising what the hardware actually does is what lets a
+/// bit-perfect server stay bit-perfect. Falls back to 48kHz when the device
+/// cannot be queried, which is what this example assumed before.
+fn device_rates(device: Option<&cpal::Device>) -> Vec<u32> {
+    let default_device;
+    let device = match device {
+        Some(device) => device,
+        None => {
+            default_device = cpal::default_host().default_output_device();
+            match default_device.as_ref() {
+                Some(device) => device,
+                None => return vec![48_000],
+            }
+        }
+    };
+
+    let Ok(configs) = device.supported_output_configs() else {
+        return vec![48_000];
+    };
+    // Stereo only: that is what the format specs below advertise.
+    let ranges: Vec<_> = configs.filter(|range| range.channels() >= 2).collect();
+
+    let rates: Vec<u32> = CANDIDATE_RATES
+        .into_iter()
+        .filter(|rate| {
+            ranges
+                .iter()
+                .any(|range| (range.min_sample_rate()..=range.max_sample_rate()).contains(rate))
+        })
+        .collect();
+
+    if rates.is_empty() {
+        vec![48_000]
+    } else {
+        rates
+    }
+}
+
 /// Environment variable helpers
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
@@ -143,6 +188,11 @@ struct Args {
     /// Audio output device ID (optional, uses default if not specified)
     #[arg(long = "audio-device")]
     audio_device: Option<String>,
+
+    /// Sample rates to advertise, comma-separated. Defaults to every rate the
+    /// output device supports, so a bit-perfect server need not resample.
+    #[arg(long = "sample-rates", value_delimiter = ',')]
+    sample_rates: Option<Vec<u32>>,
 }
 
 #[tokio::main]
@@ -195,13 +245,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("pcm", 16),
         ],
     };
+    let rates = match args.sample_rates.clone() {
+        Some(rates) if !rates.is_empty() => rates,
+        _ => device_rates(device.as_ref()),
+    };
+    println!(
+        "Advertising sample rates: {}",
+        rates
+            .iter()
+            .map(|rate| rate.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
     let supported_formats = formats
         .iter()
-        .map(|&(codec, bit_depth)| AudioFormatSpec {
-            codec: codec.to_string(),
-            channels: 2,
-            sample_rate: 48000,
-            bit_depth,
+        .flat_map(|&(codec, bit_depth)| {
+            // Opus decodes at 48kHz here, so it advertises the one rate it can
+            // honour rather than a rate the decoder would reject on arrival.
+            let codec_rates: Vec<u32> = if codec == "opus" {
+                rates
+                    .iter()
+                    .copied()
+                    .filter(|rate| *rate == 48_000)
+                    .collect()
+            } else {
+                rates.clone()
+            };
+            codec_rates
+                .into_iter()
+                .map(move |sample_rate| AudioFormatSpec {
+                    codec: codec.to_string(),
+                    channels: 2,
+                    sample_rate,
+                    bit_depth,
+                })
         })
         .collect();
 
