@@ -111,6 +111,28 @@ impl Decoder for OpusDecoder {
 mod tests {
     use super::*;
 
+    /// A packet whose frames are longer than 20 ms, which a server is free to send and which
+    /// this decoder therefore has to survive.
+    ///
+    /// The TOC alone decides how much room the decoder needs, so the payload can be anything:
+    /// what is being tested is that a packet from the network cannot take the process down.
+    /// Until the decoder dependency was raised to 0.1.26 this panicked inside it — a 60 ms
+    /// stereo frame at a 12 kHz internal rate needs 1440 samples of working space and it had a
+    /// fixed 640 — and a client that panics on a stream it advertised is a client that has to
+    /// be restarted by hand.
+    #[test]
+    fn a_long_stereo_frame_does_not_take_the_process_down() {
+        // Config 7 is SILK mediumband at 60 ms; the stereo bit is set; code 0 is one frame.
+        let toc = (7u8 << 3) | (1 << 2);
+        let mut packet = vec![toc];
+        packet.extend_from_slice(&[0x42; 60]);
+
+        let decoder = OpusDecoder::new(48_000, 2).unwrap();
+        // Either answer is fine. Decoding nonsense payload bytes may well fail, and a refusal
+        // is what should happen; what must not happen is a panic.
+        let _ = decoder.decode(&packet);
+    }
+
     #[test]
     fn decodes_opus_rs_packet() {
         let mut encoder =
