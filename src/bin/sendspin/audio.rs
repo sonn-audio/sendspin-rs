@@ -130,6 +130,57 @@ pub fn find_device(query: &str) -> Result<cpal::Device, String> {
     }
 }
 
+/// The sample rates worth offering a server, lowest first.
+///
+/// Every rate a Sendspin server is likely to hold a file at. Anything outside this set the
+/// server resamples anyway, so naming it would offer a promise the card would have to keep
+/// for no gain.
+const CANDIDATE_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+
+/// The rates `device` — or the platform default — can open for stereo playback.
+///
+/// A client that offers one fixed rate makes the server resample everything to it: a 44.1kHz
+/// album then arrives altered even though the card would have played it untouched. Offering
+/// what the hardware actually does is what leaves a bit-perfect server bit-perfect, and it
+/// costs nothing, because the server still picks.
+///
+/// Falls back to 48kHz when the device cannot be asked. A client that cannot enumerate its own
+/// card should claim the rate everything supports rather than claim nothing and go silent.
+pub fn output_rates(device: Option<&cpal::Device>) -> Vec<u32> {
+    let default_device;
+    let device = match device {
+        Some(device) => device,
+        None => {
+            default_device = cpal::default_host().default_output_device();
+            match default_device.as_ref() {
+                Some(device) => device,
+                None => return vec![48_000],
+            }
+        }
+    };
+
+    let Ok(configs) = device.supported_output_configs() else {
+        return vec![48_000];
+    };
+    // Stereo only: that is what `client/hello` offers.
+    let ranges: Vec<_> = configs.filter(|range| range.channels() >= 2).collect();
+
+    let rates: Vec<u32> = CANDIDATE_RATES
+        .into_iter()
+        .filter(|rate| {
+            ranges
+                .iter()
+                .any(|range| (range.min_sample_rate()..=range.max_sample_rate()).contains(rate))
+        })
+        .collect();
+
+    if rates.is_empty() {
+        vec![48_000]
+    } else {
+        rates
+    }
+}
+
 /// Parse `codec:sample_rate:bit_depth:channels`, e.g. `flac:48000:24:2`.
 ///
 /// All four parts are required. A partial spelling would have to invent the rest, and a
@@ -264,6 +315,22 @@ mod tests {
         // stream — better refused at the flag than at the first chunk.
         assert!(parse_format("opus:44100:16:2").is_err());
         assert!(parse_format("opus:48000:16:2").is_ok());
+    }
+
+    /// Whatever this machine has — a full card, a null host, no device at all — the offer has
+    /// to be a non-empty set of rates a server can actually pick from.
+    #[test]
+    fn the_advertised_rates_are_never_empty_and_never_invented() {
+        let rates = output_rates(None);
+        assert!(!rates.is_empty(), "a client must offer at least one rate");
+        for rate in &rates {
+            assert!(
+                CANDIDATE_RATES.contains(rate),
+                "offered {rate}Hz, which is not one of the candidates"
+            );
+        }
+        // Ascending, so the list reads as a range rather than an arbitrary order.
+        assert!(rates.windows(2).all(|pair| pair[0] < pair[1]), "{rates:?}");
     }
 
     #[test]

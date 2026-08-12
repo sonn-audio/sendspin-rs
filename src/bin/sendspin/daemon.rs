@@ -46,6 +46,11 @@ struct Device {
     /// server picks from what it is offered: an operator who names a format wants that format,
     /// not a preference the server may overrule.
     format: Option<sendspin::protocol::messages::AudioFormatSpec>,
+    /// The sample rates the output device can open, read once at startup.
+    ///
+    /// Read once rather than per connection: the card does not change while the daemon runs,
+    /// and a hello is not the place to discover that it cannot be enumerated.
+    rates: Vec<u32>,
 }
 
 /// Run the daemon until the process is stopped.
@@ -154,6 +159,18 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Client id: {client_id}");
     log::info!("Name: {name}");
 
+    let rates = crate::audio::output_rates(device.as_ref());
+    if format.is_none() {
+        log::info!(
+            "Offering: {}",
+            rates
+                .iter()
+                .map(|rate| format!("{rate}Hz"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     let device = Device {
         name,
         client_id,
@@ -163,6 +180,7 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
         static_delay,
         device,
         format,
+        rates,
         hooks,
         #[cfg(all(feature = "hardware-volume", target_os = "linux"))]
         mixer: _mixer,
@@ -215,7 +233,7 @@ fn template(device: &Device) -> ProtocolClientBuilder {
     ProtocolClientBuilder::builder()
         .client_id(device.client_id.clone())
         .name(device.name.clone())
-        .player_v1_support(player_support(device.format.as_ref()))
+        .player_v1_support(player_support(device.format.as_ref(), &device.rates))
         .product_name(Some(device.product_name.clone()))
         // Passed unconditionally rather than behind an `if`: each setter moves the builder to
         // a new type, so a conditional one would need both branches to agree on it.
@@ -273,39 +291,45 @@ fn open_mixer(args: &DaemonArgs, _volume_is_external: bool) -> Result<Option<()>
 ///
 /// With no `--audio-format` this is the full set the decoders implement, in the order this
 /// client would rather have them: Opus for bandwidth, then PCM. With one, it is that alone.
+///
+/// Each codec is offered at every rate the card can open, not at one rate the client picked.
+/// A server that resamples only when it has to can then leave a 44.1kHz album alone; naming a
+/// single rate would have made every album a resampled one.
 fn player_support(
     pinned: Option<&sendspin::protocol::messages::AudioFormatSpec>,
+    rates: &[u32],
 ) -> sendspin::protocol::messages::PlayerV1Support {
     use sendspin::protocol::messages::{AudioFormatSpec, PlayerV1Support};
 
+    // (codec, bit depth), most wanted first.
+    const CODECS: [(&str, u8); 4] = [("opus", 16), ("flac", 24), ("pcm", 24), ("pcm", 16)];
+
     let supported_formats = match pinned {
         Some(format) => vec![format.clone()],
-        None => vec![
-            AudioFormatSpec {
-                codec: "opus".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 16,
-            },
-            AudioFormatSpec {
-                codec: "flac".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 24,
-            },
-            AudioFormatSpec {
-                codec: "pcm".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 24,
-            },
-            AudioFormatSpec {
-                codec: "pcm".to_string(),
-                channels: 2,
-                sample_rate: 48_000,
-                bit_depth: 16,
-            },
-        ],
+        None => CODECS
+            .into_iter()
+            .flat_map(|(codec, bit_depth)| {
+                // Opus is defined at 48kHz, so offering it at the card's other rates would
+                // invite a stream this client's own decoder refuses.
+                let codec_rates: Vec<u32> = if codec == "opus" {
+                    rates
+                        .iter()
+                        .copied()
+                        .filter(|rate| *rate == 48_000)
+                        .collect()
+                } else {
+                    rates.to_vec()
+                };
+                codec_rates
+                    .into_iter()
+                    .map(move |sample_rate| AudioFormatSpec {
+                        codec: codec.to_string(),
+                        channels: 2,
+                        sample_rate,
+                        bit_depth,
+                    })
+            })
+            .collect(),
     };
     PlayerV1Support {
         supported_formats,
