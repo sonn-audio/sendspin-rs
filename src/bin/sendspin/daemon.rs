@@ -68,15 +68,15 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     let device = args
         .audio_device
         .as_deref()
-        .map(crate::audio::find_device)
+        .map(sendspin::audio::devices::find_device)
         .transpose()?;
     let format = args
         .audio_format
         .as_deref()
-        .map(crate::audio::parse_format)
+        .map(sendspin::audio::devices::parse_format)
         .transpose()?;
     if let (Some(device), Some(format)) = (device.as_ref(), format.as_ref()) {
-        crate::audio::verify_device_supports(device, format)?;
+        sendspin::audio::devices::verify_device_supports(device, format)?;
     }
     let hooks = Hooks::new(
         args.hook_start.clone(),
@@ -159,7 +159,7 @@ pub async fn run(args: DaemonArgs) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Client id: {client_id}");
     log::info!("Name: {name}");
 
-    let rates = crate::audio::output_rates(device.as_ref());
+    let rates = sendspin::audio::devices::output_rates(device.as_ref());
     if format.is_none() {
         log::info!(
             "Offering: {}",

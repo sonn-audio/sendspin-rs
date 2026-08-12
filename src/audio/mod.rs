@@ -3,6 +3,9 @@
 
 /// Audio decoder implementations (PCM, Opus, FLAC)
 pub mod decode;
+
+/// Choosing an output device and checking what it can play.
+pub mod devices;
 /// Audio encoders for the source role.
 pub mod encode;
 /// Lock-free volume/mute control
