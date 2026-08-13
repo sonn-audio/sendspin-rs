@@ -157,6 +157,12 @@ pub struct Source {
     status: watch::Sender<SourceStatus>,
     signal: Arc<watch::Sender<Option<SourceSignal>>>,
     level: watch::Sender<f32>,
+    /// Audio from somewhere other than a capture device, taken by the first session that starts.
+    ///
+    /// One session's worth: a caller that feeds a source this way owns the thing producing the
+    /// audio, and when that ends there is nothing to reconnect to. Behind a lock only so that
+    /// running a source stays `&self`, as every other way of driving one is.
+    frames: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>,
 }
 
 /// A handle for reporting signal presence from wherever the input is being watched.
@@ -175,9 +181,29 @@ impl SignalReporter {
 }
 
 impl Source {
+    /// The externally-fed audio, for the one session that gets it.
+    fn take_frames(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>> {
+        self.frames.lock().expect("the frames lock").take()
+    }
+
+    /// A source whose audio arrives from somewhere other than a capture device.
+    ///
+    /// Same protocol, same announcement, same encoder: only where the samples come from differs.
+    /// Bluetooth is the case this exists for -- a phone's audio, decoded outside this crate,
+    /// already interleaved little-endian at the format the config names.
+    pub fn with_frames(
+        config: SourceConfig,
+        frames: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Self {
+        let source = Self::new(config);
+        *source.frames.lock().expect("a fresh source's frames") = Some(frames);
+        source
+    }
+
     /// Build a source. Nothing is captured and nothing is sent until it is run.
     pub fn new(config: SourceConfig) -> Self {
         Self {
+            frames: std::sync::Mutex::new(None),
             config,
             status: watch::Sender::new(SourceStatus::default()),
             signal: Arc::new(watch::Sender::new(None)),
@@ -222,20 +248,39 @@ impl Source {
 
     /// Dial `url` and stream when asked to.
     ///
-    /// With `reconnect`, dials again whenever the server goes away and never returns.
+    /// With `reconnect`, dials again whenever the server goes away and never returns. A source fed
+    /// from outside gets one attempt at most: its audio is gone once the session that took it ends.
+    ///
     pub async fn run_outbound(
         &self,
         url: &str,
         reconnect: Option<Duration>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(base) = reconnect else {
-            return run_outbound(&self.config, &self.status, &self.signal, &self.level, url).await;
+            return run_outbound(
+                &self.config,
+                &self.status,
+                &self.signal,
+                &self.level,
+                url,
+                self.take_frames(),
+            )
+            .await;
         };
 
         let ceiling = Duration::from_secs(60);
         let mut wait = base;
         loop {
-            match run_outbound(&self.config, &self.status, &self.signal, &self.level, url).await {
+            match run_outbound(
+                &self.config,
+                &self.status,
+                &self.signal,
+                &self.level,
+                url,
+                self.take_frames(),
+            )
+            .await
+            {
                 Ok(()) => wait = base,
                 Err(e) => {
                     log::warn!("Connection to {url} failed: {e}");
@@ -252,8 +297,9 @@ impl Source {
     /// Listen on `bind` for servers that dial in, advertise over mDNS, and serve whichever
     /// connection wins arbitration.
     #[cfg(feature = "discovery")]
-    pub async fn run_inbound(&self, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-        run_inbound(&self.config, &self.status, &self.signal, &self.level, bind).await
+    pub async fn run_inbound(&mut self, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let frames = self.frames.take();
+        run_inbound(&self.config, &self.status, &self.signal, &self.level, bind, frames).await
     }
 }
 
@@ -286,6 +332,7 @@ async fn run_outbound(
     signal: &watch::Sender<Option<SourceSignal>>,
     level: &watch::Sender<f32>,
     url: &str,
+    frames: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Connecting to {url}");
     status.send_modify(|status| status.connection = ConnectionState::Connecting);
@@ -308,6 +355,7 @@ async fn run_outbound(
         signal.subscribe(),
         level,
         (hello.server_id, hello.name),
+        frames,
     )
     .await;
     log::info!("Server closed the connection");
@@ -321,6 +369,7 @@ async fn run_inbound(
     signal: &watch::Sender<Option<SourceSignal>>,
     level: &watch::Sender<f32>,
     bind: &str,
+    frames: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = template(config).listen(bind).await?;
     let port = listener.local_addr()?.port();
@@ -366,6 +415,9 @@ async fn capture(
     mut signal: watch::Receiver<Option<SourceSignal>>,
     level: &watch::Sender<f32>,
     server: (String, String),
+    // Audio from outside this crate, for a source that is not a sound card. Taken by the first
+    // stream that starts; a second start finds it gone, which is what the end of that audio means.
+    mut external: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) {
     status.send_modify(|status| {
         status.connection = ConnectionState::Connected;
@@ -431,7 +483,7 @@ async fn capture(
                     clock.client_to_server_micros(now).is_some()
                 };
                 if ready {
-                    match start(config, &sender, status).await {
+                    match start(config, &sender, status, &mut external).await {
                         Ok((stream, capture)) => {
                             input = Some(stream);
                             encoder = Some(capture);
@@ -511,13 +563,17 @@ async fn start(
     config: &SourceConfig,
     sender: &WsSender,
     status: &watch::Sender<SourceStatus>,
+    external: &mut Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
 ) -> Result<(crate::audio::capture::InputStream, SourceCapture), String> {
-    let stream = crate::audio::capture::InputStream::open(
-        config.device.clone(),
-        config.sample_rate,
-        config.channels,
-        config.bit_depth,
-    )?;
+    let stream = match external.take() {
+        Some(frames) => crate::audio::capture::InputStream::from_frames(frames),
+        None => crate::audio::capture::InputStream::open(
+            config.device.clone(),
+            config.sample_rate,
+            config.channels,
+            config.bit_depth,
+        )?,
+    };
     let capture = SourceCapture::new(
         &config.codec,
         config.sample_rate,
@@ -568,6 +624,17 @@ async fn flush(capture: &mut SourceCapture, sender: &WsSender) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_handed_in_from_outside_goes_to_one_session() {
+        // Whoever runs the source first gets the audio; a reconnect must not wait on a receiver
+        // that is already drained, so the second attempt captures instead.
+        let config = SourceConfig::new("id".to_string(), "name".to_string());
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let source = Source::with_frames(config, rx);
+        assert!(source.take_frames().is_some());
+        assert!(source.take_frames().is_none());
+    }
 
     #[test]
     fn a_source_that_does_not_sense_its_input_does_not_advertise_the_feature() {

@@ -16,12 +16,26 @@ use tokio::sync::mpsc;
 /// The cpal stream is closed when this is dropped, which is what releases the input for
 /// everything else on the machine — so a source holds one only while a server wants audio.
 pub struct InputStream {
-    // Kept for its `Drop`: dropping the stream is what stops the card.
-    _stream: cpal::Stream,
+    // Kept for its `Drop`: dropping the stream is what stops the card. Absent when the audio comes
+    // from somewhere else -- see [`InputStream::from_frames`].
+    _stream: Option<cpal::Stream>,
     frames: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
 impl InputStream {
+    /// PCM from something that is not a sound card.
+    ///
+    /// A source's job is to announce a format and send what arrives in it; where the samples come
+    /// from is not the protocol's business. A Bluetooth phone, decoded elsewhere, is the case this
+    /// exists for -- the audio is already interleaved little-endian at a known rate, and opening a
+    /// capture device for it would be a card that is not there.
+    pub fn from_frames(frames: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+        Self {
+            _stream: None,
+            frames,
+        }
+    }
+
     /// Open `device` — or the platform default input — at this format.
     ///
     /// The card is asked for exactly the rate and channel count requested. A card that cannot
@@ -120,7 +134,7 @@ impl InputStream {
         log::info!("Capture open: {channels}ch {sample_rate}Hz {bit_depth}-bit");
 
         Ok(Self {
-            _stream: stream,
+            _stream: Some(stream),
             frames,
         })
     }
