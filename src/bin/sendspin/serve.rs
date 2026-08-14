@@ -140,6 +140,221 @@ impl Controller for ServeController {
     }
 }
 
+/// PCM arriving over the network, played as it comes.
+///
+/// A stream has no end to read to and no length to allocate, so this holds a window of what has
+/// arrived and no more. Short of a chunk it pads with silence rather than ending: a radio
+/// stream that stalls for a moment is still the same stream, and ending it would tell every
+/// player in the group that the music stopped.
+struct StreamedTrack {
+    format: StreamPlayerConfig,
+    frame_bytes: usize,
+    pcm: Mutex<std::collections::VecDeque<u8>>,
+    title: String,
+}
+
+impl StreamedTrack {
+    /// Seconds of audio to hold. Enough to ride out a hiccup on the way in, short enough that
+    /// what a listener hears is what the source is sending now.
+    const WINDOW_SECONDS: usize = 4;
+
+    fn window_bytes(&self) -> usize {
+        Self::WINDOW_SECONDS * self.format.sample_rate as usize * self.frame_bytes
+    }
+
+    /// Take what has arrived, run a reader into it, and hand back the source.
+    fn spawn(
+        format: StreamPlayerConfig,
+        title: String,
+        mut body: impl std::io::Read + Send + 'static,
+        leading: Vec<u8>,
+    ) -> Arc<Self> {
+        let frame_bytes = usize::from(format.channels) * usize::from(format.bit_depth) / 8;
+        let track = Arc::new(Self {
+            format,
+            frame_bytes: frame_bytes.max(1),
+            pcm: Mutex::new(leading.into()),
+            title,
+        });
+
+        // A thread rather than a task: the read blocks, and the runtime this shares is the one
+        // pacing every connected player.
+        let writer = Arc::clone(&track);
+        std::thread::spawn(move || {
+            let mut buffer = vec![0u8; 16 * 1024];
+            loop {
+                match body.read(&mut buffer) {
+                    Ok(0) => {
+                        log::info!("Source stream ended");
+                        return;
+                    }
+                    Ok(read) => {
+                        let cap = writer.window_bytes();
+                        let mut pcm = writer.pcm.lock();
+                        pcm.extend(&buffer[..read]);
+                        // Dropping the oldest rather than the newest: a listener wants what is
+                        // being broadcast now, not the backlog of what was.
+                        while pcm.len() > cap {
+                            let excess = pcm.len() - cap;
+                            pcm.drain(..excess);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Source stream failed: {e}");
+                        return;
+                    }
+                }
+            }
+        });
+        track
+    }
+}
+
+impl AudioSource for StreamedTrack {
+    fn format(&self) -> StreamPlayerConfig {
+        self.format.clone()
+    }
+
+    fn next_chunk(&self, frames: usize) -> Option<Vec<u8>> {
+        let wanted = frames * self.frame_bytes;
+        let mut pcm = self.pcm.lock();
+        let take = wanted.min(pcm.len());
+        // Whole frames only. Half a frame would put the channels the wrong way round for
+        // everything after it.
+        let take = take - take % self.frame_bytes;
+        let mut chunk: Vec<u8> = pcm.drain(..take).collect();
+        chunk.resize(wanted, 0);
+        Some(chunk)
+    }
+}
+
+impl MetadataSource for StreamedTrack {
+    #[allow(deprecated)]
+    fn current(&self) -> Option<MetadataState> {
+        Some(MetadataState {
+            timestamp: 0,
+            title: Some(self.title.clone()),
+            artist: None,
+            album_artist: None,
+            album: None,
+            artwork_url: None,
+            year: None,
+            track: None,
+            progress: None,
+            repeat: None,
+            shuffle: None,
+        })
+    }
+}
+
+/// What a source turned out to be: a whole track, or a stream still arriving.
+enum Source {
+    /// Read once and looped, which is what a file is.
+    Track(Arc<Track>),
+    /// Played as it arrives, which is what a stream is.
+    Streamed(Arc<StreamedTrack>),
+}
+
+/// Fetch a URL and work out what is coming down it.
+///
+/// WAV is played as it arrives, because a broadcast has no end to read to. FLAC is not: this
+/// crate's decoder is handed whole frames, so a FLAC URL is read to the end first and then
+/// played like a file — which works for a track and not for a broadcast, and says so rather
+/// than filling memory until something gives.
+fn load_url(url: &str) -> Result<Source, String> {
+    /// Enough of the head to hold a WAV header and then some, and to tell the two apart.
+    const SNIFF_BYTES: usize = 64 * 1024;
+    /// The most a source read whole may be. A broadcast would otherwise be read until the
+    /// machine ran out of somewhere to put it.
+    const MAX_BUFFERED: usize = 256 * 1024 * 1024;
+
+    let (mut body, declared_length) = crate::fetch::get(url)?;
+    let title = url
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(url)
+        .to_string();
+
+    let mut head = Vec::new();
+    let mut buffer = vec![0u8; 8 * 1024];
+    while head.len() < SNIFF_BYTES {
+        match std::io::Read::read(&mut body, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => head.extend_from_slice(&buffer[..read]),
+            Err(e) => return Err(format!("could not read from {url}: {e}")),
+        }
+    }
+
+    // A declared length means a file that happens to live behind a URL: it is played from its
+    // beginning and looped, like a local one. A broadcast declares none, and is played from
+    // wherever it is now — keeping only a window of it, because its beginning is gone and its
+    // end never comes.
+    let finite = declared_length.is_some_and(|length| length <= MAX_BUFFERED);
+
+    if head.starts_with(b"RIFF") && !finite {
+        let (format, leading) = wav_stream_header(&head)?;
+        log::info!(
+            "Streaming {} — {}Hz {}ch {}bit",
+            title,
+            format.sample_rate,
+            format.channels,
+            format.bit_depth
+        );
+        return Ok(Source::Streamed(StreamedTrack::spawn(
+            format, title, body, leading,
+        )));
+    }
+
+    if head.starts_with(b"fLaC") || head.starts_with(b"RIFF") {
+        let mut all = head;
+        loop {
+            match std::io::Read::read(&mut body, &mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    all.extend_from_slice(&buffer[..read]);
+                    if all.len() > MAX_BUFFERED {
+                        return Err(format!(
+                            "{url} has sent more than {} MB without ending. Only a finite \
+                             source can be read whole; a FLAC broadcast cannot be played here \
+                             at all, because the decoder is handed whole frames. Send WAV to \
+                             stream.",
+                            MAX_BUFFERED / 1024 / 1024
+                        ));
+                    }
+                }
+                Err(e) => return Err(format!("could not read from {url}: {e}")),
+            }
+        }
+        let (format, pcm) = if all.starts_with(b"fLaC") {
+            decode_flac(&all)?
+        } else {
+            decode_wav(&all)?
+        };
+        // Announced by the caller, which says the same thing for a local file.
+        let frame_bytes = usize::from(format.channels) * usize::from(format.bit_depth) / 8;
+        return Ok(Source::Track(Arc::new(Track {
+            format,
+            pcm,
+            frame_bytes: frame_bytes.max(1),
+            cursor: Mutex::new(0),
+            title,
+        })));
+    }
+
+    Err(format!(
+        "{url} sends neither WAV nor FLAC. This server decodes those two; anything else needs a \
+         general-purpose decoder it deliberately has not got."
+    ))
+}
+
+/// Read a streamed WAV's header, and hand back whatever audio came with it.
+fn wav_stream_header(head: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
+    // A broadcast's `data` chunk usually claims a length nobody means — often zero, often
+    // 0xFFFFFFFF — so the header is read for its format and the rest is taken as audio.
+    let (format, pcm) = decode_wav_head(head)?;
+    Ok((format, pcm))
+}
+
 /// Read a WAV or FLAC file into interleaved little-endian PCM.
 fn load_track(path: &Path) -> Result<Track, String> {
     let bytes =
@@ -239,6 +454,28 @@ fn decode_flac(bytes: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
 
 /// Read the `fmt ` and `data` chunks of a RIFF/WAVE file.
 fn decode_wav(bytes: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
+    let (format, data, declared) = wav_format(bytes)?;
+    // A file means what its header says, so the declared length wins where it fits.
+    let end = declared
+        .map(|size| (data + size).min(bytes.len()))
+        .unwrap_or(bytes.len());
+    Ok((format, bytes[data..end].to_vec()))
+}
+
+/// The same, for audio still arriving.
+///
+/// A broadcast's `data` chunk claims a length nobody means — often zero, often the largest
+/// number that fits — so the header is read for its format and everything after it is audio.
+fn decode_wav_head(bytes: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
+    let (format, data, _) = wav_format(bytes)?;
+    Ok((format, bytes[data..].to_vec()))
+}
+
+/// Walk the chunks to the format and the start of the audio.
+///
+/// Returns where the audio begins and how long the header claims it is, which a file can be
+/// held to and a stream cannot.
+fn wav_format(bytes: &[u8]) -> Result<(StreamPlayerConfig, usize, Option<usize>), String> {
     if bytes.get(8..12) != Some(b"WAVE") {
         return Err("not a RIFF/WAVE file".to_string());
     }
@@ -253,10 +490,17 @@ fn decode_wav(bytes: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
             bytes[pos + 6],
             bytes[pos + 7],
         ]) as usize;
+
+        if id == b"data" {
+            let format = format.ok_or_else(|| "WAV data chunk precedes its fmt".to_string())?;
+            // A length that does not fit what is here is a stream's, not a file's.
+            let declared = (pos + 8 + size <= bytes.len()).then_some(size);
+            return Ok((format, pos + 8, declared));
+        }
+
         let body = bytes
             .get(pos + 8..pos + 8 + size)
             .ok_or_else(|| "WAV chunk runs past the end of the file".to_string())?;
-
         if id == b"fmt " {
             if body.len() < 16 {
                 return Err("WAV fmt chunk is too short".to_string());
@@ -284,9 +528,6 @@ fn decode_wav(bytes: &[u8]) -> Result<(StreamPlayerConfig, Vec<u8>), String> {
                 bit_depth,
                 codec_header: None,
             });
-        } else if id == b"data" {
-            let format = format.ok_or_else(|| "WAV data chunk precedes its fmt".to_string())?;
-            return Ok((format, body.to_vec()));
         }
 
         // Chunks are word-aligned: an odd length is followed by a pad byte.
@@ -303,12 +544,13 @@ pub async fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let identity = load_or_create_identity(args.settings_dir()?.join("server.key"))?;
     let mut config = ServerConfig::new(identity, args.name.clone());
 
-    let track = match args.source.as_deref() {
-        Some(path) => Some(Arc::new(load_track(Path::new(path))?)),
+    let source = match args.source.as_deref() {
+        Some(source) if crate::fetch::is_url(source) => Some(load_url(source)?),
+        Some(path) => Some(Source::Track(Arc::new(load_track(Path::new(path))?))),
         None => None,
     };
-    match (&track, args.demo) {
-        (Some(track), _) => {
+    match (&source, args.demo) {
+        (Some(Source::Track(track)), _) => {
             let format = track.format();
             log::info!(
                 "Playing {} — {}Hz {}ch {}bit",
@@ -320,6 +562,11 @@ pub async fn run(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             config = config
                 .with_audio(Arc::clone(track) as Arc<dyn AudioSource>)
                 .with_metadata(Arc::clone(track) as Arc<dyn MetadataSource>);
+        }
+        (Some(Source::Streamed(stream)), _) => {
+            config = config
+                .with_audio(Arc::clone(stream) as Arc<dyn AudioSource>)
+                .with_metadata(Arc::clone(stream) as Arc<dyn MetadataSource>);
         }
         (None, true) => {
             log::info!("Playing a 440 Hz test tone");

@@ -11,6 +11,8 @@ mod audio;
 mod cli;
 mod daemon;
 mod discovery;
+#[cfg(feature = "serve")]
+mod fetch;
 
 #[cfg(feature = "serve")]
 mod serve;

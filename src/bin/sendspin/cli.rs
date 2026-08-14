@@ -295,11 +295,15 @@ pub struct ServeArgs {
     #[arg(long, default_value = "Sendspin Server")]
     pub name: String,
 
-    /// Audio to play: a WAV or FLAC file, looped.
+    /// Audio to play: a WAV or FLAC file, or an `http://` or `https://` URL.
     ///
-    /// Only those two formats. Anything else needs a general-purpose decoder, and linking one
-    /// in would cost every player build a dependency it has no use for; convert the file
-    /// first. The track's name is served to clients that activate `metadata@v1`.
+    /// A file is looped. A URL is played as it arrives when it carries WAV, which is what a
+    /// broadcast needs; FLAC over a URL is read to the end first, so it works for a track and
+    /// not for a broadcast.
+    ///
+    /// Those two formats only. Anything else needs a general-purpose decoder, and linking one
+    /// in would cost every player build a dependency it has no use for; convert it first. The
+    /// name is served to clients that activate `metadata@v1`.
     #[arg(long)]
     pub source: Option<String>,
 
