@@ -649,6 +649,7 @@ async fn play(
                         }
                     }
                     Message::StreamEnd(_) => {
+                        log::info!("Stream ended");
                         if let Some(player) = &player {
                             player.clear();
                         }
@@ -667,7 +668,12 @@ async fn play(
                     }
                     // A clear drops what is buffered without ending the stream, so it is not a
                     // stop: firing the hook here would shut down an amplifier mid-track.
+                    //
+                    // Logged, because it is not free: everything buffered is dropped and the
+                    // cursor is re-anchored to whatever arrives next. A clear that repeats on a
+                    // cadence is a server problem, and one this client used to absorb silently.
                     Message::StreamClear(_) => {
+                        log::info!("Stream cleared: dropping what is buffered");
                         if let Some(player) = &player {
                             player.clear();
                         }
