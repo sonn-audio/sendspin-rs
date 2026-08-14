@@ -298,8 +298,15 @@ impl Source {
     /// connection wins arbitration.
     #[cfg(feature = "discovery")]
     pub async fn run_inbound(&mut self, bind: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let frames = self.frames.take();
-        run_inbound(&self.config, &self.status, &self.signal, &self.level, bind, frames).await
+        run_inbound(
+            &self.config,
+            &self.status,
+            &self.signal,
+            &self.level,
+            bind,
+            self.take_frames(),
+        )
+        .await
     }
 }
 
@@ -385,6 +392,10 @@ async fn run_inbound(
         config.name
     );
 
+    // One receiver, so it goes to the first server that gets this far and to no other: an
+    // external feed cannot be split, and handing half of it to a second connection would be
+    // worse than handing it none.
+    let mut frames = frames;
     while let Some(conn) = manager.next_connection().await {
         let server_id = conn.server_hello.server_id.clone();
         log::info!("Serving {server_id} from {}", conn.peer);
@@ -397,6 +408,7 @@ async fn run_inbound(
             signal.subscribe(),
             level,
             (server_id.clone(), conn.server_hello.name.clone()),
+            frames.take(),
         )
         .await;
         log::info!("{server_id} disconnected — waiting for the next server");
