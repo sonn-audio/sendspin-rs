@@ -1205,10 +1205,16 @@ impl SyncedPlayer {
                                     // A reanchor is the last resort: half a second of error had
                                     // to build up for one to happen. Two in a row means it is
                                     // building up again just as fast, which no amount of
-                                    // correcting will catch — so say how fast, because that
-                                    // number names the cause. A stream whose timeline runs
-                                    // faster than real time is being stamped against something
-                                    // other than its own sample rate.
+                                    // correcting will catch — so say how fast.
+                                    //
+                                    // Both quantities are this client's own: real time between
+                                    // two reanchors, and how far the *mapping* from local time
+                                    // to server time moved over it. Their ratio is the slope of
+                                    // that mapping, which is one plus the drift the clock
+                                    // filter has learned. It says nothing about how a server
+                                    // stamps its audio — an earlier version of this line
+                                    // claimed it did, and sent a reader looking at the wrong
+                                    // machine.
                                     if let Some((previous_time, previous_at)) = last_reanchor {
                                         let wall = callback_instant
                                             .duration_since(previous_at)
@@ -1217,10 +1223,14 @@ impl SyncedPlayer {
                                             (server_time - previous_time) as f64 / 1_000_000.0;
                                         if (1.0..=120.0).contains(&wall) {
                                             log::warn!(
-                                                "Sync reanchored again after {wall:.1}s: the \
-                                                 stream's timeline advanced {timeline:.3}s over \
-                                                 that, {:+.2}% off real time. Playback cannot \
-                                                 hold sync against a rate error this size.",
+                                                "Sync reanchored again after {wall:.3}s: this \
+                                                 client's map of server time advanced \
+                                                 {timeline:.3}s over that, a slope of \
+                                                 {:+.2}%. Real clocks differ by parts per \
+                                                 million, so a slope like this is a learned \
+                                                 drift that cannot be true — check `drift=` in \
+                                                 the clock trace and what the server's time \
+                                                 replies do.",
                                                 (timeline - wall) / wall * 100.0
                                             );
                                         }
