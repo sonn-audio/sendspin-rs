@@ -272,6 +272,16 @@ impl TimeFilter {
     }
 }
 
+/// Whether a drift could come from two real clocks rather than a broken timebase.
+///
+/// Quartz oscillators of the kind in a phone, a sound card or a single-board computer are
+/// specified in tens of parts per million; a hundred is a poor part running hot. A tenth of a
+/// percent is a thousand, which nothing physical does — so past that, the number is not drift.
+fn drift_is_physically_possible(drift: f64) -> bool {
+    const IMPLAUSIBLE_DRIFT: f64 = 0.001;
+    drift.abs() < IMPLAUSIBLE_DRIFT
+}
+
 /// Clock synchronization quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncQuality {
@@ -291,6 +301,9 @@ pub struct ClockSync {
     last_update: Option<Instant>,
     /// Drift-aware time filter
     filter: TimeFilter,
+    /// Whether an impossible drift has already been reported, so it is said once rather than
+    /// once a second for as long as the connection lasts.
+    reported_implausible_drift: bool,
     /// Raw monotonic clock used for timestamps
     clock: Arc<dyn Clock>,
 }
@@ -312,6 +325,7 @@ impl ClockSync {
             rtt_micros: None,
             last_update: None,
             filter: TimeFilter::reference(),
+            reported_implausible_drift: false,
             clock,
         }
     }
@@ -372,6 +386,26 @@ impl ClockSync {
             self.filter.current.drift,
             self.filter.is_synchronized(),
         );
+        // A drift no pair of real clocks can produce, reported once. Two oscillators differ by
+        // tens of parts per million; hundreds is a bad crystal in a warm room. Anything past a
+        // tenth of a percent is not a clock ageing, it is a timebase that counts something
+        // other than seconds — and the filter will track it faithfully all the way into a
+        // playback loop that re-anchors every few seconds and never settles. Saying so at the
+        // moment it is learned turns a day of chasing into one line.
+        if !self.reported_implausible_drift && self.filter.is_settled() {
+            let drift = self.filter.current.drift;
+            if !drift_is_physically_possible(drift) {
+                self.reported_implausible_drift = true;
+                log::warn!(
+                    "Clock sync: the server's time replies advance {:+.0} ppm relative to this \
+                     client ({:+.1} ms per second). No two real clocks differ by that much, so \
+                     this is a timebase reporting something other than seconds. Playback will \
+                     keep re-anchoring for as long as it lasts.",
+                    drift * 1_000_000.0,
+                    drift * 1000.0
+                );
+            }
+        }
         if !was_synced && self.filter.is_synchronized() {
             log::info!(
                 "Clock sync achieved: offset={:.0}µs, rtt={}µs",
@@ -552,6 +586,29 @@ mod tests {
             error < 2_000.0,
             "filter never caught the slew: {error:.0}µs behind after a minute of it"
         );
+    }
+
+    /// The line between a clock ageing and a timebase that is not counting seconds.
+    ///
+    /// Both sides matter. Calling a real drift impossible would cry wolf on every warm room;
+    /// calling an impossible one real is what let a server whose time replies ran 8.3% fast be
+    /// followed into a re-anchor every eight seconds, for a day, without a word.
+    #[test]
+    fn a_drift_only_a_broken_timebase_can_produce_is_named_as_one() {
+        // What real hardware does: tens of ppm, and a bad part in a warm room.
+        for real in [0.0, 1e-6, 2e-5, -5e-5, 2e-4, -9e-4] {
+            assert!(
+                drift_is_physically_possible(real),
+                "{real} is within what real oscillators do"
+            );
+        }
+        // What a broken timebase does, including the case from the field: 13/12.
+        for broken in [0.002, -0.01, 0.083_340, 0.5] {
+            assert!(
+                !drift_is_physically_possible(broken),
+                "{broken} is not something two clocks can do to each other"
+            );
+        }
     }
 
     #[test]
