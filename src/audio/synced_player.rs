@@ -735,6 +735,9 @@ impl SyncedPlayer {
         let planner = CorrectionPlanner::new();
         let mut error_filter = SyncErrorFilter::new();
         let mut engage_gate = EngageGate::new();
+        // The last reanchor, so a second one can be reported as the rate error it is rather
+        // than as another line someone has to subtract by hand.
+        let mut last_reanchor: Option<(i64, std::time::Instant)> = None;
         let mut last_frame = vec![i32::EQUILIBRIUM; channels];
         let mut schedule = CorrectionSchedule::default();
         let mut insert_counter = 0u32;
@@ -1199,6 +1202,30 @@ impl SyncedPlayer {
                                     log::debug!(
                                         "Sync reanchor applied: cursor reset to server_time={server_time}µs"
                                     );
+                                    // A reanchor is the last resort: half a second of error had
+                                    // to build up for one to happen. Two in a row means it is
+                                    // building up again just as fast, which no amount of
+                                    // correcting will catch — so say how fast, because that
+                                    // number names the cause. A stream whose timeline runs
+                                    // faster than real time is being stamped against something
+                                    // other than its own sample rate.
+                                    if let Some((previous_time, previous_at)) = last_reanchor {
+                                        let wall = callback_instant
+                                            .duration_since(previous_at)
+                                            .as_secs_f64();
+                                        let timeline =
+                                            (server_time - previous_time) as f64 / 1_000_000.0;
+                                        if (1.0..=120.0).contains(&wall) {
+                                            log::warn!(
+                                                "Sync reanchored again after {wall:.1}s: the \
+                                                 stream's timeline advanced {timeline:.3}s over \
+                                                 that, {:+.2}% off real time. Playback cannot \
+                                                 hold sync against a rate error this size.",
+                                                (timeline - wall) / wall * 100.0
+                                            );
+                                        }
+                                    }
+                                    last_reanchor = Some((server_time, callback_instant));
                                 }
                                 schedule = CorrectionSchedule::default();
                                 insert_counter = 0;
