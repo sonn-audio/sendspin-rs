@@ -405,6 +405,73 @@ fn player_support(
     }
 }
 
+/// Whether a stream's timestamps advance at the rate of the audio they carry.
+///
+/// Compares the span between the first and last chunk's timestamps against the number of
+/// frames delivered in between. They should agree to well within a tenth of a percent; a
+/// server that stamps against the wrong rate shows up as a steady percentage that no amount of
+/// playback correction can absorb.
+#[derive(Default)]
+struct StampRate {
+    /// The stamp the current window opened on.
+    first: Option<i64>,
+    /// The most recent stamp.
+    last: i64,
+    /// Frames the window's stamps span, which excludes the newest chunk: its audio has not
+    /// been spanned by a later stamp yet.
+    frames: u64,
+    /// The newest chunk's frames, waiting for the stamp that will span them.
+    pending: u64,
+    /// One report per connection. A stream that cannot hold sync says so once; repeating it
+    /// every ten seconds would bury the reanchor warnings that show the consequence.
+    reported: bool,
+}
+
+impl StampRate {
+    /// Seconds to judge over. Long enough that per-chunk jitter averages out, short enough
+    /// that nobody sits through much of a stream that cannot hold sync before being told.
+    const WINDOW_SECONDS: f64 = 10.0;
+
+    /// The deviation worth reporting. A tenth of a percent is 100µs per second — far beyond
+    /// anything the correction loop is meant to absorb, and far above ordinary jitter.
+    const THRESHOLD_PERCENT: f64 = 0.1;
+
+    fn observe(&mut self, timestamp: i64, frames: usize, sample_rate: u32) {
+        let frames = u64::from(u32::try_from(frames).unwrap_or(u32::MAX));
+        let Some(first) = self.first else {
+            self.first = Some(timestamp);
+            self.last = timestamp;
+            self.pending = frames;
+            return;
+        };
+        // The step from the previous stamp to this one is covered by the previous chunk's
+        // frames, which is what `pending` has been holding.
+        self.frames += self.pending;
+        self.pending = frames;
+        self.last = timestamp;
+
+        let seconds = (self.last - first) as f64 / 1_000_000.0;
+        if seconds < Self::WINDOW_SECONDS || sample_rate == 0 {
+            return;
+        }
+        let carried = self.frames as f64 / f64::from(sample_rate);
+        if carried > 0.0 {
+            let error = (seconds - carried) / carried * 100.0;
+            if error.abs() >= Self::THRESHOLD_PERCENT && !self.reported {
+                self.reported = true;
+                log::warn!(
+                    "Stream timestamps advance {error:+.2}% faster than the audio they carry: \
+                     {seconds:.3}s of stamps over {carried:.3}s of frames at {sample_rate}Hz. \
+                     The clock is not the problem here — the stamps are."
+                );
+            }
+        }
+        // A fresh window, so a stream that is fixed mid-flight stops being judged on its past.
+        self.first = Some(self.last);
+        self.frames = 0;
+    }
+}
+
 /// Dial a named server and play whatever it sends, until it goes away.
 async fn run_outbound(
     config: &PlayerConfig,
@@ -568,6 +635,7 @@ async fn play(
     // Reopens spent on this stream after the card reported a fault. Bounded, because a device
     // that fails the moment it opens would otherwise be reopened once per chunk forever.
     let mut output_restarts = 0_u8;
+    let mut stamp_check = StampRate::default();
     let mut played_anything = false;
     // Held outside the player: a volume command can arrive before a stream does, and the
     // setting has to survive until there is something to apply it to. Seeded from the card
@@ -764,6 +832,16 @@ async fn play(
                         continue;
                     }
                 };
+                // Do the timestamps advance at the rate of the audio they carry?
+                //
+                // This separates the two ways a stream's timeline can be wrong. A server whose
+                // clock runs fast moves everything together, and clock sync sees it as drift. A
+                // server that stamps its chunks against something other than their own sample
+                // rate leaves the clock alone and the audio wrong, which no amount of drift
+                // correction reaches. Measured here, where both the stamp and the frame count
+                // it should agree with are in hand.
+                let frames = samples.len() / usize::from(fmt.channels.max(1));
+                stamp_check.observe(chunk.timestamp, frames, fmt.sample_rate);
                 if output_unavailable {
                     continue;
                 }
@@ -1072,6 +1150,34 @@ fn build_decoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server stamping honestly must not be accused. The window has to be exact, because a
+    /// systematic error of one chunk in four hundred is already a quarter of a percent — twice
+    /// what this reports on.
+    #[test]
+    fn honest_stamps_measure_as_honest() {
+        let mut check = StampRate::default();
+        let (rate, frames) = (44_100u32, 441usize); // 10 ms chunks
+        for i in 0..2_000i64 {
+            check.observe(i * 10_000, frames, rate);
+        }
+        assert!(
+            !check.reported,
+            "a stream stamped at its own rate was reported as wrong"
+        );
+    }
+
+    /// The stream from the field: stamps running 1/12 faster than the frames they carry.
+    #[test]
+    fn stamps_running_ahead_of_their_own_audio_are_reported() {
+        let mut check = StampRate::default();
+        let (rate, frames) = (44_100u32, 441usize);
+        // 10 ms of audio stamped 10.833 ms apart.
+        for i in 0..2_000i64 {
+            check.observe(i * 10_833, frames, rate);
+        }
+        assert!(check.reported, "an 8.3% stamp error went unreported");
+    }
 
     fn config() -> PlayerConfig {
         PlayerConfig {
